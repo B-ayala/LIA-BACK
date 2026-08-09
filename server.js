@@ -9,6 +9,7 @@ const { connectDB, getPoolStats, closeDB } = require('./config/database');
 const { corsOptions } = require('./config/cors');
 const { concurrencyLimit, concurrencyStats } = require('./middleware/concurrencyLimit');
 const { createRateLimit, rateLimitStats } = require('./middleware/rateLimit');
+const { securityHeaders } = require('./middleware/securityHeaders');
 const { cacheStats } = require('./utils/cache');
 const logger = require('./utils/logger');
 const userRoutes = require('./routes/userRoutes');
@@ -31,6 +32,10 @@ app.disable('x-powered-by');
 // Compresión: el catálogo es JSON muy repetitivo (baja ~70-80%). Menos bytes por
 // respuesta = menos tiempo de socket abierto por request bajo carga.
 app.use(compression());
+
+// Headers de seguridad en TODA respuesta, incluidas las de error: va antes que
+// CORS y que las rutas para que ninguna salida quede sin ellos.
+app.use(securityHeaders);
 
 // Middleware
 app.use(cors(corsOptions));

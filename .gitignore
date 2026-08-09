@@ -51,3 +51,9 @@ coverage/
 *.jpg
 *.jpeg
 *.webp
+
+# Docs redundantes — viven fuera del repo
+ARCHITECTURE.md
+QUICKSTART.md
+VERIFICATION_CHECKLIST.md
+docs/SUPABASE_AUTH.md

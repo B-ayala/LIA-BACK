@@ -36,18 +36,37 @@ class Order {
   }
 
   /**
-   * Bloquea la fila del producto y devuelve su stock actual.
-   * El descuento real lo hace el trigger `trg_decrement_stock` al insertar la
-   * venta; esto solo sirve para validar disponibilidad de forma atómica:
-   * el `FOR UPDATE` serializa transacciones concurrentes sobre el mismo producto.
-   * @returns stock disponible (number), o null si el producto no existe.
+   * Bloquea la fila del producto y devuelve stock y precio vigentes.
+   *
+   * El descuento de stock real lo hace el trigger `trg_decrement_stock` al
+   * insertar la venta; esto sirve para validar disponibilidad de forma atómica
+   * (el `FOR UPDATE` serializa transacciones concurrentes sobre el mismo
+   * producto) y, sobre todo, para **tomar el precio de la base y no del cliente**.
+   *
+   * @returns {Promise<{stock: number, price: number, discount: number|null,
+   *   original_price: number|null}|null>} fila del producto, o null si no existe.
    */
-  static async getStockForUpdate(client, productId) {
+  static async getProductForUpdate(client, productId) {
     const result = await client.query(
-      'SELECT stock FROM public.productos WHERE id = $1 FOR UPDATE',
+      `SELECT stock, price::float8 AS price, discount::float8 AS discount,
+              original_price::float8 AS original_price
+         FROM public.productos
+        WHERE id = $1
+          FOR UPDATE`,
       [productId]
     );
-    return result.rows[0] ? result.rows[0].stock : null;
+    return result.rows[0] || null;
+  }
+
+  /** Suma los totales de las órdenes indicadas (control de monto de un pago). */
+  static async sumTotalsByIds(client, ids) {
+    const result = await client.query(
+      `SELECT COALESCE(SUM(total_price), 0)::float8 AS total
+         FROM public.ventas
+        WHERE id::text = ANY($1)`,
+      [ids.map(String)]
+    );
+    return result.rows[0].total;
   }
 
   /** Devuelve stock previamente descontado (cancelación / expiración de una orden). */
@@ -104,8 +123,13 @@ class Order {
    * Marca como pagadas las órdenes indicadas (webhook / confirmación MP).
    * Si una orden ya fue expirada o cancelada (el pago se acreditó tarde),
    * vuelve a descontar el stock que el sweep había devuelto.
+   *
+   * @param {number} [paidAmount] monto realmente acreditado en Mercado Pago. Si
+   *   se pasa y no coincide con la suma de las órdenes (± `tolerance`), NO se
+   *   marca nada: un pago por menos del total no puede saldar la compra.
+   * @returns {Promise<number>} órdenes marcadas, o -1 si el monto no coincide.
    */
-  static async markPaidByIds(ids) {
+  static async markPaidByIds(ids, paidAmount, tolerance = 1) {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
@@ -113,6 +137,14 @@ class Order {
         'SELECT * FROM public.ventas WHERE id::text = ANY($1) FOR UPDATE',
         [ids.map(String)]
       );
+
+      if (Number.isFinite(paidAmount)) {
+        const expected = await Order.sumTotalsByIds(client, ids);
+        if (Math.abs(expected - paidAmount) > tolerance) {
+          await client.query('ROLLBACK');
+          return -1;
+        }
+      }
 
       for (const row of rows) {
         if (row.payment_status === 'pagado') continue;

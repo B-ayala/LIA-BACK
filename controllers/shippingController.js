@@ -25,4 +25,6 @@ const getShippingQuote = (req, res) => {
   });
 };
 
-module.exports = { getShippingQuote };
+// CORREO_COST se exporta para que el checkout valide contra la misma tarifa:
+// una sola fuente de verdad del costo de envío en todo el backend.
+module.exports = { getShippingQuote, CORREO_COST };

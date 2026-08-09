@@ -6,7 +6,9 @@
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js",
-    "init-db": "node config/initDatabase.js"
+    "init-db": "node config/initDatabase.js",
+    "audit": "npm audit --audit-level=high",
+    "preflight": "npm run audit"
   },
   "engines": {
     "node": "22.x"

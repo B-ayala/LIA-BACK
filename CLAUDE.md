@@ -11,19 +11,22 @@
 Este repo es el **backend** de la tienda **damiana-bella**: una **API REST en Node.js + Express**
 con patrón **MVC**, sobre **PostgreSQL/Supabase** (acceso directo con `pg`). Expone:
 
-- `/api/users` — perfiles (`public.profiles` + `auth.users`), login de referencia, rate-limit de signup.
-- `/api/products` — CRUD de productos (lectura pública, escritura admin con JWT de Supabase).
+- `/api/users` — perfiles (`public.profiles` + `auth.users`), login contra Supabase Auth, rate-limit de signup.
+- `/api/products` — CRUD de productos (lectura pública cacheada, escritura admin).
+- `/api/orders` — checkout: Mercado Pago, transferencias, cancelaciones, webhook, expiración de pendientes.
+- `/api/shipping` — cotización de envío por código postal.
+- `/api/admin/insights` — analítica del asistente admin (solo admin).
 - `/api/cloudinary` — firma de uploads y gestión de imágenes/carpetas.
 
 Entry point: `server.js`. Scripts: `npm run dev` (nodemon), `npm start`, `npm run init-db`.
 
 📄 Documentación técnica completa (estructura, arquitectura MVC, endpoints, modelo de datos,
-configuración, riesgos de seguridad y **discrepancias con el frontend**) en
+configuración, cómo levantar y estado de seguridad) en
 [DOCUMENTACION_BACKEND.md](DOCUMENTACION_BACKEND.md). **Leela antes de tocar código.**
 
-⚠️ **Importante:** el frontend actual (`../../FRONT/damiana-bella`) usa un contrato de auth
-(JWT propio) y endpoints (`/auth/*`, `/orders/*`, `/shipping`) que **este backend no implementa**.
-Ver sección 11 de la documentación antes de integrar o modificar contratos.
+El frontend (`../../FRONT/damiana-bella`, repo propio) está **alineado** con estos contratos:
+maneja la sesión con Supabase Auth y adjunta el access token, que acá se verifica contra
+Supabase. Ver §11 de la documentación antes de modificar cualquier contrato.
 
 ---
 
@@ -57,8 +60,22 @@ en este repo.
 
 ## ⚠️ Reglas específicas de este repo
 
-- **Secretos solo en `.env`** (DB, Cloudinary). Hoy `.env.example` contiene credenciales reales:
-  **rotarlas** y dejar placeholders (ver §10 de la documentación).
-- **Seguridad de auth pendiente**: `authMiddleware` decodifica el JWT sin verificar firma, y las
-  rutas de usuarios están sin proteger. No tratar la auth actual como confiable.
+- **Secretos solo en `.env`** (DB, Cloudinary, Supabase, Mercado Pago). `.env.example` lleva
+  únicamente placeholders: nunca pegar valores reales en un archivo versionado.
+- **Deuda abierta**: el historial de git de ambos remotos todavía contiene la password de la BD
+  que estuvo commiteada en docs viejas. **Hay que rotarla** (ver §10 de la documentación).
+- **Auth**: `authMiddleware` verifica el access token contra Supabase Auth y cachea el resultado
+  30 s. No relajar esa verificación ni ampliar el TTL sin pensarlo dos veces.
+
+### 📄 Mantenimiento de la documentación
+
+- **El código es la fuente de verdad.** Si `DOCUMENTACION_BACKEND.md`, `README.md` o este archivo
+  contradicen al código, el error está en la doc: verificá contra el código y corregila.
+- **Docs de estado → se corrigen, no se acumulan.** `DOCUMENTACION_BACKEND.md`, `README.md`,
+  `CLAUDE.md` y `docs/flows/` describen cómo es el sistema **hoy**: si un cambio invalida un
+  párrafo, se reescribe ese párrafo en el mismo cambio. Agregar una sección nueva dejando la vieja
+  produce docs que se contradicen entre sí.
+- **Solo `CHANGELOG.md` acumula** (append-only): es historia, no estado. `qa/test-plan.md` acumula
+  casos, pero los resultados se actualizan.
+- Alcance mínimo: tocar la sección afectada. No hace falta releer la doc entera en cada cambio.
 - No mezclar lógica de frontend en este repo. Mantener la documentación separada de la del front.

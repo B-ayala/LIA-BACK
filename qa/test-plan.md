@@ -678,6 +678,114 @@ Pasos:
 Esperado: 413 `PAYLOAD_TOO_LARGE` y 400 `INVALID_JSON` (nunca 500)
 Resultado: OK (2026-08-08 — 413 con body de 400 kb, 400 con JSON roto; sin token
   sigue devolviendo 401, así que el orden de middlewares no cambió)
+
+ID: TC-194
+Caso: Precio manipulado en el body — Mercado Pago
+Tipo: security
+Pre-condición: usuario logueado, producto con stock y precio conocido (ej. $50.000)
+Pasos:
+  1. Capturar el POST /api/orders/mp-preference del checkout
+  2. Reenviarlo con items[0].unitPrice = 1, items[0].totalPrice = 1, totalPrice = 1
+  3. Consultar la venta creada en `ventas`
+Esperado: la orden se crea con unit_price/total_price del PRECIO REAL de `productos`,
+  y la preferencia de MP cobra ese total (no $1)
+Resultado: no probado
+
+ID: TC-195
+Caso: Precio manipulado en el body — transferencia
+Tipo: security
+Pasos:
+  1. POST /api/orders/transfer con unitPrice = 1 sobre un producto de $50.000
+  2. Ver la orden en el panel Ventas
+Esperado: la venta queda registrada al precio real, no al enviado
+Resultado: no probado
+
+ID: TC-196
+Caso: Costo de envío manipulado
+Tipo: security
+Pasos:
+  1. POST /api/orders/transfer con shippingMethod 'correo' y shippingCost 0
+  2. Repetir con shippingMethod 'local' y shippingCost -5000
+  3. Repetir con shippingMethod inexistente ('gratis')
+Esperado: 1 y 2 se persisten con la tarifa oficial (4400 y 0); 3 devuelve 400
+Resultado: no probado
+
+ID: TC-197
+Caso: Pago por menos del total no salda la compra
+Tipo: security
+Pre-condición: una orden pendiente cuyo total no coincida con el pago acreditado
+Pasos:
+  1. POST /api/orders/mp-confirm con un paymentId aprobado de monto menor
+Esperado: 409 "El monto abonado no coincide"; la venta sigue `pendiente`;
+  se registra `mp_confirm_amount_mismatch` en los logs
+Resultado: no probado
+
+ID: TC-198
+Caso: Regresión — compra normal sigue funcionando
+Tipo: happy
+Pasos:
+  1. Compra completa por MP con envío 'local' (costo 0) y tarjeta APRO
+  2. Compra completa por transferencia con envío 'correo'
+  3. Compra de un producto CON descuento cargado
+Esperado: los tres casos cierran igual que antes del fix; el importe cobrado es el
+  mismo que muestra el checkout en pantalla (incluido el descuento aplicado)
+Resultado: no probado
+
+ID: TC-199
+Caso: Escalada de privilegios vía profiles con la anon key
+Tipo: security
+Pre-condición: migración 2026-08-09_rls_hardening.sql APLICADA; usuario común logueado
+Pasos:
+  1. Desde la consola del navegador:
+     supabase.from('profiles').update({ role: 'admin' }).eq('id', <mi uuid>)
+  2. Reintentar leyendo perfiles ajenos:
+     supabase.from('profiles').select('*')
+Esperado: 1 falla por permisos (no queda admin); 2 devuelve solo la fila propia
+Resultado: no probado — ANTES de la migración ambos pasos FUNCIONAN (vulnerable)
+
+ID: TC-200
+Caso: TRUNCATE con la anon key
+Tipo: security
+Pre-condición: migración aplicada
+Pasos:
+  1. Intentar TRUNCATE sobre `productos` con la anon key (vía SQL/PostgREST)
+Esperado: permiso denegado
+Resultado: no probado
+
+ID: TC-201
+Caso: Regresión del panel admin tras cerrar RLS
+Tipo: happy / regression
+Pre-condición: migración aplicada, sesión admin
+Pasos:
+  1. Ventas: listar, confirmar y cancelar una transferencia
+  2. Despachos: cambiar el estado de un envío
+  3. Temas: publicar tipografía como predeterminada (upsert en site_content)
+  4. Home: alta, reorden y baja de una imagen del carrusel
+  5. Categorías: crear y borrar una
+  6. Login de un usuario común y "Mis compras"
+Esperado: todo funciona igual que antes de la migración
+Resultado: no probado — ES EL CASO QUE DECIDE SI SE HACE ROLLBACK
+
+ID: TC-202
+Caso: Webhook de MP con firma inválida
+Tipo: security
+Pre-condición: MP_WEBHOOK_SECRET configurada
+Pasos:
+  1. POST /api/orders/mp-webhook con header x-signature adulterado
+  2. Repetir sin header x-signature
+Esperado: 401 en ambos y `mp_webhook_invalid_signature` en los logs; sin la variable
+  configurada, el webhook sigue respondiendo 200 como antes
+Resultado: no probado
+
+ID: TC-203
+Caso: Headers de seguridad presentes
+Tipo: security
+Pasos:
+  1. curl -I http://localhost:3000/health
+  2. curl -I http://localhost:3000/api/ruta-inexistente  (respuesta 404)
+Esperado: CSP, X-Content-Type-Options, X-Frame-Options, Referrer-Policy y CORP en
+  ambas; sin X-Powered-By; HSTS solo cuando se sirve por HTTPS
+Resultado: no probado
 ```
 
 ---

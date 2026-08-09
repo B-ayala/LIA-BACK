@@ -2,6 +2,7 @@ const crypto = require('crypto');
 const { pool } = require('../config/database');
 const Order = require('../models/Order');
 const mercadopago = require('../utils/mercadopago');
+const { CORREO_COST } = require('./shippingController');
 const { caches, invalidateProducts } = require('../utils/cache');
 const logger = require('../utils/logger');
 
@@ -25,6 +26,61 @@ const MAX_NUDGE_ORDERS = 50;
 const MAX_ORDER_ITEMS = 50;
 const DEFAULT_ORDER_PAGE_SIZE = 200;
 const MAX_ORDER_PAGE_SIZE = 500;
+
+// Costo de envío por método. `moto` es variable (se acuerda por WhatsApp según
+// distancia), así que solo se acota; el resto es una constante del negocio y se
+// impone desde acá: el cliente no puede elegir cuánto paga de envío.
+const SHIPPING_COSTS = {
+  local: 0,
+  correo: CORREO_COST,
+};
+const MAX_MOTO_SHIPPING_COST = 100000;
+
+// Diferencia máxima tolerada entre lo acreditado en MP y el total de las
+// órdenes: absorbe redondeos de centavos sin dejar pasar un pago menor.
+const PAYMENT_AMOUNT_TOLERANCE = 1;
+
+/**
+ * Precio unitario vigente de un producto, calculado desde la fila de la base.
+ *
+ * Replica exactamente `getProductPricing` del frontend (`src/utils/pricing.ts`)
+ * para que el importe cobrado sea el mismo que el usuario vio en pantalla, pero
+ * decidido por el servidor. Si las reglas de precio cambian, deben cambiar en
+ * los dos lados.
+ */
+const resolveUnitPrice = ({ price, discount, original_price: originalPrice }) => {
+  const basePrice = Number(price) || 0;
+  const promoOriginal = Number(originalPrice);
+  // Promoción ya aplicada en `price`: `original_price` es solo el precio tachado.
+  if (Number.isFinite(promoOriginal) && promoOriginal > basePrice) return basePrice;
+
+  const safeDiscount = Number(discount);
+  if (Number.isFinite(safeDiscount) && safeDiscount > 0) {
+    return basePrice * (1 - safeDiscount / 100);
+  }
+  return basePrice;
+};
+
+/**
+ * Costo de envío validado contra la tarifa del servidor.
+ * @returns {{ok: true, cost: number} | {ok: false, message: string}}
+ */
+const resolveShippingCost = (shippingMethod, rawCost) => {
+  const requested = Number.isFinite(Number(rawCost)) ? Number(rawCost) : 0;
+
+  if (shippingMethod === 'moto') {
+    if (requested < 0 || requested > MAX_MOTO_SHIPPING_COST) {
+      return { ok: false, message: 'El costo de envío informado no es válido.' };
+    }
+    return { ok: true, cost: requested };
+  }
+
+  const official = SHIPPING_COSTS[shippingMethod];
+  if (official === undefined) {
+    return { ok: false, message: 'El método de envío seleccionado no es válido.' };
+  }
+  return { ok: true, cost: official };
+};
 
 /** Entero saneado dentro de [min, max]; cae al default si no es válido. */
 const boundedInt = (raw, fallback, min, max) => {
@@ -143,45 +199,78 @@ const reserveOrders = async ({ buyerName, buyerEmail, items, shippingMethod, shi
   try {
     await client.query('BEGIN');
 
-    const surcharge = Number.isFinite(Number(shippingCost)) ? Number(shippingCost) : 0;
+    const shipping = resolveShippingCost(shippingMethod, shippingCost);
+    if (!shipping.ok) {
+      await client.query('ROLLBACK');
+      return { ok: false, status: 400, message: shipping.message };
+    }
+    const surcharge = shipping.cost;
     const orderIds = [];
+    // Líneas ya valorizadas por el servidor: son las que se le cobran a MP.
+    const pricedItems = [];
 
     for (const [index, item] of items.entries()) {
       const productId = Number.parseInt(item.productId, 10);
-      const hasProductId = Number.isInteger(productId);
 
-      if (hasProductId) {
-        const available = await Order.getStockForUpdate(client, productId);
-        if (available === null || available < item.quantity) {
-          await client.query('ROLLBACK');
-          return {
-            ok: false,
-            status: 409,
-            message: `No hay stock suficiente de "${item.productName}".`,
-          };
-        }
+      // Sin producto identificable no hay precio que validar contra la base, y
+      // el precio del body no es confiable: se rechaza la compra entera.
+      if (!Number.isInteger(productId)) {
+        await client.query('ROLLBACK');
+        return {
+          ok: false,
+          status: 400,
+          message: `No se pudo identificar el producto "${item.productName}".`,
+        };
+      }
+
+      const product = await Order.getProductForUpdate(client, productId);
+      if (product === null || product.stock < item.quantity) {
+        await client.query('ROLLBACK');
+        return {
+          ok: false,
+          status: 409,
+          message: `No hay stock suficiente de "${item.productName}".`,
+        };
+      }
+
+      // El importe SIEMPRE sale de la base, nunca del body: un cliente que
+      // manipule `unitPrice`/`totalPrice` termina pagando el precio real.
+      const unitPrice = resolveUnitPrice(product);
+      if (!(unitPrice > 0)) {
+        await client.query('ROLLBACK');
+        return {
+          ok: false,
+          status: 409,
+          message: `El producto "${item.productName}" no está disponible para la venta.`,
+        };
       }
 
       const orderId = await Order.insertPending(client, {
         buyerName,
         buyerEmail,
-        productId: hasProductId ? productId : null,
+        productId,
         productName: item.productName,
         productImage: item.productImage,
         quantity: item.quantity,
-        unitPrice: item.unitPrice,
+        unitPrice,
         // El costo de envío se suma a la primera línea (mismo criterio que el frontend)
-        totalPrice: item.totalPrice + (index === 0 ? surcharge : 0),
+        totalPrice: unitPrice * item.quantity + (index === 0 ? surcharge : 0),
         unitsConfig: item.unitsConfig,
         paymentMethod,
         shippingMethod,
       });
       orderIds.push(orderId);
+      pricedItems.push({
+        productName: item.productName,
+        productImage: item.productImage,
+        quantity: item.quantity,
+        unitPrice,
+      });
     }
 
     await client.query('COMMIT');
     invalidateProducts();
-    return { ok: true, orderIds };
+    return { ok: true, orderIds, pricedItems, shippingCost: surcharge };
   } catch (error) {
     await client.query('ROLLBACK').catch(() => undefined);
     console.error(`Error al reservar órdenes (${paymentMethod}):`, error.message);
@@ -240,7 +329,15 @@ const buildMpCheckout = async (req) => {
 
   try {
     const preference = await mercadopago.createPreference(
-      buildPreferencePayload({ buyerName, buyerEmail, items, shippingCost, orderIds: reservation.orderIds })
+      // Se le cobra al comprador lo que quedó persistido (precio de la base),
+      // no lo que vino en el body.
+      buildPreferencePayload({
+        buyerName,
+        buyerEmail,
+        items: reservation.pricedItems,
+        shippingCost: reservation.shippingCost,
+        orderIds: reservation.orderIds,
+      })
     );
 
     if (!preference || !preference.init_point) {
@@ -376,7 +473,23 @@ const confirmMpPayment = async (req, res) => {
     }
 
     const ids = String(payment.external_reference).split(',').map((s) => s.trim()).filter(Boolean);
-    const updated = ids.length > 0 ? await Order.markPaidByIds(ids) : 0;
+    const updated = ids.length > 0
+      ? await Order.markPaidByIds(ids, Number(payment.transaction_amount), PAYMENT_AMOUNT_TOLERANCE)
+      : 0;
+
+    // El monto acreditado no cubre el total de las órdenes: no se saldan.
+    if (updated === -1) {
+      logger.warn('mp_confirm_amount_mismatch', {
+        paymentId: String(paymentId),
+        paidAmount: Number(payment.transaction_amount),
+        orderIds: ids,
+      });
+      return res.status(409).json({
+        success: false,
+        message: 'El monto abonado no coincide con el total de la compra.',
+      });
+    }
+
     // Un pago acreditado tarde vuelve a descontar stock: el catálogo cacheado
     // tiene que reflejarlo ya.
     if (updated > 0) invalidateProducts();
@@ -402,12 +515,34 @@ const mpWebhook = async (req, res) => {
       return res.status(200).json({ success: true });
     }
 
+    // Firma HMAC de MP. `null` = no hay MP_WEBHOOK_SECRET configurado: se sigue
+    // adelante porque el pago se revalida igual contra la API de MP más abajo.
+    const signatureValid = mercadopago.verifyWebhookSignature({
+      signatureHeader: req.headers['x-signature'],
+      requestId: req.headers['x-request-id'],
+      dataId: paymentId,
+    });
+    if (signatureValid === false) {
+      logger.warn('mp_webhook_invalid_signature', { paymentId: String(paymentId) });
+      return res.status(401).json({ success: false });
+    }
+
     const payment = await mercadopago.getPayment(paymentId);
     if (payment && payment.status === 'approved' && payment.external_reference) {
       const ids = String(payment.external_reference).split(',').map((s) => s.trim()).filter(Boolean);
       if (ids.length > 0) {
-        await Order.markPaidByIds(ids);
-        invalidateProducts();
+        const updated = await Order.markPaidByIds(
+          ids, Number(payment.transaction_amount), PAYMENT_AMOUNT_TOLERANCE
+        );
+        if (updated === -1) {
+          logger.warn('mp_webhook_amount_mismatch', {
+            paymentId: String(paymentId),
+            paidAmount: Number(payment.transaction_amount),
+            orderIds: ids,
+          });
+        } else {
+          invalidateProducts();
+        }
       }
     }
 

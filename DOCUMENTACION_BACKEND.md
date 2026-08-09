@@ -3,25 +3,26 @@
 > Documentación de **cómo está construido hoy** el backend, leída directamente del código fuente
 > (`server.js`, `routes/`, `controllers/`, `models/`, `middleware/`, `config/`). Pensada como
 > referencia de consulta antes de cualquier cambio.
->
-> ⚠️ **Leé primero la sección 11 (Discrepancias con el frontend).** Este backend implementa un
-> contrato **distinto** al que consume el frontend actual (`../../FRONT/damiana-bella`). No asumas
-> que todo lo que el front llama existe acá.
 
 ---
 
 ## 1. Resumen
 
 API REST en **Node.js + Express** con patrón **MVC**, sobre **PostgreSQL/Supabase** (acceso
-directo vía `pg`, no vía el SDK de Supabase). Expone tres áreas bajo el prefijo `/api`:
+directo vía `pg`, no vía el SDK de Supabase). Expone seis áreas bajo el prefijo `/api`:
 
-- **`/api/users`** — perfiles de usuario (sobre `public.profiles` + `auth.users`), login de
-  referencia y tracker de rate-limit de signup.
+- **`/api/users`** — perfiles de usuario (sobre `public.profiles` + `auth.users`), login contra
+  Supabase Auth y tracker de rate-limit de signup.
 - **`/api/products`** — CRUD de productos (lectura pública, escritura solo admin).
+- **`/api/orders`** — checkout completo: preferencia de Mercado Pago, órdenes por transferencia,
+  cancelación, confirmación de pago, webhook de MP y expiración de pendientes.
+- **`/api/shipping`** — cotización de envío por código postal.
+- **`/api/admin/insights`** — analítica del asistente del panel admin (solo admin).
 - **`/api/cloudinary`** — firma de uploads y gestión de imágenes/carpetas vía Admin API de Cloudinary.
 
-La autenticación se basa en el **JWT de Supabase Auth** que emite el frontend: el backend lo
-**decodifica** para extraer el `sub` (user id) y busca el rol en `public.profiles`.
+La autenticación se basa en el **access token de Supabase Auth** que emite el frontend: el
+backend lo **verifica contra Supabase** (`GET /auth/v1/user`) y busca el rol en
+`public.profiles`. Ver §6.
 
 ---
 
@@ -32,8 +33,8 @@ La autenticación se basa en el **JWT de Supabase Auth** que emite el frontend: 
 | `express` | ^4.18.2 | servidor HTTP / routing |
 | `compression` | ^1.8.1 | gzip de las respuestas (el JSON del catálogo es muy repetitivo) |
 | `pg` | ^8.11.3 | cliente PostgreSQL (pool) |
-| `jsonwebtoken` | ^9.0.3 | **decodificar** el JWT de Supabase (no se verifica firma — ver §10) |
-| `bcryptjs` | ^2.4.3 | hashing de passwords (declarado; sin uso activo en el código actual) |
+| `jsonwebtoken` | ^9.0.3 | declarado; la verificación del token la hace `authMiddleware` contra Supabase Auth (ver §6) |
+| `bcryptjs` | ^2.4.3 | hashing de passwords (declarado; sin uso activo: las passwords las maneja Supabase Auth) |
 | `cors` | ^2.8.5 | CORS con allowlist por `FRONTEND_URL` |
 | `dotenv` | ^16.6.1 | variables de entorno |
 | `nodemon` | ^3.0.1 (dev) | hot-reload en desarrollo |
@@ -90,6 +91,7 @@ lia-store/
 │   ├── rateLimit.js            # límites por endpoint (ventana deslizante) con headers estándar
 │   ├── concurrencyLimit.js     # bulkhead + cola con timeout → 503 en vez de colapso
 │   ├── httpCache.js            # Cache-Control público / no-store
+│   ├── securityHeaders.js      # CSP/HSTS/nosniff/X-Frame-Options en toda respuesta
 │   └── signupTracker.js        # rate-limit de signup in-memory (Map por email)
 │
 ├── utils/
@@ -101,18 +103,15 @@ lia-store/
 │   ├── test-plan.md           # plan de pruebas (incluye TC-180–TC-193 de concurrencia y carga)
 │   └── load-test.js           # suite de carga y concurrencia sin dependencias
 │
-└── docs/
-    ├── SUPABASE_AUTH.md        # notas sobre el modelo de auth con Supabase
-    └── flows/
-        ├── flow-checkout.md
-        ├── flow-admin-assistant.md
-        ├── flow-despliegue-produccion.md
-        └── flow-concurrencia-carga.md   # capas de defensa ante carga y concurrencia
+└── docs/flows/
+    ├── flow-checkout.md
+    ├── flow-admin-assistant.md
+    ├── flow-despliegue-produccion.md
+    └── flow-concurrencia-carga.md   # capas de defensa ante carga y concurrencia
 ```
 
-> El repo trae además documentación propia: `README.md`, `ARCHITECTURE.md`, `QUICKSTART.md`,
-> `CHANGELOG.md`, `VERIFICATION_CHECKLIST.md`. Este documento las complementa con una vista
-> verificada contra el código actual.
+> Documentación del repo: este archivo (referencia técnica), `README.md` (entrada rápida),
+> `docs/flows/` (flujos de negocio), `qa/test-plan.md` y `CHANGELOG.md`.
 
 ---
 
@@ -155,16 +154,15 @@ config/database.js → Pool de conexiones pg
 |---|---|---|---|
 | GET | `/api/users/signup-status/:email` | pública | Estado de rate-limit de signup (solo lectura). |
 | POST | `/api/users/signup-ratelimit` | pública | Registra que Supabase devolvió rate-limit para un email. Body `{ email }`. |
-| POST | `/api/users/login` | pública | Login "de referencia": busca por email en `profiles`/`auth.users`. **No valida password** (ver §10/§11). |
-| GET | `/api/users/auth/:userId` | pública | Usuario por Supabase Auth ID. |
-| GET | `/api/users` | pública | Lista de perfiles (paginada `?limit&offset`, máx 100). |
-| POST | `/api/users` | pública | Legacy/obsoleto: devuelve nota de "crear vía Supabase Auth". |
-| GET | `/api/users/:id` | pública | Perfil por id. |
-| PUT | `/api/users/:id` | pública | Actualiza `name`/`role` (transacción, valida rol ∈ {user,admin}). |
-| DELETE | `/api/users/:id` | pública | Borra de `profiles` **y** `auth.users` (transacción). |
+| POST | `/api/users/login` | pública | Valida credenciales contra Supabase Auth (`/auth/v1/token?grant_type=password`) y devuelve el perfil. Rate limit 10/min. |
+| GET | `/api/users/auth/:userId` | **Bearer + admin** | Usuario por Supabase Auth ID. |
+| GET | `/api/users` | **Bearer + admin** | Lista de perfiles (paginada `?limit&offset`, máx 100). |
+| POST | `/api/users` | **Bearer + admin** | Legacy/obsoleto: devuelve nota de "crear vía Supabase Auth". |
+| GET | `/api/users/:id` | **Bearer + admin** | Perfil por id. |
+| PUT | `/api/users/:id` | **Bearer + admin** | Actualiza `name`/`role` (transacción, valida rol ∈ {user,admin}). |
+| DELETE | `/api/users/:id` | **Bearer + admin** | Borra de `profiles` **y** `auth.users` (transacción). |
 
-> ⚠️ Estas rutas de usuarios **no tienen `authMiddleware`**: hoy son públicas (cualquiera puede
-> listar, editar rol o borrar usuarios). Ver §10.
+> Todas las respuestas de este router van con `no-store`: son datos personales.
 
 ### 5.2 Productos — `/api/products` (`productRoutes.js` → `productController.js`)
 | Método | Ruta | Auth | Descripción |
@@ -180,18 +178,64 @@ Body de create/update (camelCase → columnas snake_case): `name`, `price`, `sto
 `discount` (admite null), `condition` (`new`/`used`), `freeShipping`, `variants`,
 `specifications`, `features`, `faqs` (JSONB), `warranty`, `returnPolicy`, `status`.
 
-### 5.3 Cloudinary — `/api/cloudinary` (`cloudinaryRoutes.js` → `cloudinaryController.js`)
+### 5.3 Órdenes y pagos — `/api/orders` (`orderRoutes.js` → `orderController.js`)
 | Método | Ruta | Auth | Descripción |
 |---|---|---|---|
-| GET | `/api/cloudinary/config` | pública | `{ cloudName, apiKey }`. |
-| GET | `/api/cloudinary/images` | pública | Lista recursos (`?folder&next_cursor`, Admin API). |
-| GET | `/api/cloudinary/folders` | pública | Lista carpetas (`?path`). |
-| POST | `/api/cloudinary/folders` | pública | Crea carpeta. Body `{ path }`. |
-| DELETE | `/api/cloudinary/folders` | pública | Borra carpeta. Body `{ path }`. |
-| POST | `/api/cloudinary/sign` | pública | Firma SHA1 de los params recibidos + `CLOUDINARY_API_SECRET`. |
-| POST | `/api/cloudinary/delete` | pública | Borra imagen. Body `{ publicId }`. |
+| POST | `/api/orders/mp-webhook` | pública (server a server) | Notificación de Mercado Pago; verifica el pago contra la API de MP y marca las ventas. Rate limit 240/min. |
+| POST | `/api/orders/transfer` | **Bearer** | Crea la orden por transferencia bancaria (el trigger de la BD descuenta stock). |
+| POST | `/api/orders/mp-preference` | **Bearer** | Valida stock con `SELECT … FOR UPDATE`, inserta ventas `pendiente` y crea la preferencia MP (`init_point`, `order_ids`). **409** si no hay stock; **503** sin `MP_ACCESS_TOKEN`. |
+| POST | `/api/orders/mp-confirm` | **Bearer** | Confirma el pago verificándolo contra la API de MP (no confía en la URL de retorno) y **compara el monto acreditado** con el total de las órdenes: si no coincide, **409**. |
+| GET | `/api/orders/user?email=` | **Bearer** | Órdenes del usuario. Solo el dueño o un admin (ajeno → **403**). |
+| POST | `/api/orders/nudge` | **Bearer** | Registra el recordatorio de pago pendiente. |
+| POST | `/api/orders/:id/cancel` | **Bearer** | Cancela una orden propia y restaura stock (ajena → **403**). |
+| PATCH | `/api/orders/:id/confirm-transfer` | **Bearer + admin** | Confirma la transferencia → `pagado` (no re-descuenta stock). Ya resuelta → **409**. |
+| PATCH | `/api/orders/:id/cancel-transfer` | **Bearer + admin** | Cancela la transferencia → `cancelado` + stock restaurado. |
 
-### 5.4 Utilidades
+**El importe lo decide el servidor.** `reserveOrders` lee `price`/`discount`/`original_price` en el
+mismo `SELECT … FOR UPDATE` que bloquea el stock y recalcula `unit_price`/`total_price`; el
+`unitPrice` del body se ignora. La regla replica `getProductPricing` del frontend
+(`src/utils/pricing.ts`): **si cambia una, hay que cambiar la otra**. El costo de envío se valida
+contra la tarifa de `shippingController` (`local` 0, `correo` `CORREO_COST`, `moto` variable
+acotado). Un ítem sin `productId` se rechaza con 400: sin producto no hay precio verificable.
+
+Rate limits: checkout 12/min (`transfer`, `mp-preference`), mutaciones 40/min. Todo `no-store`.
+Además, `server.js` corre `expireStaleOrders` cada 60 s: expira pendientes vencidas (MP 15 min,
+transferencia 5 h) y restaura stock. Detalle del flujo en `docs/flows/flow-checkout.md`.
+
+### 5.4 Envíos — `/api/shipping` (`shippingRoutes.js` → `shippingController.js`)
+| Método | Ruta | Auth | Descripción |
+|---|---|---|---|
+| GET | `/api/shipping?postalCode=` | pública | Cotización por código postal. Cacheable 5 min (`publicCache(300)`), rate limit 120/min. |
+
+### 5.5 Analítica admin — `/api/admin/insights` (`insightsRoutes.js` → `insightsController.js`)
+Todo el router es **Bearer + admin**, `no-store`, rate limit 60/min y con caché en memoria de 60 s.
+Respuesta uniforme `{ success, insight }`.
+
+| Método | Ruta | Descripción |
+|---|---|---|
+| GET | `/low-stock?threshold=` | Productos activos bajo el umbral (default 5, clamp 1–100). |
+| GET | `/sales-today` | Facturación, pedidos y unidades pagadas del día. |
+| GET | `/pending-payment` | Pedidos `pendiente` (split MP / transferencia). |
+| GET | `/pending-pickups` | Retiros en local por WhatsApp pendientes de confirmar. |
+| GET | `/top-products` | Top de unidades vendidas del mes vs. mes anterior. |
+| GET | `/sales-growth` | Productos con mayor crecimiento vs. mes anterior. |
+| GET | `/pickups-to-confirm` | Retiros en local pagados, pendientes de entrega. |
+
+### 5.6 Cloudinary — `/api/cloudinary` (`cloudinaryRoutes.js` → `cloudinaryController.js`)
+| Método | Ruta | Auth | Descripción |
+|---|---|---|---|
+| GET | `/api/cloudinary/config` | pública | `{ cloudName, apiKey }` — datos no sensibles que necesita el widget. Cacheable 5 min. |
+| GET | `/api/cloudinary/images` | **Bearer + admin** | Lista recursos (`?folder&next_cursor`, Admin API). |
+| GET | `/api/cloudinary/usage` | **Bearer + admin** | Uso de la cuenta (cuota de almacenamiento). |
+| GET | `/api/cloudinary/folders` | **Bearer + admin** | Lista carpetas (`?path`). |
+| POST | `/api/cloudinary/folders` | **Bearer + admin** | Crea carpeta. Body `{ path }`. |
+| DELETE | `/api/cloudinary/folders` | **Bearer + admin** | Borra carpeta. Body `{ path }`. |
+| POST | `/api/cloudinary/sign` | **Bearer + admin** | Firma SHA1 de los params recibidos + `CLOUDINARY_API_SECRET` (que nunca se expone). |
+| POST | `/api/cloudinary/delete` | **Bearer + admin** | Borra imagen. Body `{ publicId }`. |
+
+Rate limit 60/min: cada request consume cuota de la API de Cloudinary.
+
+### 5.7 Utilidades
 | Método | Ruta | Descripción |
 |---|---|---|
 | GET | `/` | Info de la API (`{ message, version }`). |
@@ -204,13 +248,21 @@ Body de create/update (camelCase → columnas snake_case): `name`, `price`, `sto
 
 - **Origen del token**: el frontend obtiene el JWT de **Supabase Auth** y lo manda en
   `Authorization: Bearer <token>`.
-- **`authMiddleware`**: hace `jwt.decode(token)` (**sin verificar firma**), toma `decoded.sub`
-  como user id, y consulta `SELECT id, role, name FROM public.profiles WHERE id = $1`. Si existe,
-  setea `req.user = { id, name, role }`.
+- **`authMiddleware`**: **verifica el token contra Supabase Auth** (`GET /auth/v1/user` con el
+  token como Bearer y la `SUPABASE_ANON_KEY` como `apikey`). Supabase valida firma, expiración y
+  revocación. Con el `id` devuelto consulta `SELECT id, role, name FROM public.profiles WHERE id = $1`
+  y setea `req.user = { id, name, email, role }`. Sin `SUPABASE_URL` / `SUPABASE_ANON_KEY`
+  responde **503**; token ausente o inválido → **401**.
+- **Caché de verificación**: el resultado se cachea por `CACHE_TTL_AUTH_SECONDS` (30 s por
+  defecto, `0` desactiva) bajo una clave **SHA-256 del token** (nunca el token en claro), con
+  single-flight para no disparar N verificaciones del mismo token en paralelo. Solo se cachean
+  verificaciones exitosas. **Trade-off explícito**: un token revocado puede seguir siendo
+  aceptado hasta que expire el TTL.
 - **`adminMiddleware`**: debe ir después de `authMiddleware`; exige `req.user.role === 'admin'`
   (403 si no).
-- Hoy **solo `/api/products` (POST/PUT/DELETE)** usa esta cadena. El resto de mutaciones
-  (usuarios) están sin protección.
+- **Cobertura**: la cadena protege las escrituras de productos, **todo** el router de usuarios
+  salvo login/signup-status/signup-ratelimit, órdenes (salvo el webhook de MP), la analítica
+  admin completa y Cloudinary salvo `/config`.
 
 ---
 
@@ -235,8 +287,9 @@ Acceso directo con `pg` al Postgres de Supabase (esquemas `public` y `auth`).
 
 ## 8. Configuración (variables de entorno)
 
-Definidas en `.env` (plantilla en `.env.example`). El backend usa **conexión directa a Postgres**
-(`DB_*`), no `SUPABASE_URL`/`SUPABASE_KEY`.
+Definidas en `.env` (plantilla en `.env.example`). Los datos se leen por **conexión directa a
+Postgres** (`DB_*`); `SUPABASE_URL` / `SUPABASE_ANON_KEY` se usan **solo** para verificar tokens
+de Supabase Auth y para el login.
 
 | Variable | Requerida | Uso |
 |---|---|---|
@@ -255,6 +308,7 @@ Definidas en `.env` (plantilla en `.env.example`). El backend usa **conexión di
 | `SUPABASE_ANON_KEY` | ✅ (auth) | Anon key usada en la verificación del token y en `userController`. |
 | `MP_ACCESS_TOKEN` | ✅ (Mercado Pago) | **Secreto.** Sin ella, `/api/orders/mp-*` responde **503**; la transferencia bancaria sigue funcionando. |
 | `MP_WEBHOOK_URL` | — | URL pública del webhook (`https://…/api/orders/mp-webhook`). En local no aplica salvo que expongas el backend por túnel. |
+| `MP_WEBHOOK_SECRET` | — (recomendada en prod) | **Secreto.** Firma del webhook (panel MP → Webhooks). Si está, se valida `x-signature` y se rechaza con **401** lo que no cuadre; si falta, el webhook igual revalida cada pago contra la API de MP. |
 
 ### 8.1 Concurrencia, carga y caché (opcionales)
 
@@ -350,53 +404,67 @@ El frontend vive en `../../FRONT/damiana-bella` (repo git propio) y apunta acá 
 
 ---
 
-## 10. Riesgos de seguridad detectados (a revisar)
+## 10. Seguridad — estado actual
 
-> Hallazgos verificados en el código actual. No los corregí (la tarea era documentar), pero
-> conviene tratarlos antes de producción. Referencia: `../../skill/04-security.md`.
+> Referencia: `../../skill/04-security.md`. Verificado contra el código.
 
-1. **JWT sin verificación de firma** (`authMiddleware.js`): usa `jwt.decode`, no `jwt.verify`.
-   Cualquiera puede forjar un token con un `sub` arbitrario; si ese `sub` existe en `profiles`
-   con rol `admin`, obtiene acceso admin. **Debe verificarse la firma** contra el JWKS/secret de
-   Supabase.
-2. **Rutas de usuarios sin auth**: `GET/PUT/DELETE /api/users(/:id)` son públicas → listar
-   usuarios, **cambiar roles** (escalada de privilegios) y borrar cuentas sin autenticación.
-3. **Credenciales reales en `.env.example`**: incluye `DB_HOST` real y `DB_PASSWORD` en claro.
-   Si el repo es/llega a ser público, la BD queda expuesta. **Rotar la password** y dejar la
-   plantilla con valores vacíos/placeholder.
-4. **`CLOUDINARY_*` ausentes en `.env.example`**: el código las usa pero no están documentadas
-   en la plantilla → arranque/firmas fallan silenciosamente.
-5. **Logging sensible**: `authMiddleware` y `cloudinaryController` hacen `console.log` de tokens
-   (parciales) y firmas. Quitar en producción.
-6. **`login` no valida password**: `POST /api/users/login` devuelve datos del usuario solo con
-   el email (la comparación de hash está comentada). No usar como mecanismo de autenticación.
+**Resuelto** (los hallazgos originales de esta sección ya no aplican):
+
+- **Verificación del token**: `authMiddleware` valida contra Supabase Auth, no decodifica sin
+  verificar. Ver §6.
+- **Rutas de usuarios protegidas**: todo el CRUD de `/api/users` exige Bearer + rol admin.
+- **`login` valida credenciales** contra Supabase Auth (`grant_type=password`).
+- **`.env.example` con placeholders**, sin credenciales reales.
+- **Rate limiting por endpoint** con ventana deslizante y headers estándar (`middleware/rateLimit.js`),
+  más estricto en login (10/min) y checkout (12/min).
+- **Logs estructurados** (`utils/logger.js`) sin tokens ni PII; la caché de auth indexa por
+  SHA-256 del token.
+- **SQL parametrizado** en todas las queries; transacciones y `FOR UPDATE` en el stock.
+- **Precio e importe decididos por el servidor** en el checkout, y monto del pago contrastado
+  contra el total de las órdenes antes de marcarlas pagadas (ver §5.3).
+- **CORS con allowlist** por `FRONTEND_URL` (nunca `*` en producción).
+
+- **Headers de seguridad** en toda respuesta (`middleware/securityHeaders.js`): CSP restrictiva,
+  `nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy`, CORP y HSTS cuando se sirve por HTTPS.
+- **Firma del webhook de MP** verificada con HMAC-SHA256 y comparación en tiempo constante
+  cuando `MP_WEBHOOK_SECRET` está configurada.
+- **`npm run audit`** (`--audit-level=high`) disponible como paso previo al deploy.
+
+**RLS y permisos de Supabase** — ver `db/migrations/2026-08-09_rls_hardening.sql`. La `anon key`
+es pública (viaja en el bundle del front), así que todo lo que `anon`/`authenticated` puedan hacer
+en la base lo puede hacer cualquiera. La migración activa RLS en las tablas que no la tenían,
+acota los `GRANT` y **revoca `TRUNCATE`** (que no está sujeto a RLS). El backend conecta como
+`postgres` (dueño), así que no le afecta.
+
+**Pendiente / a vigilar:**
+
+1. **Historial de git con credenciales**: `README.md`, `QUICKSTART.md` y `VERIFICATION_CHECKLIST.md`
+   tuvieron el host y la password de la BD en claro. Los archivos ya se limpiaron/eliminaron, pero
+   **siguen en el historial de ambos remotos** (`origin` y `lia-back`). **Rotar la password de la BD**
+   es obligatorio; borrar el archivo no alcanza.
+2. **TTL de la caché de auth**: un token revocado sigue siendo válido hasta 30 s
+   (`CACHE_TTL_AUTH_SECONDS`). Aceptable para este dominio; bajarlo a `0` si alguna vez importa
+   la revocación inmediata.
+3. **Sin headers de seguridad HTTP** (`helmet`, CSP, HSTS) en el backend. Hoy los aporta la capa
+   de hosting/`vercel.json` del front; conviene sumarlos también acá.
+4. **Auditoría de dependencias**: no hay `npm audit` en un pipeline automático.
 
 ---
 
-## 11. Discrepancias con el frontend actual (importante)
+## 11. Contrato con el frontend
 
-El frontend en `../../FRONT/damiana-bella` migró a un **esquema de auth con JWT propio** y usa
-endpoints que **este backend no implementa**. Es decir, **este backend corresponde a una versión
-anterior** (auth basada en el token de Supabase). Lo que el front llama y acá **falta**:
+El frontend (`../../FRONT/damiana-bella`, repo propio) y este backend están **alineados**:
 
-- **Auth propia (`/api/auth/*`)**: `register`, `login`, `logout`, `me`, `refresh`,
-  `confirm-email`, `resend-confirmation`, `forgot-password`, `reset-password`, `change-password`.
-  Acá la auth vive en `/api/users` con otro contrato.
-- **Órdenes/pagos (`/api/orders/*`)**: `mp-preference` (Mercado Pago), `user?email=`,
-  `:id/cancel`, `:id/confirm-transfer`, `:id/cancel-transfer`. **No existen.**
-- **Envíos (`/api/shipping`)**: cálculo por código postal. **No existe.**
-- **`/api/cloudinary/usage`**: el front lo consume; acá no está implementado (sí están
-  `config`, `images`, `folders`, `sign`, `delete`).
+- **Auth**: la maneja **Supabase Auth desde el front** (`signInWithPassword`, `signUp`,
+  `verifyOtp`, `resetPasswordForEmail`). No hay endpoints `/api/auth/*` acá y **no hacen falta**:
+  el backend solo verifica el access token que el front adjunta.
+- **Órdenes, envíos, insights y Cloudinary**: implementados (§5.3 a §5.6) y consumidos por
+  `src/services/orderService.ts`, `shippingService`, `insightsService` y `productService`.
+- **Transferencias**: el front **no** inserta en `ventas` directo por Supabase (lo bloqueaba RLS);
+  usa `POST /api/orders/transfer`, que corre con el pool del backend.
 
-Además, en el código actual hay **referencias rotas**: `userController.loginUser` llama a
-`User.findByEmail` y `getUserByAuthId` llama a `User.findByUserId`, pero **esos métodos no
-existen** en `models/User.js` (solo `findById`, `findAll`, `findByIdAndUpdate`,
-`findByIdAndDelete`). Esas rutas lanzarían error en runtime.
-
-> **Conclusión:** para que este backend sirva al frontend actual hay que **alinear contratos**
-> (implementar auth JWT, orders, shipping, cloudinary/usage y proteger las rutas de usuarios), o
-> bien reemplazar este backend por el que el frontend espera. Esto **excede** la tarea de
-> documentar: queda señalado como decisión pendiente.
+> Al cambiar cualquier contrato de esta lista, actualizar también
+> `../../FRONT/damiana-bella/DOCUMENTACION_FRONTEND.md` §6 en el mismo cambio.
 
 ---
 

@@ -3,6 +3,8 @@
  * Requiere MP_ACCESS_TOKEN en el entorno (Access Token del vendedor).
  */
 
+const crypto = require('crypto');
+
 const MP_API_BASE = 'https://api.mercadopago.com';
 
 // Tolera valores pegados con comillas en el .env (mismo criterio que cloudinaryController)
@@ -45,4 +47,43 @@ const createPreference = (preference) =>
 const getPayment = (paymentId) =>
   mpRequest(`/v1/payments/${encodeURIComponent(paymentId)}`);
 
-module.exports = { isConfigured, createPreference, getPayment };
+/**
+ * Verifica la firma `x-signature` de una notificación de webhook.
+ *
+ * Mercado Pago firma con HMAC-SHA256 sobre el manifest
+ *   `id:<data.id>;request-id:<x-request-id>;ts:<ts>;`
+ * usando la clave secreta del webhook (panel de MP → Webhooks).
+ *
+ * Si `MP_WEBHOOK_SECRET` no está configurada devuelve `null` ("no verificable"),
+ * y el caller decide: hoy el webhook igual revalida el pago contra la API de MP,
+ * así que sin secreto sigue siendo seguro, solo menos estricto.
+ *
+ * @returns {boolean|null} true/false si se pudo verificar, null si no hay secreto.
+ */
+const verifyWebhookSignature = ({ signatureHeader, requestId, dataId }) => {
+  const secret = (process.env.MP_WEBHOOK_SECRET || '').trim().replace(/^['"]|['"]$/g, '');
+  if (!secret) return null;
+  if (!signatureHeader || !dataId) return false;
+
+  // Formato: "ts=1704908010,v1=618c85345248dd820d5fd456117c2ab2ef8eda45a0282ff693eac24131a5e839"
+  const parts = String(signatureHeader).split(',').reduce((acc, chunk) => {
+    const [key, value] = chunk.split('=');
+    if (key && value) acc[key.trim()] = value.trim();
+    return acc;
+  }, {});
+
+  const { ts, v1 } = parts;
+  if (!ts || !v1) return false;
+
+  const manifest = `id:${String(dataId).toLowerCase()};request-id:${requestId || ''};ts:${ts};`;
+  const expected = crypto.createHmac('sha256', secret).update(manifest).digest('hex');
+
+  // Comparación en tiempo constante: una comparación normal filtra por timing
+  // cuántos bytes iniciales acertó un atacante que itere sobre la firma.
+  const expectedBuffer = Buffer.from(expected, 'utf8');
+  const receivedBuffer = Buffer.from(v1, 'utf8');
+  if (expectedBuffer.length !== receivedBuffer.length) return false;
+  return crypto.timingSafeEqual(expectedBuffer, receivedBuffer);
+};
+
+module.exports = { isConfigured, createPreference, getPayment, verifyWebhookSignature };

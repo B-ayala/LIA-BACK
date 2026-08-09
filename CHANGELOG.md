@@ -81,6 +81,55 @@
 - `DOCUMENTACION_BACKEND.md` §9 "Cómo levantar el proyecto": Node 22.x, comandos completos,
   nota sobre el arranque bloqueante por conexión a BD y el sweep de órdenes, nuevas
   §9.1 (stack completo backend + frontend) y §9.2 (tabla de problemas frecuentes en local).
+- **Endurecimiento de RLS y permisos en Supabase** (`db/migrations/2026-08-09_rls_hardening.sql`,
+  **pendiente de aplicar**). Auditoría del catálogo de la base: `profiles` tenía **RLS desactivada**
+  con `UPDATE` concedido a `anon`/`authenticated` → cualquiera con la anon key (que es pública)
+  podía hacer `UPDATE profiles SET role='admin'` y tomar el panel completo. Misma exposición en
+  `ventas_archivadas` (34 filas con PII de compradores), `contact_messages`, `site_content`,
+  `carousel_images`, `email_tokens` y `refresh_tokens`. Además `TRUNCATE` —que **no** respeta
+  RLS— estaba concedido en todas las tablas. La migración activa RLS, define políticas
+  self/admin y revoca los privilegios de más, preservando los accesos que hoy usa el frontend.
+- **`ventas`: se elimina la política `ventas_insert_public`** (`CHECK (true)`): permitía insertar
+  ventas con la anon key y, vía el trigger `trg_decrement_stock`, vaciar el stock sin comprar.
+  Las altas ya van por `POST /api/orders/transfer`.
+- **Headers de seguridad en toda respuesta** (`middleware/securityHeaders.js`): CSP, `nosniff`,
+  `X-Frame-Options: DENY`, `Referrer-Policy`, `Cross-Origin-Resource-Policy` y HSTS bajo HTTPS.
+  Sin dependencias nuevas: para una API que solo devuelve JSON, `helmet` aportaba seis cabeceras
+  y una dependencia más.
+- **Firma del webhook de Mercado Pago verificada** (HMAC-SHA256 sobre el manifest de MP, con
+  `crypto.timingSafeEqual`) cuando `MP_WEBHOOK_SECRET` está definida; si falta, se mantiene el
+  comportamiento anterior (revalidación del pago contra la API de MP).
+- **`npm run audit`** agregado (`--audit-level=high`). Estado actual: 0 vulnerabilidades.
+- **El precio de la compra ya no lo define el cliente** (BUG-001, crítico). `unitPrice`,
+  `totalPrice` y `shippingCost` llegaban en el body y se persistían sin contrastarlos contra
+  `productos`: cualquier usuario podía comprar por $1 manipulando el request. Ahora
+  `reserveOrders` toma `price`/`discount`/`original_price` de la base en el mismo
+  `SELECT … FOR UPDATE` que ya bloqueaba el stock y recalcula el importe server-side
+  (misma regla que `getProductPricing` del frontend, incluidos descuentos y promociones).
+  La preferencia de Mercado Pago se arma con esos precios, no con los del body.
+- **Costo de envío validado contra la tarifa del servidor**: `local` = 0 y `correo` = `CORREO_COST`
+  (importado de `shippingController`, fuente única); `moto` sigue siendo variable pero acotado.
+  Un método de envío desconocido devuelve **400**.
+- **Control de monto en la acreditación de pagos**: `mp-confirm` y el webhook comparan el
+  `transaction_amount` de Mercado Pago contra la suma de las órdenes (± $1 de tolerancia por
+  redondeo). Si no coincide, no se marca nada como pagado: `mp-confirm` responde **409** y
+  ambos registran `mp_*_amount_mismatch`.
+- **Ítems sin `productId` rechazados** en el checkout (**400**): sin producto identificable no hay
+  precio verificable contra la base. Antes se aceptaban con el precio del body.
+- **Credenciales de la BD eliminadas de la documentación**: `README.md`, `QUICKSTART.md` y
+  `VERIFICATION_CHECKLIST.md` tenían el `DB_HOST` y la `DB_PASSWORD` reales en claro. ⚠️ Siguen
+  en el historial de git de ambos remotos: **la password de la base debe rotarse**.
+- **Documentación obsoleta eliminada**: `ARCHITECTURE.md`, `QUICKSTART.md`,
+  `VERIFICATION_CHECKLIST.md` y `docs/SUPABASE_AUTH.md` describían la migración
+  MongoDB → PostgreSQL y contradecían el estado real del código.
+- `README.md` reescrito: entrada corta y verificada (áreas de la API, puesta en marcha, índice
+  de documentación) en lugar de la guía de migración con credenciales.
+- `DOCUMENTACION_BACKEND.md` §1, §2, §5, §6, §10 y §11 corregidos contra el código: la doc
+  afirmaba que `authMiddleware` decodificaba el JWT sin verificar firma, que las rutas de
+  usuarios eran públicas, que `login` no validaba password y que el backend no implementaba
+  `/orders` ni `/shipping`. Nada de eso era cierto. Se documentaron los routers de órdenes,
+  envíos, insights y el `/cloudinary/usage` faltante.
+- `CLAUDE.md`: mismas correcciones sobre auth y contrato con el frontend.
 
 ### Added
 - **Documentación del despliegue a producción** (`docs/flows/flow-despliegue-produccion.md`):
