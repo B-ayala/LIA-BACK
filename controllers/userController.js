@@ -1,5 +1,25 @@
 const User = require('../models/User');
 const { getStatus, recordRateLimit } = require('../middleware/signupTracker');
+const { checkLock, recordFailure, recordSuccess } = require('../middleware/loginBruteforce');
+const logger = require('../utils/logger');
+
+/**
+ * Responde un error de servidor sin exponer internals (detalle de Postgres,
+ * mensajes de Supabase, etc.). El detalle real va al log estructurado.
+ */
+const serverError = (res, action, error) => {
+  logger.error(`users_${action}_failed`, { error: error.message });
+  return res.status(500).json({
+    success: false,
+    code: 'INTERNAL_ERROR',
+    message: 'No se pudo completar la operación. Reintentá en unos segundos.',
+  });
+};
+
+// Mensajes de validación de dominio que el modelo lanza intencionalmente
+// (ver models/User.js): son los únicos seguros de reenviar al cliente tal cual.
+const SAFE_USER_VALIDATION_ERROR =
+  /^Error al (actualizar|eliminar) usuario: (El nombre no puede tener más de 100 caracteres|El rol debe ser "user" o "admin"|Debe proporcionar al menos un campo para actualizar \(name o role\)|Usuario no encontrado)$/;
 
 /**
  * @desc    Login de usuario
@@ -15,6 +35,17 @@ exports.loginUser = async (req, res) => {
       return res.status(400).json({
         success: false,
         message: 'Email y contraseña son requeridos'
+      });
+    }
+
+    const lock = checkLock(email);
+    if (lock.locked) {
+      res.setHeader('Retry-After', lock.retryAfterSeconds);
+      logger.warn('login_locked', { retryAfterSeconds: lock.retryAfterSeconds });
+      return res.status(429).json({
+        success: false,
+        code: 'ACCOUNT_LOCKED',
+        message: 'Demasiados intentos fallidos. Esperá antes de volver a intentar.'
       });
     }
 
@@ -35,6 +66,7 @@ exports.loginUser = async (req, res) => {
     });
 
     if (!authResponse.ok) {
+      recordFailure(email);
       return res.status(401).json({
         success: false,
         message: 'Credenciales inválidas'
@@ -50,6 +82,8 @@ exports.loginUser = async (req, res) => {
       });
     }
 
+    recordSuccess(email);
+
     res.status(200).json({
       success: true,
       data: {
@@ -61,7 +95,7 @@ exports.loginUser = async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('Error en loginUser:', error);
+    logger.error('users_login_failed', { error: error.message });
     res.status(500).json({
       success: false,
       message: 'No se pudo validar las credenciales'
@@ -90,11 +124,7 @@ exports.getUsers = async (req, res) => {
       data: result.users
     });
   } catch (error) {
-    console.error('Error en getUsers:', error);
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    return serverError(res, 'list', error);
   }
 };
 
@@ -127,11 +157,7 @@ exports.getUserById = async (req, res) => {
       data: user
     });
   } catch (error) {
-    console.error('Error en getUserById:', error);
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    return serverError(res, 'get_by_id', error);
   }
 };
 
@@ -170,10 +196,10 @@ exports.createUser = async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('Error en createUser:', error);
+    logger.error('users_create_failed', { error: error.message });
     res.status(400).json({
       success: false,
-      message: error.message
+      message: 'No se pudo completar la operación.'
     });
   }
 };
@@ -217,19 +243,19 @@ exports.updateUser = async (req, res) => {
       data: user
     });
   } catch (error) {
-    console.error('Error en updateUser:', error);
-    
-    // Detectar error de email duplicado
-    if (error.message.includes('ya está en uso')) {
-      return res.status(409).json({
-        success: false,
-        message: error.message
-      });
+    logger.error('users_update_failed', { error: error.message });
+
+    // El modelo lanza mensajes de validación de dominio conocidos (rol
+    // inválido, nombre demasiado largo, no encontrado): son seguros de
+    // mostrar. Cualquier otro error (fallo real de Postgres) no se reenvía
+    // tal cual al cliente.
+    if (SAFE_USER_VALIDATION_ERROR.test(error.message)) {
+      return res.status(400).json({ success: false, message: error.message });
     }
 
     res.status(400).json({
       success: false,
-      message: error.message
+      message: 'No se pudo actualizar el usuario. Verificá los datos e intentá de nuevo.'
     });
   }
 };
@@ -264,11 +290,11 @@ exports.deleteUser = async (req, res) => {
       data: user
     });
   } catch (error) {
-    console.error('Error en deleteUser:', error);
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    if (SAFE_USER_VALIDATION_ERROR.test(error.message)) {
+      logger.warn('users_delete_rejected', { error: error.message });
+      return res.status(400).json({ success: false, message: error.message });
+    }
+    return serverError(res, 'delete', error);
   }
 };
 
@@ -322,10 +348,6 @@ exports.getUserByAuthId = async (req, res) => {
       data: user
     });
   } catch (error) {
-    console.error('Error en getUserByAuthId:', error);
-    res.status(500).json({
-      success: false,
-      message: error.message
-    });
+    return serverError(res, 'get_by_auth_id', error);
   }
 };

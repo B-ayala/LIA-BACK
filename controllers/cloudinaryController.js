@@ -1,5 +1,33 @@
 const crypto = require('crypto');
 const https = require('https');
+const logger = require('../utils/logger');
+
+/**
+ * Responde un error de servidor sin exponer internals (respuesta cruda de
+ * Cloudinary, mensajes de red, etc.). El detalle real va al log estructurado.
+ */
+const serverError = (res, action, error) => {
+  logger.error(`cloudinary_${action}_failed`, { error: error.message });
+  return res.status(502).json({
+    success: false,
+    code: 'CLOUDINARY_ERROR',
+    message: 'No se pudo completar la operación con Cloudinary. Reintentá en unos segundos.',
+  });
+};
+
+/**
+ * Un segmento de carpeta válido para la API de Cloudinary: sin `..`, sin `/`
+ * dentro del segmento, sin vacíos. Rechaza cualquier intento de escapar del
+ * namespace de carpetas (ej. `productos/../../otra-cuenta`).
+ */
+const FOLDER_SEGMENT_RE = /^[A-Za-z0-9 _-]+$/;
+
+/** @returns {string[]|null} segmentos saneados, o null si el path es inválido. */
+const sanitizeFolderPath = (rawPath) => {
+  const segments = String(rawPath).split('/');
+  const isValid = segments.every((segment) => segment !== '..' && FOLDER_SEGMENT_RE.test(segment));
+  return isValid ? segments : null;
+};
 
 const generateSignature = (req, res) => {
   try {
@@ -35,11 +63,7 @@ const generateSignature = (req, res) => {
       },
     });
   } catch (error) {
-    console.error('Cloudinary signature error:', error);
-    res.status(500).json({
-      success: false,
-      message: error.message,
-    });
+    serverError(res, 'generate_signature', error);
   }
 };
 
@@ -84,30 +108,16 @@ const deleteImage = async (req, res) => {
             data: result,
           });
         } catch (parseError) {
-          console.error('Parse error:', parseError);
-          res.status(500).json({
-            success: false,
-            message: 'No se pudo analizar la respuesta de Cloudinary',
-          });
+          serverError(res, 'delete_image_parse', parseError);
         }
       });
     });
 
-    request.on('error', (error) => {
-      console.error('Cloudinary delete error:', error);
-      res.status(500).json({
-        success: false,
-        message: error.message,
-      });
-    });
+    request.on('error', (error) => serverError(res, 'delete_image', error));
 
     request.end();
   } catch (error) {
-    console.error('Delete handler error:', error);
-    res.status(500).json({
-      success: false,
-      message: error.message,
-    });
+    serverError(res, 'delete_image', error);
   }
 };
 
@@ -153,21 +163,16 @@ const getImages = async (req, res) => {
           }
           res.json({ success: true, data: result });
         } catch (parseError) {
-          console.error('Parse error:', parseError);
-          res.status(500).json({ success: false, message: 'No se pudo analizar la respuesta de Cloudinary' });
+          serverError(res, 'get_images_parse', parseError);
         }
       });
     });
 
-    request.on('error', (error) => {
-      console.error('Cloudinary getImages error:', error);
-      res.status(500).json({ success: false, message: error.message });
-    });
+    request.on('error', (error) => serverError(res, 'get_images', error));
 
     request.end();
   } catch (error) {
-    console.error('getImages handler error:', error);
-    res.status(500).json({ success: false, message: error.message });
+    serverError(res, 'get_images', error);
   }
 };
 
@@ -195,8 +200,7 @@ const getUsage = async (_req, res) => {
 
     res.json({ success: true, data: mapUsageResponse(result) });
   } catch (error) {
-    console.error('getUsage error:', error);
-    res.status(500).json({ success: false, message: error.message });
+    serverError(res, 'get_usage', error);
   }
 };
 
@@ -235,15 +239,20 @@ const cloudinaryRequest = (method, path, body) => {
 const getFolders = async (req, res) => {
   try {
     const { path: folderPath } = req.query;
-    const apiPath = folderPath
-      ? `/v1_1/${process.env.CLOUDINARY_CLOUD_NAME}/folders/${encodeURIComponent(folderPath)}`
-      : `/v1_1/${process.env.CLOUDINARY_CLOUD_NAME}/folders`;
+    let apiPath = `/v1_1/${process.env.CLOUDINARY_CLOUD_NAME}/folders`;
+
+    if (folderPath) {
+      const segments = sanitizeFolderPath(folderPath);
+      if (!segments) {
+        return res.status(400).json({ success: false, message: 'El path de la carpeta no es válido' });
+      }
+      apiPath += `/${segments.map(encodeURIComponent).join('/')}`;
+    }
 
     const result = await cloudinaryRequest('GET', apiPath, null);
     res.json({ success: true, data: result });
   } catch (error) {
-    console.error('getFolders error:', error);
-    res.status(500).json({ success: false, message: error.message });
+    serverError(res, 'get_folders', error);
   }
 };
 
@@ -253,13 +262,16 @@ const createFolder = async (req, res) => {
     if (!folderPath) {
       return res.status(400).json({ success: false, message: 'El path de la carpeta es requerido' });
     }
+    const segments = sanitizeFolderPath(folderPath);
+    if (!segments) {
+      return res.status(400).json({ success: false, message: 'El path de la carpeta no es válido' });
+    }
 
-    const apiPath = `/v1_1/${process.env.CLOUDINARY_CLOUD_NAME}/folders/${folderPath.split('/').map(encodeURIComponent).join('/')}`;
+    const apiPath = `/v1_1/${process.env.CLOUDINARY_CLOUD_NAME}/folders/${segments.map(encodeURIComponent).join('/')}`;
     const result = await cloudinaryRequest('POST', apiPath, null);
     res.json({ success: true, data: result });
   } catch (error) {
-    console.error('createFolder error:', error);
-    res.status(500).json({ success: false, message: error.message });
+    serverError(res, 'create_folder', error);
   }
 };
 
@@ -269,13 +281,16 @@ const deleteFolder = async (req, res) => {
     if (!folderPath) {
       return res.status(400).json({ success: false, message: 'El path de la carpeta es requerido' });
     }
+    const segments = sanitizeFolderPath(folderPath);
+    if (!segments) {
+      return res.status(400).json({ success: false, message: 'El path de la carpeta no es válido' });
+    }
 
-    const apiPath = `/v1_1/${process.env.CLOUDINARY_CLOUD_NAME}/folders/${folderPath.split('/').map(encodeURIComponent).join('/')}`;
+    const apiPath = `/v1_1/${process.env.CLOUDINARY_CLOUD_NAME}/folders/${segments.map(encodeURIComponent).join('/')}`;
     const result = await cloudinaryRequest('DELETE', apiPath, null);
     res.json({ success: true, data: result });
   } catch (error) {
-    console.error('deleteFolder error:', error);
-    res.status(500).json({ success: false, message: error.message });
+    serverError(res, 'delete_folder', error);
   }
 };
 

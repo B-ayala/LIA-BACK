@@ -39,12 +39,8 @@ const createProduct = async (req, res) => {
       sizeGuide, status, images,
     } = req.body;
 
-    if (!name || !price) {
-      return res.status(400).json({
-        success: false,
-        message: 'El nombre y el precio son requeridos',
-      });
-    }
+    // name y price ya vienen validados por el schema Zod de la ruta (ver
+    // schemas/productSchema.js).
 
     // Un producto activo sin stock queda oculto en la tienda (el catálogo filtra
     // stock > 0), así que el estado sería engañoso. Se valida también acá, no sólo

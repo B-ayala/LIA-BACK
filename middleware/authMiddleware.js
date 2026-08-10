@@ -174,29 +174,6 @@ const adminMiddleware = (req, res, next) => {
   }
 };
 
-/**
- * Middleware para manejo de errores de validación
- */
-const errorHandler = (err, req, res, next) => {
-  console.error('Error:', err);
-  
-  // Error de base de datos
-  if (err.code && err.code.startsWith('P')) {
-    return res.status(400).json({
-      success: false,
-      message: 'Error en la base de datos',
-      ...(process.env.NODE_ENV === 'development' && { error: err.message })
-    });
-  }
-  
-  // Error genérico
-  res.status(err.status || 500).json({
-    success: false,
-    message: err.message || 'Error interno del servidor',
-    ...(process.env.NODE_ENV === 'development' && { stack: err.stack })
-  });
-};
-
 module.exports = {
   authMiddleware,
   adminMiddleware

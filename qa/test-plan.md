@@ -786,6 +786,73 @@ Pasos:
 Esperado: CSP, X-Content-Type-Options, X-Frame-Options, Referrer-Policy y CORP en
   ambas; sin X-Powered-By; HSTS solo cuando se sirve por HTTPS
 Resultado: no probado
+
+ID: TC-204
+Caso: Errores de usuarios/Cloudinary no filtran detalle interno
+Tipo: security
+Pasos:
+  1. GET /api/users/:id con un id que provoque un error de Postgres (ej. no-UUID)
+  2. POST /api/cloudinary/sign con body vacío ({})
+Esperado: la respuesta trae un mensaje genérico (`INTERNAL_ERROR` /
+  `CLOUDINARY_ERROR` o mensaje de validación); nunca texto crudo de `pg` ni de
+  la respuesta de Cloudinary. El detalle real aparece en el log del servidor.
+Resultado: ok — verificado 2026-08-10 (smoke test manual, ver CHANGELOG)
+
+ID: TC-205
+Caso: Path traversal en carpetas de Cloudinary
+Tipo: security
+Pre-condición: sesión admin
+Pasos:
+  1. POST /api/cloudinary/folders con { "path": "../evil" }
+  2. POST /api/cloudinary/folders con { "path": "productos/../../otra" }
+  3. POST /api/cloudinary/folders con { "path": "productos/verano" } (control, válido)
+Esperado: 1 y 2 devuelven 400 "El path de la carpeta no es válido"; 3 se crea normal
+Resultado: ok — verificado 2026-08-10 (unit test del sanitizador, ver CHANGELOG)
+
+ID: TC-206
+Caso: Validación Zod en alta/edición de productos
+Tipo: security / edge
+Pre-condición: sesión admin
+Pasos:
+  1. POST /api/products sin `price`
+  2. POST /api/products con `price: -100`
+  3. POST /api/products con `price: "1500.50"` (string numérico, compat legacy)
+  4. PUT /api/products/:id con `status: "borrado"` (valor fuera del enum)
+Esperado: 1, 2 y 4 devuelven 400 `VALIDATION_ERROR` con `details` por campo;
+  3 se acepta y persiste como número (1500.5)
+Resultado: ok — verificado 2026-08-10 (unit test del schema, ver CHANGELOG)
+
+ID: TC-207
+Caso: Bloqueo progresivo de login por email (fuerza bruta)
+Tipo: security
+Pasos:
+  1. POST /api/users/login con un email y contraseña incorrecta, 4 veces seguidas
+  2. Repetir un 5° intento inmediatamente
+  3. Esperar el `Retry-After` informado y reintentar
+Esperado: los primeros 4 devuelven 401; el 5° devuelve 429 `ACCOUNT_LOCKED` con
+  header `Retry-After`; tras esperar, el login vuelve a evaluarse normalmente
+Resultado: ok — verificado 2026-08-10 (curl manual, ver CHANGELOG)
+
+ID: TC-208
+Caso: Login exitoso limpia el contador de fuerza bruta
+Tipo: security / regression
+Pasos:
+  1. 2 intentos fallidos de login con un email real
+  2. Login exitoso con la contraseña correcta
+  3. 2 intentos fallidos más
+Esperado: el paso 3 NO acumula sobre el conteo del paso 1 (se reinició en el login
+  exitoso); no se llega a bloquear con solo 2+2 fallos
+Resultado: no probado — requiere usuario de prueba real (no se ejecuta con curl solo)
+
+ID: TC-209
+Caso: authMiddleware sin errorHandler muerto (regresión de arranque)
+Tipo: regression
+Pasos:
+  1. Levantar el servidor (`npm run dev`)
+  2. Pegar cualquier request autenticada (ej. GET /api/orders/user)
+Esperado: el servidor arranca sin errores de require y la ruta responde normal
+  (401/200 según token), confirmando que quitar `errorHandler` no rompió nada
+Resultado: ok — verificado 2026-08-10 (smoke test de arranque, ver CHANGELOG)
 ```
 
 ---

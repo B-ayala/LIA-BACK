@@ -429,6 +429,16 @@ El frontend vive en `../../FRONT/damiana-bella` (repo git propio) y apunta acá 
 - **Firma del webhook de MP** verificada con HMAC-SHA256 y comparación en tiempo constante
   cuando `MP_WEBHOOK_SECRET` está configurada.
 - **`npm run audit`** (`--audit-level=high`) disponible como paso previo al deploy.
+- **Manejo de errores sin fuga de internals** en todos los controllers (`userController`,
+  `cloudinaryController`, `productController`): el detalle real (mensaje de Postgres, respuesta
+  cruda de Cloudinary) va al log estructurado; el cliente recibe un mensaje genérico o, cuando
+  el error es de validación de dominio conocida, un mensaje acotado y seguro.
+- **Validación de borde con Zod** en `/api/products` (`schemas/productSchema.js` +
+  `middleware/validateBody.js`): tipos, rangos y longitudes antes de tocar la base.
+- **Sin path traversal en carpetas de Cloudinary**: `path` se valida por segmento (sin `..`,
+  charset acotado) antes de armar la ruta a la API de Cloudinary.
+- **Bloqueo progresivo de login por email** (`middleware/loginBruteforce.js`), además del rate
+  limit por IP: frena fuerza bruta distribuida contra una misma cuenta.
 
 **RLS y permisos de Supabase** — ver `db/migrations/2026-08-09_rls_hardening.sql`. La `anon key`
 es pública (viaja en el bundle del front), así que todo lo que `anon`/`authenticated` puedan hacer
@@ -445,9 +455,9 @@ acota los `GRANT` y **revoca `TRUNCATE`** (que no está sujeto a RLS). El backen
 2. **TTL de la caché de auth**: un token revocado sigue siendo válido hasta 30 s
    (`CACHE_TTL_AUTH_SECONDS`). Aceptable para este dominio; bajarlo a `0` si alguna vez importa
    la revocación inmediata.
-3. **Sin headers de seguridad HTTP** (`helmet`, CSP, HSTS) en el backend. Hoy los aporta la capa
-   de hosting/`vercel.json` del front; conviene sumarlos también acá.
-4. **Auditoría de dependencias**: no hay `npm audit` en un pipeline automático.
+3. **Auditoría de dependencias**: no hay `npm audit` en un pipeline automático.
+4. **Rate limit y bloqueo de login en memoria de proceso**: correcto con una sola instancia
+   (Railway hoy); con más de una instancia hay que mover esos stores a algo compartido (Redis).
 
 ---
 

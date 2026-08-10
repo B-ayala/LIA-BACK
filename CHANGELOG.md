@@ -58,6 +58,25 @@
 - `authMiddleware`: "Usuario no encontrado en la base de datos" se unifica en
   "Token inválido o expirado" (no revela si el perfil existe).
 
+### Security
+- `userController` y `cloudinaryController` devolvían `error.message` crudo en
+  sus respuestas de error (detalle de Postgres, de la API de Cloudinary, etc.).
+  Ahora responden un mensaje genérico y el detalle va al log estructurado,
+  igual que ya hacía `productController`.
+- `middleware/authMiddleware.js`: se elimina `errorHandler`, código muerto (sin
+  ninguna referencia) que además filtraba `err.stack`/`err.message` con una
+  política distinta a la del error handler real de `server.js`.
+- `POST/DELETE /api/cloudinary/folders` y `GET /api/cloudinary/folders`:
+  el `path` de carpeta se saneaba con `encodeURIComponent` pero no rechazaba
+  segmentos `..`, permitiendo escapar del namespace de carpetas esperado en
+  Cloudinary. Ahora se valida cada segmento contra un allowlist de caracteres.
+- `POST/PUT /api/products`: validación de borde con Zod
+  (`schemas/productSchema.js` + `middleware/validateBody.js`) — tipos, rangos
+  numéricos y longitudes máximas antes de tocar la base.
+- Login (`POST /api/users/login`): bloqueo progresivo por email
+  (`middleware/loginBruteforce.js`) además del rate limit por IP ya existente,
+  para frenar fuerza bruta distribuida contra una misma cuenta.
+
 ### Fixed
 - Los errores 500 de `productController` devolvían `error.message` crudo, lo que
   filtraba detalle de infraestructura al cliente (por ejemplo el `pool_size` de

@@ -10,6 +10,8 @@ const {
 const { authMiddleware, adminMiddleware } = require('../middleware/authMiddleware');
 const { createRateLimit } = require('../middleware/rateLimit');
 const { publicCache, noStore } = require('../middleware/httpCache');
+const { validateBody } = require('../middleware/validateBody');
+const { createProductSchema, updateProductSchema } = require('../schemas/productSchema');
 
 // El catálogo es el endpoint más leído y el que menos cambia: se deja cachear
 // 30 s en navegador/CDN. Combinado con el ETag de Express, las relecturas
@@ -29,8 +31,8 @@ router.get('/', readLimit, catalogCache, getProducts);
 router.get('/:id', readLimit, catalogCache, getProductById);
 
 // Protected routes (admin only)
-router.post('/', writeLimit, noStore, authMiddleware, adminMiddleware, createProduct);
-router.put('/:id', writeLimit, noStore, authMiddleware, adminMiddleware, updateProduct);
+router.post('/', writeLimit, noStore, authMiddleware, adminMiddleware, validateBody(createProductSchema), createProduct);
+router.put('/:id', writeLimit, noStore, authMiddleware, adminMiddleware, validateBody(updateProductSchema), updateProduct);
 router.delete('/:id', writeLimit, noStore, authMiddleware, adminMiddleware, deleteProduct);
 
 module.exports = router;
