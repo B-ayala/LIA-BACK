@@ -353,7 +353,11 @@ const buildMpCheckout = async (req) => {
       },
     };
   } catch (error) {
-    console.error('Error en createMpPreference:', error.message);
+    if (error.code === 'MP_TIMEOUT') {
+      logger.warn('mp_create_preference_timeout', { orderIds: reservation.orderIds });
+    } else {
+      console.error('Error en createMpPreference:', error.message);
+    }
     await releaseOrders(reservation.orderIds);
     return {
       status: 502,
@@ -496,7 +500,13 @@ const confirmMpPayment = async (req, res) => {
 
     return res.status(200).json({ success: true, orders_paid: updated });
   } catch (error) {
-    console.error('Error en confirmMpPayment:', error.message);
+    if (error.code === 'MP_TIMEOUT') {
+      logger.warn('mp_confirm_timeout', { paymentId: req.body && req.body.paymentId });
+    } else {
+      console.error('Error en confirmMpPayment:', error.message);
+    }
+    // El frontend puede reintentar mp-confirm sin riesgo: solo lee el estado
+    // del pago contra MP, no crea ni descuenta nada por sí mismo.
     return res.status(502).json({ success: false, message: 'No se pudo verificar el pago' });
   }
 };
@@ -548,7 +558,11 @@ const mpWebhook = async (req, res) => {
 
     return res.status(200).json({ success: true });
   } catch (error) {
-    console.error('Error en mpWebhook:', error.message);
+    if (error.code === 'MP_TIMEOUT') {
+      logger.warn('mp_webhook_timeout', { paymentId: req.query && (req.query['data.id'] || req.query.id) });
+    } else {
+      console.error('Error en mpWebhook:', error.message);
+    }
     // 500 hace que MP reintente la notificación más tarde
     return res.status(500).json({ success: false });
   }
@@ -756,4 +770,9 @@ module.exports = {
   cancelTransfer,
   recordNudge,
   expireStaleOrders,
+  // Expuesto solo para el test de concurrencia (qa/concurrency-stock-test.js):
+  // permite invocar la transacción BEGIN/FOR UPDATE/COMMIT directo, sin pasar
+  // por auth ni por el single-flight de `caches.orders` (que colapsaría 50
+  // llamadas del mismo usuario en una sola y no probaría nada).
+  reserveOrders,
 };

@@ -7,6 +7,13 @@ const crypto = require('crypto');
 
 const MP_API_BASE = 'https://api.mercadopago.com';
 
+// Sin timeout, un `fetch` colgado deja la request de Express (y, en el caso de
+// createPreference, las órdenes ya reservadas) esperando indefinidamente en vez
+// de fallar rápido hacia el manejo de error que ya existe (compensación /
+// respuesta controlada). 8s dan margen a la API de MP sin sumar una espera
+// perceptible sobre los 10s de statement_timeout de la DB.
+const MP_REQUEST_TIMEOUT_MS = 8000;
+
 // Tolera valores pegados con comillas en el .env (mismo criterio que cloudinaryController)
 const getAccessToken = () =>
   (process.env.MP_ACCESS_TOKEN || '').trim().replace(/^['"]|['"]$/g, '');
@@ -14,14 +21,28 @@ const getAccessToken = () =>
 const isConfigured = () => Boolean(getAccessToken());
 
 const mpRequest = async (path, options = {}) => {
-  const response = await fetch(`${MP_API_BASE}${path}`, {
-    ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${getAccessToken()}`,
-      ...(options.headers || {}),
-    },
-  });
+  let response;
+  try {
+    response = await fetch(`${MP_API_BASE}${path}`, {
+      ...options,
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${getAccessToken()}`,
+        ...(options.headers || {}),
+      },
+      signal: AbortSignal.timeout(MP_REQUEST_TIMEOUT_MS),
+    });
+  } catch (error) {
+    // `AbortSignal.timeout` dispara un `TimeoutError`; se re-envuelve con un
+    // código propio para que el caller lo distinga de un rechazo de MP (4xx/5xx)
+    // o de un corte de red, y lo loguee como lo que es: la API no respondió a tiempo.
+    if (error.name === 'TimeoutError' || error.name === 'AbortError') {
+      const timeoutError = new Error(`Mercado Pago no respondió en ${MP_REQUEST_TIMEOUT_MS}ms`);
+      timeoutError.code = 'MP_TIMEOUT';
+      throw timeoutError;
+    }
+    throw error;
+  }
 
   const data = await response.json().catch(() => null);
 

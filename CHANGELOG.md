@@ -2,6 +2,98 @@
 
 ## [Unreleased]
 
+### Fixed
+- **`qa/concurrency-stock-test.js` sin guard de entorno**: el script usa el mismo
+  `.env` que el servidor productivo (no hay DB de test separada en el proyecto)
+  y crea/borra filas reales de `productos`/`ventas`. Ahora exige
+  `ALLOW_QA_AGAINST_THIS_DB=1` explícito antes de correr, para que un `.env` mal
+  apuntado no compita por conexiones del pool con tráfico real. El producto de
+  prueba además se crea `inactive` en vez de `active`, para que quede invisible
+  en el catálogo público si el proceso muere antes del cleanup del `finally`
+  (hallazgos H-001/H-002 de la auditoría de esta sesión).
+- **Llamadas a Mercado Pago sin timeout**: `mpRequest` (`createPreference`/`getPayment`)
+  usaba `fetch` sin límite propio — si la API de MP se colgaba, el request de
+  Express quedaba esperando indefinidamente en vez de fallar hacia el manejo de
+  error ya existente. Se agregó `AbortSignal.timeout(8000)`; el timeout se
+  distingue con `error.code = 'MP_TIMEOUT'` y se loguea como tal (en vez de como
+  error genérico) en `createMpPreference` (dispara la compensación que ya
+  cancelaba/devolvía stock), `confirmMpPayment` y `mpWebhook` (responde 500 para
+  que MP reintente, como ya hacía con cualquier otro error). No se agregaron
+  reintentos propios: distinguir un timeout antes vs. después de que MP procesó
+  la operación requiere diseño aparte. Verificado que `AbortSignal.timeout`
+  aborta con `TimeoutError` a los ~2000ms configurados contra un host que no
+  responde, y que las suites de concurrencia (stock + HTTP) siguen en verde.
+
+### Added
+- **`qa/concurrency-stock-test.js`**: prueba real de concurrencia de stock. Llama
+  `reserveOrders` (la transacción `BEGIN → SELECT FOR UPDATE → validación → COMMIT`
+  que usan `/api/orders/transfer` y `/api/orders/mp-preference`) en paralelo contra
+  un producto descartable con stock=1, sin pasar por HTTP/auth/dedupe. Verifica
+  1 éxito + N-1 rechazos con 409, stock final 0, 1 sola venta creada y sin
+  conexiones colgadas en el pool, repitiendo la corrida para confirmar
+  consistencia. Ejecutado con 10 compras concurrentes × 5 corridas (el máximo
+  seguro dado el límite de 12 conexiones del pooler de Supabase, ver hallazgo en
+  Riesgos abajo): las 5 pasaron.
+- **`db/migrations/2026-08-18_add_stock_check_constraint.sql`**: `CHECK (stock >= 0)`
+  en `productos` como segunda barrera de integridad (defensa en profundidad), sin
+  tocar el mecanismo de lock existente. Aplicada en la base actual; también sumada
+  al schema de `db/migracion-nueva-cuenta/01_schema_public.sql` para que no se
+  pierda cuando se migre a la cuenta nueva de Supabase.
+- **Workflow de GitHub Actions `.github/workflows/supabase-keepalive.yml`**: pinguea cada 3
+  días una tabla pública no crítica (`categories`) del proyecto Supabase **nuevo** (una vez
+  creado) vía PostgREST, para evitar que el plan free lo pause por 7 días de inactividad
+  mientras se termina de configurar la migración. Requiere 2 secrets de GitHub
+  (`SUPABASE_KEEPALIVE_URL`, `SUPABASE_KEEPALIVE_ANON_KEY`) que se cargan recién cuando el
+  proyecto nuevo exista — sin ellos, falla en rojo a propósito en vez de en silencio. El
+  proyecto viejo no lo necesita mientras siga recibiendo tráfico real del sitio.
+- **Script de backup para migración a nueva cuenta de Supabase** (ver
+  `docs/flows/flow-migracion-supabase.md`): introspección directa de catálogos de
+  Postgres (`pg_class`, `pg_constraint`, `pg_trigger`, `pg_proc`, `pg_policies`,
+  `information_schema.role_table_grants`, `pg_publication_tables`) para generar
+  DDL fiel al estado real de la base (no a las migraciones versionadas, que ya
+  tenían drift conocido). Genera schema completo (10 tablas, 6 funciones, 4
+  triggers en `public` + trigger `on_auth_user_created` en `auth.users`, RLS,
+  GRANTs, suscripción a Realtime) y datos (104 filas), excluyendo `profiles` por
+  decisión explícita de no migrar usuarios de Supabase Auth.
+- Hallazgo durante el backup: tabla `ventas_archivadas` y columnas/tablas de un
+  sistema de auth propio ya reemplazado por Supabase Auth (`profiles.password_hash`,
+  `profiles.email_confirmed_at`, `email_tokens`, `refresh_tokens`) — vacías, sin
+  uso activo, no documentadas en `DOCUMENTACION_BACKEND.md`.
+
+### Fixed
+- **Bug en el script de backup — restauración de `productos`/`contact_messages`
+  fallaba**: sus columnas `id` son `GENERATED ALWAYS AS IDENTITY`, que rechaza un
+  `INSERT` con id explícito salvo `OVERRIDING SYSTEM VALUE`. Se agregó esa
+  cláusula más el resync de la secuencia (`setval` a `MAX(id)`) después de
+  cargar los datos, para que los próximos inserts sin id explícito no colisionen.
+- **GRANTs por rol (`anon`/`authenticated`/`service_role`) no se estaban
+  replicando** en el dump de estructura — sin ellos, RLS igual bloquea todo
+  porque el rol ni siquiera tiene permiso de tabla. Se agregó la extracción vía
+  `information_schema.role_table_grants` por tabla.
+- **Suscripción de `site_content` a Supabase Realtime no se capturaba** — se
+  hubiera perdido en silencio en la cuenta nueva. Se agregó la detección vía
+  `pg_publication_tables` y el `ALTER PUBLICATION supabase_realtime ADD TABLE`
+  correspondiente al dump de estructura.
+- **Auditoría del runbook de migración (agente `data-analyst`, solo lectura)**
+  detectó y se corrigió en `docs/flows/flow-migracion-supabase.md`: faltaba
+  congelar escrituras del sitio entre la toma del backup y el corte de tráfico
+  (riesgo real de pérdida de ventas/registros generados en ese lapso); el paso
+  de `npm run init-db` post-restore se describía con más alcance del real
+  (solo cubre RLS básico de `profiles` y columnas de `productos`, no las 9
+  tablas restantes); faltaba plan de rollback ante un restore fallido a mitad
+  de camino y un paso de verificación de conteos de filas contra
+  `00_REPORTE.md`. También se corrigió que el fix de Realtime afecta al
+  banner del header (`TopNavBar.tsx`), no al panel admin de Temas/Tipografía.
+- **Debate `data-analyst` ↔ `po-tecnico` sobre qué datos migrar, con confirmación
+  del usuario**: se determinó que la base actual no tiene datos de producción
+  real (ventas, usuarios y 7 de 8 productos son pruebas del equipo). El seed de
+  datos para la cuenta nueva se redujo de 104 filas / 9 tablas a 25 filas / 2
+  tablas (`categories`, `site_content` — `02_data_seed.sql`). Un producto
+  ("Polera", $50.000, acoplado al carrusel activo del home) tenía evidencia
+  técnica fuerte de ser catálogo real; el usuario confirmó que también es de
+  prueba y se descartó igual. `docs/flows/flow-migracion-supabase.md`
+  reescrito para reflejar la decisión final.
+
 ### Added
 - **Manejo de concurrencia y carga en toda la API** (ver
   `docs/flows/flow-concurrencia-carga.md`, casos QA `TC-180`–`TC-193`):
