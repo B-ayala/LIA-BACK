@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+### Added
+- **Modo de compra restringida (allowlist de compradores)**: nueva columna
+  `profiles.purchase_allowed_exclusive` (migración
+  `db/migrations/2026-09-12_add_purchase_allowed_exclusive_to_profiles.sql`).
+  El admin puede marcar a uno o varios usuarios como "comprador habilitado"
+  desde `PUT /api/users/:id`. Mientras exista al menos un perfil marcado, el
+  sistema entra en modo restringido: `POST /api/orders/transfer` y
+  `POST /api/orders/mp-preference` responden `403 PURCHASES_DISABLED` a
+  cualquier usuario no marcado (`User.getPurchasePermission`,
+  `orderController.blockIfPurchaseNotAllowed`). Al desmarcar al último
+  usuario, la compra vuelve a estar habilitada para todos automáticamente.
+
+### Fixed
+- **Admin principal ("owner") podía perder el rol admin, y no había forma de
+  proteger ninguna cuenta**: nueva columna `profiles.is_owner` (migración
+  `db/migrations/2026-09-12_add_is_owner_to_profiles.sql`), asignada al admin
+  más antiguo existente. `User.findByIdAndUpdate` rechaza sacarle el rol admin
+  al owner y `User.findByIdAndDelete` rechaza eliminarlo, sin importar quién
+  esté logueado (antes el único chequeo era "no te saques el rol a vos
+  mismo", que no protegía ninguna cuenta en particular). El panel de
+  Usuarios (`admin/pages/Users`) deshabilita esos botones para el owner.
+
 ### Changed
 - **Producto "Activo" con stock 0 ya no bloquea el guardado**: `createProduct` y
   `updateProduct` (`controllers/productController.js`) dejan de responder `400`

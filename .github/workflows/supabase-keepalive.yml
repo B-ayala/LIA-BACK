@@ -1,0 +1,39 @@
+name: Supabase keep-alive (proyecto nuevo)
+
+# Evita que Supabase pause el proyecto free por inactividad (se pausa a los 7 días
+# sin requests — ver docs/flows/flow-migracion-supabase.md). Corre cada 3 días,
+# con margen de sobra antes del límite de 7.
+#
+# Requiere 2 secrets en GitHub (Settings → Secrets and variables → Actions),
+# con los datos del proyecto NUEVO de Supabase (no el viejo, que ya recibe
+# tráfico real del sitio en producción y no lo necesita):
+#   - SUPABASE_KEEPALIVE_URL        -> https://<project-ref>.supabase.co
+#   - SUPABASE_KEEPALIVE_ANON_KEY   -> anon key del proyecto nuevo
+#
+# Este workflow no hace nada hasta que esos 2 secrets existan — falla en rojo
+# a propósito (curl sin URL válida) para que sea visible que falta configurarlo,
+# en vez de fallar en silencio.
+#
+# Después del corte de tráfico a este proyecto (paso 7 del runbook), NO hace falta
+# desactivar ni borrar este workflow: pasa a ser un respaldo de contingencia
+# independiente del backend (si Railway cae o un deploy falla, este sigue corriendo
+# igual). Es gratuito y liviano — se deja corriendo indefinidamente.
+
+on:
+  schedule:
+    - cron: '0 6 */3 * *' # cada 3 días a las 06:00 UTC
+  workflow_dispatch: {} # permite correrlo a mano desde la pestaña Actions
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Query liviana a una tabla pública no crítica (categories)
+        run: |
+          curl --fail --silent --show-error \
+            "${SUPABASE_URL}/rest/v1/categories?select=id&limit=1" \
+            -H "apikey: ${SUPABASE_ANON_KEY}" \
+            -H "Authorization: Bearer ${SUPABASE_ANON_KEY}"
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_KEEPALIVE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_KEEPALIVE_ANON_KEY }}

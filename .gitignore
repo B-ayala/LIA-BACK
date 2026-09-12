@@ -44,6 +44,13 @@ Thumbs.db
 coverage/
 .nyc_output/
 
+# Scripts de prueba/QA locales (carga, concurrencia, verificación manual) —
+# no son parte del código de la app. El plan de pruebas (qa/test-plan.md) sí
+# se versiona: es documentación, no un script.
+qa/*.js
+qa_timeout_test_out.txt
+*_test_out.txt
+
 # Herramientas de agentes / QA local
 .claude/
 .playwright-mcp/
@@ -57,3 +64,5 @@ ARCHITECTURE.md
 QUICKSTART.md
 VERIFICATION_CHECKLIST.md
 docs/SUPABASE_AUTH.md
+.vercel
+.env*

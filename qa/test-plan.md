@@ -853,6 +853,126 @@ Pasos:
 Esperado: el servidor arranca sin errores de require y la ruta responde normal
   (401/200 según token), confirmando que quitar `errorHandler` no rompió nada
 Resultado: ok — verificado 2026-08-10 (smoke test de arranque, ver CHANGELOG)
+
+ID: TC-210
+Caso: Crear/actualizar producto "Activo" con stock 0 ya no devuelve 400
+Tipo: happy / regression
+Pre-condición: sesión admin
+Pasos:
+  1. POST /api/products con `status: "active"`, `stock: 0` (sin variantes)
+  2. PUT /api/products/:id de un producto activo existente con `stock: 0`
+  3. PUT /api/products/:id de un producto ya activo, sin tocar `status`,
+     bajando solo `stock` a 0
+Esperado: los 3 devuelven 200/201 y el producto queda `status: "active"`,
+  `stock: 0` (antes: 400 "No se puede...")
+Resultado: no probado
+
+ID: TC-211
+Caso: Producto activo con stock 0 (por variantes) se guarda igual
+Tipo: happy / edge
+Pre-condición: sesión admin
+Pasos:
+  1. POST /api/products con `status: "active"`, variante "Talle" con
+     `stockByOption` en 0 para todas las opciones (stock agregado 0)
+  2. PUT /api/products/:id subiendo el stock de una variante a >0
+Esperado: paso 1 se crea (200/201) con stock agregado 0; paso 2 actualiza sin
+  error y el stock agregado pasa a ser >0
+Resultado: no probado
+
+ID: TC-212
+Caso: Admin marca a un usuario como "comprador habilitado" (activa modo restringido)
+Tipo: happy
+Pre-condición: sesión admin; usuario B normal, sin marcar
+Pasos:
+  1. PUT /api/users/:idB { purchase_allowed_exclusive: true }
+Esperado: 200, `data.purchase_allowed_exclusive === true`
+Resultado: no probado
+
+ID: TC-213
+Caso: Con modo restringido activo, el usuario marcado SÍ puede comprar
+Tipo: happy
+Pre-condición: TC-212 aplicado (usuario B marcado); usuario B logueado
+Pasos:
+  1. POST /api/orders/transfer con datos válidos (usuario B)
+  2. POST /api/orders/mp-preference con datos válidos (usuario B)
+Esperado: ambos devuelven 201/200 normalmente, como si el modo no existiera
+Resultado: no probado
+
+ID: TC-214
+Caso: Con modo restringido activo, un usuario NO marcado no puede comprar
+Tipo: security / failure
+Pre-condición: TC-212 aplicado (usuario B marcado); usuario C (distinto, no marcado) logueado
+Pasos:
+  1. POST /api/orders/transfer con datos válidos (usuario C)
+  2. POST /api/orders/mp-preference con datos válidos (usuario C)
+Esperado: ambos devuelven 403 `{ code: 'PURCHASES_DISABLED', message: 'Por el
+  momento no es posible comprar. Sitio en mantenimiento, gracias por tu
+  paciencia.' }`; no se toca stock ni se inserta en `ventas`
+Resultado: no probado
+
+ID: TC-215
+Caso: Admin desmarca al último usuario → compra vuelve a estar habilitada para todos
+Tipo: happy / regression
+Pre-condición: TC-212 aplicado (único usuario marcado: B)
+Pasos:
+  1. PUT /api/users/:idB { purchase_allowed_exclusive: false }
+  2. POST /api/orders/transfer con datos válidos (usuario C, el que estaba bloqueado)
+Esperado: paso 1 → 200; paso 2 → 201 (ya no bloquea a nadie)
+Resultado: no probado
+
+ID: TC-216
+Caso: Varios usuarios marcados simultáneamente
+Tipo: edge
+Pre-condición: usuarios B y D normales, sin marcar
+Pasos:
+  1. PUT /api/users/:idB { purchase_allowed_exclusive: true }
+  2. PUT /api/users/:idD { purchase_allowed_exclusive: true }
+  3. Ambos (B y D) intentan POST /api/orders/transfer
+  4. Usuario C (no marcado) intenta POST /api/orders/transfer
+Esperado: pasos 3 → 201 para B y D; paso 4 → 403 `PURCHASES_DISABLED`
+Resultado: no probado
+
+ID: TC-217
+Caso: Validación del campo `purchase_allowed_exclusive` en PUT /api/users/:id
+Tipo: edge / security
+Pre-condición: sesión admin
+Pasos:
+  1. PUT /api/users/:id { purchase_allowed_exclusive: "true" } (string, no boolean)
+  2. PUT /api/users/:id { purchase_allowed_exclusive: true } sin sesión admin (token de usuario normal)
+Esperado: paso 1 → 400 con mensaje de validación; paso 2 → 403 (adminMiddleware)
+Resultado: no probado
+
+ID: TC-220
+Caso: No se puede quitar el rol admin al usuario principal (owner)
+Tipo: security / failure
+Pre-condición: usuario A es el owner (`is_owner = true`, admin más antiguo); sesión de otro admin B
+Pasos:
+  1. GET /api/users → verificar que A aparece con `is_owner: true`
+  2. PUT /api/users/:idA { role: 'user' }
+Esperado: paso 1 → 200; paso 2 → 400 "No se le puede quitar el rol admin al
+  usuario principal"; el rol de A no cambia en la base
+Resultado: no probado
+
+ID: TC-221
+Caso: No se puede eliminar al usuario principal (owner)
+Tipo: security / failure
+Pre-condición: usuario A es el owner; sesión de otro admin B
+Pasos:
+  1. DELETE /api/users/:idA
+Esperado: 400 "No se puede eliminar al usuario principal"; A sigue existiendo
+  en `profiles` y `auth.users`
+Resultado: no probado
+
+ID: TC-222
+Caso: Un admin normal (no owner) sí puede ser degradado o eliminado por otro admin
+Tipo: happy / regression
+Pre-condición: usuario B es admin normal (`is_owner = false`, distinto del owner y de quien opera)
+Pasos:
+  1. PUT /api/users/:idB { role: 'user' }
+  2. PUT /api/users/:idB { role: 'admin' } (requiere email confirmado)
+  3. DELETE /api/users/:idB
+Esperado: los tres pasos devuelven 200; el owner (A) no se ve afectado
+Resultado: no probado
 ```
 
 ---
@@ -896,6 +1016,9 @@ Resultado: ok — verificado 2026-08-10 (smoke test de arranque, ver CHANGELOG)
 | Front data layer | TC-141 | — | TC-140 | — | — |
 | Asistente insights | TC-150 | TC-153/154 | TC-155 | TC-151/152 | — |
 | Concurrencia y carga | TC-180/183/185/190 | TC-184/187/193 | TC-188/189/191 | TC-186 | TC-181/182/192 |
+| Productos (CRUD admin) | TC-210 | TC-211 | — | — | — |
+| Modo compra restringida | TC-212/213/215/216 | TC-216 | TC-215 | TC-214/217 | — |
+| Admin principal (owner) | TC-222 | — | — | TC-220/221 | — |
 
 ## Cross-browser / device
 Probado en Chrome desktop (Playwright). Pendiente: Safari iOS, Chrome Android

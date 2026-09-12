@@ -1,6 +1,7 @@
 const crypto = require('crypto');
 const { pool } = require('../config/database');
 const Order = require('../models/Order');
+const User = require('../models/User');
 const mercadopago = require('../utils/mercadopago');
 const { CORREO_COST } = require('./shippingController');
 const { caches, invalidateProducts } = require('../utils/cache');
@@ -13,6 +14,30 @@ const TRANSFER_EXPIRY_HOURS = 5;
 
 const MP_NOT_CONFIGURED_MESSAGE =
   'Los pagos con Mercado Pago no están disponibles en este momento. Podés pagar por transferencia.';
+
+// Mensaje mostrado cuando el admin activó el modo de compra restringida
+// (ver User.getPurchasePermission) y el usuario actual no está en la lista
+// de compradores habilitados.
+const PURCHASES_DISABLED_MESSAGE =
+  'Por el momento no es posible comprar. Sitio en mantenimiento, gracias por tu paciencia.';
+
+/**
+ * Corta el checkout temprano si el modo de compra restringida está activo y
+ * este usuario no es uno de los compradores habilitados.
+ * @returns {Promise<boolean>} true si ya se respondió la request (bloqueado).
+ */
+const blockIfPurchaseNotAllowed = async (req, res) => {
+  const { allowed } = await User.getPurchasePermission(req.user.id);
+  if (allowed) return false;
+
+  logger.warn('order_blocked_purchases_disabled', { userId: req.user.id });
+  res.status(403).json({
+    success: false,
+    code: 'PURCHASES_DISABLED',
+    message: PURCHASES_DISABLED_MESSAGE,
+  });
+  return true;
+};
 
 // Respuestas del nudge "¿al final comprás?" (checkout transferencia) → valor de
 // `origin` en ventas. 'abandonado' además cancela la orden y devuelve el stock.
@@ -381,6 +406,8 @@ const createMpPreference = async (req, res) => {
     return res.status(400).json({ success: false, message: validationError });
   }
 
+  if (await blockIfPurchaseNotAllowed(req, res)) return;
+
   if (!mercadopago.isConfigured()) {
     return res.status(503).json({ success: false, message: MP_NOT_CONFIGURED_MESSAGE });
   }
@@ -403,6 +430,8 @@ const createTransferOrder = async (req, res) => {
   if (validationError) {
     return res.status(400).json({ success: false, message: validationError });
   }
+
+  if (await blockIfPurchaseNotAllowed(req, res)) return;
 
   const reservation = await caches.orders.single(orderDedupeKey('transfer', req), () =>
     reserveOrders({ buyerName, buyerEmail, items, shippingMethod, shippingCost, paymentMethod: 'transfer' })

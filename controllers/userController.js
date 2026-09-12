@@ -19,7 +19,7 @@ const serverError = (res, action, error) => {
 // Mensajes de validación de dominio que el modelo lanza intencionalmente
 // (ver models/User.js): son los únicos seguros de reenviar al cliente tal cual.
 const SAFE_USER_VALIDATION_ERROR =
-  /^Error al (actualizar|eliminar) usuario: (El nombre no puede tener más de 100 caracteres|El rol debe ser "user" o "admin"|Debe proporcionar al menos un campo para actualizar \(name o role\)|Usuario no encontrado)$/;
+  /^Error al (actualizar|eliminar) usuario: (El nombre no puede tener más de 100 caracteres|El rol debe ser "user" o "admin"|El campo purchase_allowed_exclusive debe ser booleano|Debe proporcionar al menos un campo para actualizar \(name, role o purchase_allowed_exclusive\)|Usuario no encontrado|No se le puede quitar el rol admin al usuario principal|No se puede eliminar al usuario principal)$/;
 
 /**
  * @desc    Login de usuario

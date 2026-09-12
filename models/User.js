@@ -71,7 +71,9 @@ class User {
           COALESCE(p.role, 'user') AS role,
           COALESCE(p.created_at, u.created_at) AS created_at,
           u.email,
-          u.email_confirmed_at
+          u.email_confirmed_at,
+          COALESCE(p.purchase_allowed_exclusive, false) AS purchase_allowed_exclusive,
+          COALESCE(p.is_owner, false) AS is_owner
         FROM auth.users u
         LEFT JOIN public.profiles p ON p.id = u.id
         ORDER BY COALESCE(p.created_at, u.created_at) DESC
@@ -113,7 +115,7 @@ class User {
     try {
       await client.query('BEGIN');
 
-      const { name, role } = updateData;
+      const { name, role, purchase_allowed_exclusive: purchaseAllowedExclusive } = updateData;
       const updates = [];
       const values = [];
       let paramCount = 1;
@@ -131,21 +133,39 @@ class User {
         if (!['user', 'admin'].includes(role)) {
           throw new Error('El rol debe ser "user" o "admin"');
         }
+        if (role !== 'admin') {
+          const ownerCheck = await client.query(
+            'SELECT is_owner FROM public.profiles WHERE id = $1',
+            [id]
+          );
+          if (ownerCheck.rows[0]?.is_owner) {
+            throw new Error('No se le puede quitar el rol admin al usuario principal');
+          }
+        }
         updates.push(`role = $${paramCount}`);
         values.push(role);
         paramCount++;
       }
 
+      if (purchaseAllowedExclusive !== undefined) {
+        if (typeof purchaseAllowedExclusive !== 'boolean') {
+          throw new Error('El campo purchase_allowed_exclusive debe ser booleano');
+        }
+        updates.push(`purchase_allowed_exclusive = $${paramCount}`);
+        values.push(purchaseAllowedExclusive);
+        paramCount++;
+      }
+
       if (updates.length === 0) {
-        throw new Error('Debe proporcionar al menos un campo para actualizar (name o role)');
+        throw new Error('Debe proporcionar al menos un campo para actualizar (name, role o purchase_allowed_exclusive)');
       }
 
       values.push(id);
       const query = `
-        UPDATE public.profiles 
-        SET ${updates.join(', ')} 
+        UPDATE public.profiles
+        SET ${updates.join(', ')}
         WHERE id = $${paramCount}
-        RETURNING id, name, role, created_at
+        RETURNING id, name, role, created_at, purchase_allowed_exclusive, is_owner
       `;
 
       const result = await client.query(query, values);
@@ -166,6 +186,38 @@ class User {
   }
 
   /**
+   * ¿Puede este usuario completar una compra?
+   *
+   * "Modo restringido" no es un switch aparte: está activo cuando existe al
+   * menos un perfil con purchase_allowed_exclusive = true. Si está activo,
+   * solo esos perfiles pueden comprar; el resto queda bloqueado hasta que el
+   * admin desmarque a todos.
+   */
+  static async getPurchasePermission(userId) {
+    try {
+      const query = `
+        SELECT
+          COALESCE(p.purchase_allowed_exclusive, false) AS is_exclusive_buyer,
+          r.restricted_mode_active
+        FROM (
+          SELECT EXISTS (
+            SELECT 1 FROM public.profiles WHERE purchase_allowed_exclusive = true
+          ) AS restricted_mode_active
+        ) r
+        LEFT JOIN public.profiles p ON p.id = $1
+      `;
+      const result = await pool.query(query, [userId]);
+      const row = result.rows[0];
+      const restrictedModeActive = row.restricted_mode_active;
+      const isExclusiveBuyer = row.is_exclusive_buyer;
+
+      return { allowed: !restrictedModeActive || isExclusiveBuyer };
+    } catch (error) {
+      throw new Error(`Error al verificar permiso de compra: ${error.message}`);
+    }
+  }
+
+  /**
    * Eliminar usuario
    */
   static async findByIdAndDelete(id) {
@@ -173,6 +225,14 @@ class User {
     
     try {
       await client.query('BEGIN');
+
+      const ownerCheck = await client.query(
+        'SELECT is_owner FROM public.profiles WHERE id = $1',
+        [id]
+      );
+      if (ownerCheck.rows[0]?.is_owner) {
+        throw new Error('No se puede eliminar al usuario principal');
+      }
 
       // Borrado defensivo del perfil (por si no hubiera FK con ON DELETE CASCADE).
       const profileResult = await client.query(

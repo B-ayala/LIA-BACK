@@ -15,6 +15,25 @@ stock y el estado de pago consistentes entre frontend, backend y Supabase.
 - Usuario autenticado (el checkout lo exige; el token Bearer viaja vía `apiFetch`).
 - Producto activo con stock suficiente.
 - Para MP: `MP_ACCESS_TOKEN` configurado en el backend (si falta → 503 con mensaje claro).
+- Modo de compra restringida (ver sección abajo) desactivado, o el usuario debe
+  estar en la allowlist.
+
+## Modo de compra restringida (allowlist de compradores)
+Gate previo a `mp-preference`/`transfer`, antes de tocar stock. El admin marca a
+uno o varios usuarios como "comprador habilitado"
+(`profiles.purchase_allowed_exclusive`, vía `PUT /api/users/:id`) desde
+`admin/pages/Users`. No hay un switch global aparte: el modo restringido está
+activo mientras exista **al menos un** perfil marcado
+(`User.getPurchasePermission`, `EXISTS (... WHERE purchase_allowed_exclusive)`).
+- Con el modo activo, `POST /api/orders/mp-preference` y `POST /api/orders/transfer`
+  responden `403 { code: 'PURCHASES_DISABLED' }` a cualquier usuario no marcado,
+  antes de reservar stock (`orderController.blockIfPurchaseNotAllowed`). El
+  frontend muestra el mensaje tal cual: "Por el momento no es posible comprar.
+  Sitio en mantenimiento, gracias por tu paciencia."
+- Al desmarcar al último usuario, el modo se desactiva solo y la compra vuelve
+  a estar habilitada para todos.
+- Pensado para "modo mantenimiento" controlado en producción (ej. probar el
+  checkout con una sola cuenta antes de habilitar la compra pública).
 
 ## Modelo de stock (importante)
 El descuento de stock lo hace el **trigger `trg_decrement_stock`** (AFTER INSERT en
@@ -64,6 +83,7 @@ El descuento de stock lo hace el **trigger `trg_decrement_stock`** (AFTER INSERT
   depender del navegador del usuario.
 
 ## Errores esperados
+- Modo de compra restringida activo y usuario no habilitado → 403 `PURCHASES_DISABLED`.
 - Stock insuficiente al crear preferencia → 409 con nombre del producto; nada se persiste.
 - MP caído / token inválido → 502 "No se pudo conectar con Mercado Pago…"; rollback completo.
 - `MP_ACCESS_TOKEN` ausente → 503 "Los pagos con Mercado Pago no están disponibles…".

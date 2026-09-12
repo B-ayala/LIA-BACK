@@ -42,15 +42,9 @@ const createProduct = async (req, res) => {
     // name y price ya vienen validados por el schema Zod de la ruta (ver
     // schemas/productSchema.js).
 
-    // Un producto activo sin stock queda oculto en la tienda (el catálogo filtra
-    // stock > 0), así que el estado sería engañoso. Se valida también acá, no sólo
-    // en el cliente.
-    if ((status || 'active') === 'active' && (Number(stock) || 0) <= 0) {
-      return res.status(400).json({
-        success: false,
-        message: 'No se puede crear un producto activo sin stock. Cargá stock o guardalo como inactivo.',
-      });
-    }
+    // Un producto "Activo" sin stock es un estado válido: se muestra en la
+    // tienda marcado "Sin stock" y no se puede comprar (el front pide
+    // confirmación explícita antes de llegar acá).
 
     // Derive imageUrl from images array if provided
     const resolvedImageUrl = (images && images.length > 0) ? images[0] : (imageUrl || '');
@@ -189,23 +183,9 @@ const updateProduct = async (req, res) => {
       sizeGuide, status, images,
     } = req.body;
 
-    // Defensa server-side: un producto activo sin stock queda oculto en la tienda.
-    // Se contempla tanto pasar el estado a "active" como bajar el stock a 0 de un
-    // producto ya activo. Sólo se consulta el estado actual si hace falta resolverlo.
-    if (status !== undefined || stock !== undefined) {
-      const current = await pool.query('SELECT status, stock FROM public.productos WHERE id = $1', [id]);
-      if (current.rows.length === 0) {
-        return res.status(404).json({ success: false, message: 'Producto no encontrado' });
-      }
-      const targetStatus = status ?? current.rows[0].status;
-      const targetStock = stock ?? current.rows[0].stock;
-      if (targetStatus === 'active' && (Number(targetStock) || 0) <= 0) {
-        return res.status(400).json({
-          success: false,
-          message: 'No se puede dejar un producto activo sin stock. Cargá stock o pasalo a inactivo.',
-        });
-      }
-    }
+    // Un producto "Activo" sin stock es un estado válido: se muestra en la
+    // tienda marcado "Sin stock" y no se puede comprar (el front pide
+    // confirmación explícita antes de llegar acá).
 
     // Build dynamic update query
     const updates = [];
