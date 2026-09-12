@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Changed
+- **Producto "Activo" con stock 0 ya no bloquea el guardado**: `createProduct` y
+  `updateProduct` (`controllers/productController.js`) dejan de responder `400`
+  cuando el estado es `active` y el stock (simple o agregado de variantes) es 0.
+  Es un estado válido ahora: el producto se guarda y se muestra en la tienda
+  marcado "Sin stock" (no comprable). La confirmación explícita del usuario
+  vive en el frontend (`ProductModal`); el backend ya no necesita la
+  revalidación porque no hay nada inválido que impedir.
+
 ### Fixed
 - **`qa/concurrency-stock-test.js` sin guard de entorno**: el script usa el mismo
   `.env` que el servidor productivo (no hay DB de test separada en el proyecto)
