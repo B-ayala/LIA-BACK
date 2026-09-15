@@ -3,6 +3,19 @@
 ## [Unreleased]
 
 ### Added
+- **Endpoints de sesión con refresh token en cookie httpOnly**: nuevo
+  `controllers/authController.js` + `routes/authRoutes.js`, montados en
+  `/api/auth` (`login`, `refresh`, `logout`). El refresh token de Supabase ya
+  no vuelve al frontend: queda en una cookie `httpOnly` (`sb_refresh_token`,
+  `Secure` + `SameSite=None` en producción, scope `/api/auth`), y el frontend
+  solo recibe el access token en el body para guardarlo en memoria (nunca en
+  `localStorage`). Mitiga robo persistente de sesión vía XSS. La cookie tiene
+  una ventana deslizante de **2 horas de inactividad** (se resetea en cada
+  login/refresh; antes, con el token en `localStorage`, la sesión no vencía
+  nunca salvo que se borrara el storage del navegador). Reusa el mismo rate
+  limit + bloqueo por fuerza bruta que el login histórico
+  (`middleware/loginBruteforce.js`). Requiere la nueva dependencia
+  `cookie-parser`.
 - **Modo de compra restringida (allowlist de compradores)**: nueva columna
   `profiles.purchase_allowed_exclusive` (migración
   `db/migrations/2026-09-12_add_purchase_allowed_exclusive_to_profiles.sql`).
@@ -34,6 +47,14 @@
   revalidación porque no hay nada inválido que impedir.
 
 ### Fixed
+- **RLS de `productos` exponía inactivos a cualquiera con la anon key**: la policy
+  `"Allow public read"` era `USING (true)`, así que el ocultamiento de productos
+  `inactive` dependía solo del filtro `.eq('status','active')` del frontend —
+  cualquiera podía leerlos igual llamando directo a la API REST de Supabase con
+  la anon key (pública, va en el bundle). Nueva migración
+  `db/migrations/2026-09-15_restrict_productos_public_read.sql`: reemplaza esa
+  policy por `status = 'active' OR public.is_admin()`. No afecta al panel admin
+  (el backend lee como `postgres`, sin RLS).
 - **`qa/concurrency-stock-test.js` sin guard de entorno**: el script usa el mismo
   `.env` que el servidor productivo (no hay DB de test separada en el proyecto)
   y crea/borra filas reales de `productos`/`ventas`. Ahora exige

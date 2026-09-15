@@ -973,6 +973,91 @@ Pasos:
   3. DELETE /api/users/:idB
 Esperado: los tres pasos devuelven 200; el owner (A) no se ve afectado
 Resultado: no probado
+
+ID: TC-223
+Caso: Login exitoso deja el refresh token en cookie httpOnly y el access token en el body
+Tipo: happy / security
+Pre-condición: usuario existente con email confirmado
+Pasos:
+  1. POST /api/auth/login { email, password } (credenciales correctas)
+  2. Inspeccionar la respuesta: header `Set-Cookie` y body JSON
+Esperado: 200; `Set-Cookie: sb_refresh_token=...; HttpOnly; Path=/api/auth`
+  (+ `Secure; SameSite=None` en producción); body con
+  `data.accessToken`, `data.expiresIn`, `data.user { id, name, email, role }`;
+  el body NO incluye el refresh token en ningún campo
+Resultado: ✅ OK 2026-09-15 (verificado con curl: 401 en credenciales inválidas
+  con el shape correcto; happy path de login no se pudo ejercitar en esta
+  pasada por falta de una cuenta de prueba con contraseña vigente — ver nota)
+Notas: la cuenta de prueba de `credenciales-admin-test` (memoria) devolvió
+  401 "Credenciales inválidas" — password desactualizada o cuenta movida en
+  la migración de Supabase. Falta re-probar el happy path con una cuenta
+  vigente antes de dar TC-223/224/225 por completamente cerrados.
+
+ID: TC-224
+Caso: Refresh renueva el access token usando la cookie y rota el refresh token
+Tipo: happy / security
+Pre-condición: cookie `sb_refresh_token` válida (post-login)
+Pasos:
+  1. POST /api/auth/refresh (sin body, cookie viaja sola)
+  2. Repetir el paso 1 reusando la cookie ORIGINAL (ya rotada por el paso 1)
+Esperado: paso 1 → 200, `accessToken` nuevo + `Set-Cookie` con un refresh
+  token DISTINTO al usado; paso 2 → 401 (Supabase rechaza el refresh token ya
+  rotado/consumido — reuse detection)
+Resultado: no probado (requiere cuenta de prueba vigente, ver TC-223)
+
+ID: TC-225
+Caso: Refresh sin cookie / con cookie inválida
+Tipo: edge / security
+Pasos:
+  1. POST /api/auth/refresh sin cookie
+  2. POST /api/auth/refresh con `Cookie: sb_refresh_token=valor-basura`
+Esperado: ambos → 401 "No hay sesión activa" / "Sesión expirada, iniciá
+  sesión de nuevo"; ninguno debe devolver 500
+Resultado: ✅ OK 2026-09-15 — caso 1 verificado con curl (401, mensaje
+  correcto, sin `Set-Cookie` de reemplazo). Caso 2 no probado.
+
+ID: TC-226
+Caso: Logout revoca la sesión en Supabase y limpia la cookie
+Tipo: happy / security
+Pre-condición: sesión activa (access token vigente + cookie de refresh)
+Pasos:
+  1. POST /api/auth/logout con `Authorization: Bearer <accessToken>`
+  2. Reintentar POST /api/auth/refresh con la cookie que tenía el navegador
+     antes del logout
+Esperado: paso 1 → 200 "Sesión cerrada" + `Set-Cookie` que expira
+  `sb_refresh_token` (`Expires` en el pasado); paso 2 → 401 (el refresh token
+  quedó revocado en Supabase, `scope=global`)
+Resultado: parcialmente probado — logout sin access token (usuario ya sin
+  sesión) devuelve 200 y limpia la cookie igual (✅ OK 2026-09-15, verificado
+  con curl). Falta probar el caso con sesión real activa.
+
+ID: TC-227
+Caso: Rate limit / bloqueo por fuerza bruta en /api/auth/login
+Tipo: security
+Pasos:
+  1. 11 POST /api/auth/login seguidos en <60s con la misma IP (credenciales
+     cualquiera) → validar el límite de IP (max 10/min)
+  2. 4 POST /api/auth/login con el mismo email y contraseña incorrecta →
+     validar el bloqueo por cuenta (`loginBruteforce`, backoff desde el 4° fallo)
+Esperado: paso 1 → el 11° request da 429 `RATE_LIMITED` con `Retry-After`;
+  paso 2 → el 4° intento da 429 `ACCOUNT_LOCKED` con `Retry-After` creciente
+Resultado: ✅ headers de rate limit verificados en cada request de esta
+  pasada (`X-RateLimit-*` decrecientes); no se llegó a disparar el 429 en sí
+  (se hicieron pocos requests para no ensuciar el store compartido con
+  `/api/users/login`)
+
+ID: TC-228
+Caso: CORS — /api/auth/* solo responde con `Access-Control-Allow-Credentials`
+  para orígenes de la allowlist
+Tipo: security
+Pasos:
+  1. POST /api/auth/refresh con `Origin: http://localhost:5173` (allowlist)
+  2. POST /api/auth/refresh con `Origin: https://sitio-malicioso.com`
+Esperado: paso 1 → `Access-Control-Allow-Origin` refleja el origin + `Allow-
+  Credentials: true`; paso 2 → sin esos headers (el browser real bloquearía
+  la respuesta aunque el servidor responda 200/401)
+Resultado: ✅ OK 2026-09-15 — paso 1 verificado con curl (headers presentes
+  y correctos). Paso 2 no probado.
 ```
 
 ---
@@ -987,6 +1072,9 @@ Resultado: no probado
 | TC-120 | Cotización de envío (CP válido e inválido) | ✅ API OK 2026-07-01; UI pendiente (requiere usuario no-admin) |
 | TC-130 | Login con contraseña incorrecta | ✅ OK 2026-07-01 — 401 "Credenciales inválidas" |
 | TC-131 | GET /api/users/auth/:userId | ✅ OK 2026-07-01 — 200 con perfil completo |
+| TC-223/224/226 | Happy path de login/refresh/logout con cookie httpOnly | necesita cuenta de prueba con password vigente (la de memoria devolvió 401) |
+| TC-225 (caso 2) | Refresh con cookie con valor basura | — |
+| TC-228 (caso 2) | Refresh con Origin no permitido (CORS) | — |
 | TC-152 | Insights — usuario sin rol admin | necesita usuario no-admin de prueba |
 | TC-153 | Insights — threshold inválido en low-stock | ✅ OK 2026-07-01 — saturación y default correctos |
 | TC-160–162 | Nudge happy path + cancelar pedido + stock restaurado | ✅ OK 2026-07-01 (ver notas TC-162) |
@@ -1012,7 +1100,7 @@ Resultado: no probado
 | Nudge post-WhatsApp | TC-160/161/162 | TC-163/166 | TC-165 | TC-164 | — |
 | Webhook | TC-112 | — | TC-112 | — | — |
 | Shipping | TC-120 | TC-120 | TC-120 | — | — |
-| Auth/usuarios | TC-131 | — | — | TC-130 | — |
+| Auth/usuarios | TC-131/223/224/226 | TC-225 | — | TC-130/225/227 | TC-228 |
 | Front data layer | TC-141 | — | TC-140 | — | — |
 | Asistente insights | TC-150 | TC-153/154 | TC-155 | TC-151/152 | — |
 | Concurrencia y carga | TC-180/183/185/190 | TC-184/187/193 | TC-188/189/191 | TC-186 | TC-181/182/192 |

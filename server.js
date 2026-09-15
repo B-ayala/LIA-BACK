@@ -4,6 +4,7 @@ dotenv.config();
 
 const express = require('express');
 const cors = require('cors');
+const cookieParser = require('cookie-parser');
 const compression = require('compression');
 const { connectDB, getPoolStats, closeDB } = require('./config/database');
 const { corsOptions } = require('./config/cors');
@@ -12,6 +13,7 @@ const { createRateLimit, rateLimitStats } = require('./middleware/rateLimit');
 const { securityHeaders } = require('./middleware/securityHeaders');
 const { cacheStats } = require('./utils/cache');
 const logger = require('./utils/logger');
+const authRoutes = require('./routes/authRoutes');
 const userRoutes = require('./routes/userRoutes');
 const cloudinaryRoutes = require('./routes/cloudinaryRoutes');
 const productRoutes = require('./routes/productRoutes');
@@ -39,6 +41,9 @@ app.use(securityHeaders);
 
 // Middleware
 app.use(cors(corsOptions));
+// Solo se usa para leer la cookie httpOnly del refresh token (authRoutes):
+// no se firma nada acá, Supabase ya emite el refresh token firmado.
+app.use(cookieParser());
 // Límite explícito de body: un payload gigante consume memoria y CPU de parseo
 // antes de llegar a cualquier validación.
 app.use(express.json({ limit: '256kb' }));
@@ -57,6 +62,7 @@ app.use(
 app.use('/api', concurrencyLimit);
 
 // Rutas
+app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/cloudinary', cloudinaryRoutes);
 app.use('/api/products', productRoutes);
