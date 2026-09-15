@@ -1,5 +1,6 @@
 const User = require('../models/User');
 const { checkLock, recordFailure, recordSuccess } = require('../middleware/loginBruteforce');
+const { checkLimit, recordAttempt } = require('../middleware/emailActionLimiter');
 const logger = require('../utils/logger');
 
 /**
@@ -64,6 +65,21 @@ const serviceUnavailable = (res) =>
 
 const invalidCredentials = (res) =>
   res.status(401).json({ success: false, message: 'Credenciales inválidas' });
+
+const getFrontendOrigin = () =>
+  (process.env.FRONTEND_URL || 'http://localhost:5173').split(',')[0].trim();
+
+const isValidEmail = (email) => typeof email === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+
+const maxAttemptsResponse = (res, retryAfterSeconds) => {
+  res.setHeader('Retry-After', retryAfterSeconds);
+  return res.status(429).json({
+    success: false,
+    code: 'MAX_ATTEMPTS_REACHED',
+    message: 'Alcanzaste el máximo de 3 intentos. Volvé a intentar en 24 horas.',
+    retryAfterSeconds,
+  });
+};
 
 /**
  * @desc    Login: valida credenciales contra Supabase Auth. El refresh token
@@ -183,4 +199,93 @@ exports.logout = async (req, res) => {
 
   clearRefreshCookie(res);
   res.status(200).json({ success: true, message: 'Sesión cerrada' });
+};
+
+/**
+ * @desc    Reenvía el email de confirmación de cuenta. Máximo 3 intentos cada
+ *          24hs por email (se cuenta el intento aunque Supabase responda error,
+ *          para que no se pueda eludir el límite).
+ * @route   POST /api/auth/resend-confirmation
+ */
+exports.resendConfirmation = async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ success: false, message: 'Email inválido' });
+    }
+
+    const limit = checkLimit('resend_confirmation', email);
+    if (!limit.allowed) return maxAttemptsResponse(res, limit.retryAfterSeconds);
+
+    if (!SUPABASE_URL || !SUPABASE_ANON_KEY) return serviceUnavailable(res);
+
+    recordAttempt('resend_confirmation', email);
+
+    const redirectTo = `${getFrontendOrigin()}/auth/confirm`;
+    const response = await fetch(
+      `${SUPABASE_URL}/auth/v1/resend?redirect_to=${encodeURIComponent(redirectTo)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', apikey: SUPABASE_ANON_KEY },
+        body: JSON.stringify({ type: 'signup', email }),
+      }
+    );
+
+    // No distinguimos "no existe" / "ya confirmado" en la respuesta al cliente
+    // (evita filtrar qué emails están registrados); el detalle real va al log.
+    if (!response.ok) {
+      logger.warn('auth_resend_confirmation_upstream_failed', { status: response.status });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: 'Si la cuenta existe y está pendiente, te reenviamos el email de confirmación.',
+    });
+  } catch (error) {
+    logger.error('auth_resend_confirmation_failed', { error: error.message });
+    res.status(500).json({ success: false, message: 'No se pudo reenviar el email' });
+  }
+};
+
+/**
+ * @desc    Envía el email de recuperación de contraseña. Máximo 3 intentos
+ *          cada 24hs por email.
+ * @route   POST /api/auth/forgot-password
+ */
+exports.forgotPassword = async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ success: false, message: 'Email inválido' });
+    }
+
+    const limit = checkLimit('forgot_password', email);
+    if (!limit.allowed) return maxAttemptsResponse(res, limit.retryAfterSeconds);
+
+    if (!SUPABASE_URL || !SUPABASE_ANON_KEY) return serviceUnavailable(res);
+
+    recordAttempt('forgot_password', email);
+
+    const redirectTo = `${getFrontendOrigin()}/auth/reset-password`;
+    const response = await fetch(
+      `${SUPABASE_URL}/auth/v1/recover?redirect_to=${encodeURIComponent(redirectTo)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', apikey: SUPABASE_ANON_KEY },
+        body: JSON.stringify({ email }),
+      }
+    );
+
+    if (!response.ok) {
+      logger.warn('auth_forgot_password_upstream_failed', { status: response.status });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: 'Si la cuenta existe, te enviamos un email para restablecer la contraseña.',
+    });
+  } catch (error) {
+    logger.error('auth_forgot_password_failed', { error: error.message });
+    res.status(500).json({ success: false, message: 'No se pudo enviar el email' });
+  }
 };

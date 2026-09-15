@@ -26,6 +26,14 @@
   cualquier usuario no marcado (`User.getPurchasePermission`,
   `orderController.blockIfPurchaseNotAllowed`). Al desmarcar al último
   usuario, la compra vuelve a estar habilitada para todos automáticamente.
+- **Límite de 3 intentos cada 24hs para reenviar confirmación de email y pedir
+  reset de contraseña**: nuevos `POST /api/auth/resend-confirmation` y
+  `POST /api/auth/forgot-password` (`middleware/emailActionLimiter.js`, mismo
+  patrón que `loginBruteforce.js`). El frontend ya no llama a
+  `supabase.auth.resend` / `resetPasswordForEmail` directo desde el navegador
+  (se podía eludir cualquier límite limpiando `localStorage`); ahora pasa por
+  el backend, que cuenta el intento y corta al 4° pedido devolviendo `429` con
+  `retryAfterSeconds`.
 
 ### Fixed
 - **Admin principal ("owner") podía perder el rol admin, y no había forma de
