@@ -3,6 +3,28 @@
 ## [Unreleased]
 
 ### Added
+- **`ventas.user_id`** (script SQL `db/migrations/2026-09-18_add_user_id_to_ventas.sql`):
+  FK real a `auth.users` para identificar al comprador de cada venta, además del
+  `buyer_email`/`buyer_name` en texto que ya existía (se conservan como snapshot
+  histórico). Se completa desde el checkout autenticado (`orderController.reserveOrders`)
+  y tiene backfill de filas históricas por match de email. Antes, "Mis compras" y
+  cualquier agregación por cliente dependían solo del email, que se pierde si el
+  usuario lo cambia.
+- **Timestamps de estado en `ventas`** (script SQL
+  `db/migrations/2026-09-18_add_status_timestamps_to_ventas.sql`): `paid_at`,
+  `cancelled_at`, `dispatched_at`, completados por el trigger
+  `trg_set_ventas_status_timestamps` en cada cambio de `payment_status`/`dispatch_status`
+  (cubre tanto los cambios del backend como los que hace el panel admin directo contra
+  Supabase). Antes solo existía `created_at`, así que no se podía medir tiempo hasta el
+  pago ni hasta el despacho de una orden ya cerrada.
+- **Tabla `product_card_options`** (script SQL
+  `db/migrations/2026-09-18_add_product_card_options.sql`): guarda los
+  "sellos" configurables desde el Admin que se muestran en las cards de
+  producto de los listados del front (Mercado Pago, cuotas, envío gratis,
+  etc.) — label, ícono, orden y activo/inactivo. RLS: lectura pública
+  (anon + authenticated), escritura (insert/update/delete) solo admin vía
+  `is_admin()`, mismo patrón que `carousel_images`. El front la consume
+  directo con la anon key (Supabase), sin pasar por la API Express.
 - **Endpoints de sesión con refresh token en cookie httpOnly**: nuevo
   `controllers/authController.js` + `routes/authRoutes.js`, montados en
   `/api/auth` (`login`, `refresh`, `logout`). El refresh token de Supabase ya
@@ -46,6 +68,10 @@
   Usuarios (`admin/pages/Users`) deshabilita esos botones para el owner.
 
 ### Changed
+- **`GET /api/orders/user` deja de hacer `SELECT *`**: `Order.findPaidByEmail`
+  ahora lista columnas explícitas. Sin cambio de comportamiento visible; evita
+  que una columna interna nueva se exponga a "Mis compras" sin decisión
+  explícita.
 - **Producto "Activo" con stock 0 ya no bloquea el guardado**: `createProduct` y
   `updateProduct` (`controllers/productController.js`) dejan de responder `400`
   cuando el estado es `active` y el stock (simple o agregado de variantes) es 0.

@@ -272,16 +272,27 @@ Acceso directo con `pg` al Postgres de Supabase (esquemas `public` y `auth`).
 
 | Tabla | Esquema | Uso en el backend |
 |---|---|---|
-| `profiles` | public | `id UUID` (FK → `auth.users.id`, ON DELETE CASCADE), `name`, `role` (`user`/`admin`), `created_at`. RLS habilitada; política "Users see their profile". Índice `idx_profiles_role`. |
+| `profiles` | public | `id UUID` (FK → `auth.users.id`, ON DELETE CASCADE), `name`, `role` (`user`/`admin`), `is_owner`, `purchase_allowed_exclusive`, `created_at`. RLS habilitada; política "Users see their profile". Índice `idx_profiles_role`. **Legacy sin usar** (no las referencia ningún archivo `.js`, vacías en el 100% de las filas): `email`, `password_hash` — restos de un sistema de auth propio reemplazado por Supabase Auth. |
 | `auth.users` | auth | gestionada por Supabase Auth; se lee (`email`, `email_confirmed_at`) y se borra en cascada al eliminar perfil. |
 | `productos` | public | CRUD vía `productController`. Columnas (incluidas por `init-db`): `name`, `price`, `stock`, `category`, `image_url`, `public_id`, `description`, `discount NUMERIC(5,2)`, `condition`, `free_shipping`, `variants/specifications/features/faqs/images JSONB`, `warranty`, `return_policy`, `status`, `featured`, `created_at`, `updated_at`. |
+| `ventas` | public | Una fila = una línea de producto vendido. `id`, `user_id` (FK → `auth.users.id`, `ON DELETE SET NULL`, agregada 2026-09-18), `buyer_name`/`buyer_email` (snapshot del comprador al momento de la venta, se conservan aunque el usuario cambie el email después), `product_id` (FK, `ON DELETE SET NULL`), `product_name`/`product_image` (desnormalizado), `quantity`, `unit_price`, `total_price`, `units_config JSONB`, `payment_method` (`mp`/`transfer`), `payment_status` (`pendiente`/`pagado`/`cancelado`/`expirado`), `shipping_method`, `dispatch_status`, `mp_preference_id`, `origin` (respuesta al nudge de WhatsApp), `created_at`, `paid_at`/`cancelled_at`/`dispatched_at` (agregadas 2026-09-18, las completa el trigger `trg_set_ventas_status_timestamps`). Ver `models/Order.js` y `controllers/orderController.js`. |
+| `ventas_archivadas` | public | **Legacy sin usar**: mismas columnas que `ventas` + `archived_at`, con RLS y GRANTs configurados, pero ningún archivo `.js` inserta en ella. |
+| `email_tokens` / `refresh_tokens` | public | **Legacy sin usar**: 0 filas, sin código que las referencie. La confirmación de email y el reset de contraseña se resuelven contra la API de Supabase Auth (`authController.js`); la sesión usa el refresh token de Supabase en cookie httpOnly, no estas tablas. |
 | `carousel_images` | public | creada por `init-db` (`id`, `url`, `order`, `is_active`, `created_at`). La escribe el frontend directo; el backend solo la crea. |
 
 **Trigger** (`init-db`): `on_auth_user_created` → `handle_new_user()` inserta una fila en
 `profiles` (rol `user`) cada vez que se crea un usuario en `auth.users`.
 
+**Trigger** (`db/migrations/2026-09-18_add_status_timestamps_to_ventas.sql`):
+`trg_set_ventas_status_timestamps` completa `paid_at`/`cancelled_at`/`dispatched_at` cuando
+`payment_status`/`dispatch_status` cambian — cubre tanto los cambios que hace el backend
+(`payment_status`) como los que hace el panel admin directo contra Supabase con la anon key
+(`dispatch_status`, sin endpoint propio en este repo).
+
 > El esquema "fuente de verdad" lo administra Supabase; `init-db` es idempotente
 > (`CREATE TABLE IF NOT EXISTS`, `ADD COLUMN IF NOT EXISTS`) y sirve para alinear una BD nueva.
+> Los cambios de schema puntuales (nuevas columnas, triggers) viven en `db/migrations/*.sql`,
+> con instrucciones de aplicación manual vía Supabase SQL Editor en cada archivo.
 
 ---
 

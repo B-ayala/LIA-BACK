@@ -14,7 +14,11 @@ class Order {
    */
   static async findPaidByEmail(email, limit, offset) {
     const result = await pool.query(
-      `SELECT *, COUNT(*) OVER()::int AS total_count
+      `SELECT id, user_id, buyer_name, buyer_email, product_id, product_name,
+              product_image, quantity, unit_price, total_price, units_config,
+              payment_method, payment_status, shipping_method, dispatch_status,
+              mp_preference_id, origin, created_at, paid_at, dispatched_at,
+              COUNT(*) OVER()::int AS total_count
          FROM public.ventas
         WHERE LOWER(buyer_email) = LOWER($1) AND payment_status = 'pagado'
         ORDER BY created_at DESC, id DESC
@@ -82,14 +86,15 @@ class Order {
   static async insertPending(client, row) {
     const result = await client.query(
       `INSERT INTO public.ventas
-        (buyer_name, buyer_email, product_id, product_name, product_image,
+        (buyer_name, buyer_email, user_id, product_id, product_name, product_image,
          quantity, unit_price, total_price, units_config,
          payment_method, payment_status, shipping_method)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pendiente', $11)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pendiente', $11, $12)
        RETURNING id`,
       [
         row.buyerName || null,
         row.buyerEmail || null,
+        row.userId || null,
         row.productId,
         row.productName,
         row.productImage || null,

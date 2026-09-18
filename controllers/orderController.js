@@ -219,7 +219,7 @@ const buildPreferencePayload = ({ buyerName, buyerEmail, items, shippingCost, or
  *
  * @returns {Promise<{ok: true, orderIds: string[]} | {ok: false, status: number, message: string}>}
  */
-const reserveOrders = async ({ buyerName, buyerEmail, items, shippingMethod, shippingCost, paymentMethod }) => {
+const reserveOrders = async ({ buyerName, buyerEmail, userId, items, shippingMethod, shippingCost, paymentMethod }) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -273,6 +273,7 @@ const reserveOrders = async ({ buyerName, buyerEmail, items, shippingMethod, shi
       const orderId = await Order.insertPending(client, {
         buyerName,
         buyerEmail,
+        userId,
         productId,
         productName: item.productName,
         productImage: item.productImage,
@@ -346,7 +347,7 @@ const buildMpCheckout = async (req) => {
   const { buyerName, buyerEmail, items, shippingMethod, shippingCost } = req.body;
 
   const reservation = await reserveOrders({
-    buyerName, buyerEmail, items, shippingMethod, shippingCost, paymentMethod: 'mp',
+    buyerName, buyerEmail, userId: req.user.id, items, shippingMethod, shippingCost, paymentMethod: 'mp',
   });
   if (!reservation.ok) {
     return { status: reservation.status, body: { success: false, message: reservation.message } };
@@ -434,7 +435,9 @@ const createTransferOrder = async (req, res) => {
   if (await blockIfPurchaseNotAllowed(req, res)) return;
 
   const reservation = await caches.orders.single(orderDedupeKey('transfer', req), () =>
-    reserveOrders({ buyerName, buyerEmail, items, shippingMethod, shippingCost, paymentMethod: 'transfer' })
+    reserveOrders({
+      buyerName, buyerEmail, userId: req.user.id, items, shippingMethod, shippingCost, paymentMethod: 'transfer',
+    })
   );
 
   if (!reservation.ok) {

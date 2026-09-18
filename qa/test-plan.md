@@ -1058,6 +1058,35 @@ Esperado: paso 1 → `Access-Control-Allow-Origin` refleja el origin + `Allow-
   la respuesta aunque el servidor responda 200/401)
 Resultado: ✅ OK 2026-09-15 — paso 1 verificado con curl (headers presentes
   y correctos). Paso 2 no probado.
+
+ID: TC-229
+Caso: ventas.user_id se completa al crear una orden autenticada (MP y transferencia)
+Tipo: happy
+Pre-condición: script SQL `2026-09-18_add_user_id_to_ventas.sql` ya aplicado en Supabase;
+  usuario de sitio logueado
+Pasos:
+  1. Iniciar sesión con un usuario del sitio
+  2. Completar checkout por transferencia → `POST /api/orders/transfer`
+  3. Completar checkout con Mercado Pago → `POST /api/orders/mp-preference`
+  4. `SELECT id, user_id, buyer_email FROM ventas ORDER BY created_at DESC LIMIT 2`
+Esperado: las dos ventas nuevas tienen `user_id` = uuid del usuario logueado
+  (no NULL), y `buyer_email` sigue coincidiendo con su email
+Resultado: no probado — pendiente de aplicar el script SQL en producción
+
+ID: TC-230
+Caso: paid_at / cancelled_at / dispatched_at se completan solos al cambiar de estado
+Tipo: happy
+Pre-condición: script SQL `2026-09-18_add_status_timestamps_to_ventas.sql` ya aplicado
+Pasos:
+  1. Confirmar una transferencia pendiente (`PATCH /api/orders/:id/confirm-transfer`)
+     → verificar `paid_at` en la base
+  2. Cancelar una orden de transferencia pendiente (`PATCH /api/orders/:id/cancel-transfer`)
+     → verificar `cancelled_at`
+  3. Desde el panel admin (Despachos), cambiar `dispatch_status` a "despachado"
+     → verificar `dispatched_at`
+Esperado: cada columna queda con la fecha/hora real del cambio; el resto de las
+  columnas de timestamp para esa fila quedan NULL (no se pisan entre sí)
+Resultado: no probado — pendiente de aplicar el script SQL en producción
 ```
 
 ---
