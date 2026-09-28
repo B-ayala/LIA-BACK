@@ -26,6 +26,7 @@ const productBaseSchema = z.object({
   discount: z.coerce.number().min(0).max(100).nullable().optional(),
   condition: z.enum(['new', 'used']).optional(),
   freeShipping: z.boolean().optional(),
+  hoverImageEnabled: z.boolean().optional(),
   variants: z.array(z.any()).max(MAX_ARRAY_ITEMS).optional(),
   specifications: z.array(z.any()).max(MAX_ARRAY_ITEMS).optional(),
   features: z.array(z.any()).max(MAX_ARRAY_ITEMS).optional(),

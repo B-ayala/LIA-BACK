@@ -34,7 +34,7 @@ const createProduct = async (req, res) => {
   try {
     const {
       name, price, stock, category, imageUrl, publicId,
-      description, discount, condition, freeShipping,
+      description, discount, condition, freeShipping, hoverImageEnabled,
       variants, specifications, features, faqs, warranty, returnPolicy,
       sizeGuide, status, images,
     } = req.body;
@@ -53,9 +53,9 @@ const createProduct = async (req, res) => {
     const result = await pool.query(
       `INSERT INTO public.productos
        (name, price, stock, category, image_url, public_id, description,
-        discount, condition, free_shipping, variants, specifications, features, faqs,
+        discount, condition, free_shipping, hover_image_enabled, variants, specifications, features, faqs,
         warranty, return_policy, size_guide, status, images)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
        RETURNING *`,
       [
         name,
@@ -68,6 +68,7 @@ const createProduct = async (req, res) => {
         discount ? parseFloat(discount) : null,
         condition || 'new',
         freeShipping || false,
+        hoverImageEnabled !== undefined ? hoverImageEnabled : true,
         variants ? JSON.stringify(variants) : null,
         specifications ? JSON.stringify(specifications) : null,
         features ? JSON.stringify(features) : null,
@@ -178,7 +179,7 @@ const updateProduct = async (req, res) => {
     const { id } = req.params;
     const {
       name, price, stock, category, imageUrl, publicId,
-      description, discount, condition, freeShipping,
+      description, discount, condition, freeShipping, hoverImageEnabled,
       variants, specifications, features, faqs, warranty, returnPolicy,
       sizeGuide, status, images,
     } = req.body;
@@ -238,6 +239,10 @@ const updateProduct = async (req, res) => {
     if (freeShipping !== undefined) {
       updates.push(`free_shipping = $${paramCount++}`);
       values.push(freeShipping);
+    }
+    if (hoverImageEnabled !== undefined) {
+      updates.push(`hover_image_enabled = $${paramCount++}`);
+      values.push(hoverImageEnabled);
     }
     if (variants !== undefined) {
       updates.push(`variants = $${paramCount++}`);
