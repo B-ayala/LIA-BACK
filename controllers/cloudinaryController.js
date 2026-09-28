@@ -22,6 +22,14 @@ const serverError = (res, action, error) => {
  */
 const FOLDER_SEGMENT_RE = /^[A-Za-z0-9 _-]+$/;
 
+/**
+ * CLOUDINARY_API_SECRET tal como llega de la env var, saneado. Copiar/pegar el
+ * secret en el panel de Railway puede sumar comillas o un salto de línea al
+ * final sin que se note — eso invalida cualquier firma SHA1 calculada con él.
+ */
+const getApiSecret = () =>
+  (process.env.CLOUDINARY_API_SECRET || '').trim().replace(/^['"]|['"]$/g, '');
+
 /** @returns {string[]|null} segmentos saneados, o null si el path es inválido. */
 const sanitizeFolderPath = (rawPath) => {
   const segments = String(rawPath).split('/');
@@ -43,7 +51,7 @@ const generateSignature = (req, res) => {
     }
 
     // Cloudinary signature: sort keys alphabetically, concatenate "key=value&...", append API_SECRET
-    const apiSecret = (process.env.CLOUDINARY_API_SECRET || '').replace(/^['"]|['"]$/g, '');
+    const apiSecret = getApiSecret();
     const signatureString =
       Object.keys(paramsToSign)
         .sort()
@@ -79,7 +87,7 @@ const deleteImage = async (req, res) => {
     }
 
     // Create auth string for Cloudinary API
-    const apiSecret = (process.env.CLOUDINARY_API_SECRET || '').replace(/^['"]|['"]$/g, '');
+    const apiSecret = getApiSecret();
     const auth = Buffer.from(
       `${process.env.CLOUDINARY_API_KEY}:${apiSecret}`
     ).toString('base64');
@@ -125,7 +133,7 @@ const getImages = async (req, res) => {
   try {
     const { folder, next_cursor } = req.query;
 
-    const apiSecret = (process.env.CLOUDINARY_API_SECRET || '').replace(/^['"]|['"]$/g, '');
+    const apiSecret = getApiSecret();
     const auth = Buffer.from(
       `${process.env.CLOUDINARY_API_KEY}:${apiSecret}`
     ).toString('base64');
@@ -207,7 +215,7 @@ const getUsage = async (_req, res) => {
 // Helper: make a Cloudinary Admin API request
 const cloudinaryRequest = (method, path, body) => {
   return new Promise((resolve, reject) => {
-    const apiSecret = (process.env.CLOUDINARY_API_SECRET || '').replace(/^['"]|['"]$/g, '');
+    const apiSecret = getApiSecret();
     const auth = Buffer.from(`${process.env.CLOUDINARY_API_KEY}:${apiSecret}`).toString('base64');
 
     const headers = { 'Authorization': `Basic ${auth}` };
