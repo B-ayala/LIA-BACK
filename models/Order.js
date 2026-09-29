@@ -89,7 +89,7 @@ class Order {
         (buyer_name, buyer_email, user_id, product_id, product_name, product_image,
          quantity, unit_price, total_price, units_config,
          payment_method, payment_status, shipping_method)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pendiente', $11, $12)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pendiente', $12)
        RETURNING id`,
       [
         row.buyerName || null,

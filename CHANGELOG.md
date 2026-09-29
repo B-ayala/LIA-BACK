@@ -58,6 +58,21 @@
   `retryAfterSeconds`.
 
 ### Fixed
+- **`Order.insertPending` guardaba `payment_method`/`payment_status` invertidos**:
+  desde el commit que agregó `user_id` (2026-09-18) la lista de columnas del
+  `INSERT` quedó desalineada con la lista de `VALUES` — cada orden nueva
+  quedaba con `payment_method = 'pendiente'` (el literal que debía ir en
+  `payment_status`) y `payment_status = 'mp'`/`'transfer'` (el método real).
+  Efecto grave: el barrido de expiración (`Order.expireStale`) filtra por
+  `payment_method = 'mp' AND payment_status = 'pendiente'`, así que nunca
+  encontraba estas órdenes y **jamás les devolvía el stock reservado** al
+  abandonarse o expirar. Corregido el orden de `VALUES` en
+  `models/Order.js`. Las órdenes generadas entre el 18/09 y este fix que ya
+  llegaron a `pagado`/`cancelado`/`expirado` quedan con `payment_method`
+  incorrecto de forma irreversible (dato solo informativo, no afecta monto ni
+  stock); las que seguían `pendiente` se repararon a mano en producción con un
+  `UPDATE` puntual.
+
 - **Admin principal ("owner") podía perder el rol admin, y no había forma de
   proteger ninguna cuenta**: nueva columna `profiles.is_owner` (migración
   `db/migrations/2026-09-12_add_is_owner_to_profiles.sql`), asignada al admin
