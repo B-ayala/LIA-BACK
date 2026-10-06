@@ -108,3 +108,65 @@ origen **no** está habilitado, aunque el status sea 200.
   restricción para el DNS: Cloudflare.
 - **Propagación de DNS.** Los cambios de nameservers no son inmediatos. Un dominio que no
   resuelve dentro de las primeras horas no implica error de configuración.
+
+## Orden de despliegue 2026-10-06
+
+Cambios que se publican juntos: idempotencia de checkout, restricción de UPDATE sobre
+`ventas`, firma obligatoria del webhook de Mercado Pago y front con `Idempotency-Key`.
+El orden importa: un backend sin `Idempotency-Key` en `allowedHeaders` de CORS rechazaría
+el preflight del front nuevo (el checkout dejaría de funcionar), y una base sin la columna
+hace fallar el INSERT del backend nuevo cuando recibe la key.
+
+> Nota: el resto de este documento menciona Railway como hosting del backend; el backend
+> hoy corre en Render (ver memoria del proyecto). Los pasos de abajo usan Render. El texto
+> anterior queda pendiente de revisar.
+
+| Paso | Dónde | Qué | Por qué en este orden |
+|---|---|---|---|
+| 1 | Supabase (SQL editor) | Correr `db/migrations/2026-10-06_idempotency_key.sql` | Agrega `ventas.idempotency_key` (nullable) e índice único parcial `ventas_user_idempotency_key_uidx`. Tiene que existir antes de que el backend nuevo reciba una request con `Idempotency-Key`. |
+| 2 | Supabase (SQL editor) | Correr `db/migrations/2026-10-06_ventas_restrict_update.sql` | Deja a `authenticated` con UPDATE solo sobre `ventas.dispatch_status`. No depende del backend (corre como `postgres`) ni del front nuevo. |
+| 3 | Render -> Environment | Cargar `MP_WEBHOOK_SECRET` (clave secreta de la integración de MP) | Con la variable definida el webhook exige firma. Cargarla **antes o junto con el deploy** del backend; si se carga después, el webhook queda aceptando sin firma hasta entonces (el arranque loguea `mp_webhook_unsigned`). |
+| 4 | Render | Deploy del backend | Debe estar vivo antes que el front: el front nuevo ya manda `Idempotency-Key` (CORS lo permite desde este backend) y espera el 503 `AUTH_UNAVAILABLE`. |
+| 5 | Vercel | Deploy del front | Último: depende de los pasos 1 y 4. |
+
+### Verificación
+
+Paso 1 (columna e índice):
+```sql
+SELECT column_name, is_nullable FROM information_schema.columns
+ WHERE table_schema = 'public' AND table_name = 'ventas' AND column_name = 'idempotency_key';
+-- 1 fila, is_nullable = YES
+SELECT indexdef FROM pg_indexes
+ WHERE schemaname = 'public' AND indexname = 'ventas_user_idempotency_key_uidx';
+-- 1 fila: UNIQUE (user_id, idempotency_key) WHERE idempotency_key IS NOT NULL
+```
+
+Paso 2 (privilegios de columna; debe listar solo `dispatch_status`):
+```sql
+SELECT column_name, privilege_type FROM information_schema.column_privileges
+ WHERE table_schema = 'public' AND table_name = 'ventas'
+   AND grantee = 'authenticated' AND privilege_type = 'UPDATE';
+```
+Además, como admin en el panel Despachos: cambiar el estado de un pedido debe seguir
+funcionando y, al pasar a `despachado`, `dispatched_at` debe quedar seteado.
+
+Paso 3 y 4 (webhook): en los logs de arranque del backend NO debe aparecer
+`mp_webhook_unsigned` con `phase: 'startup'`. Un POST a `/api/orders/mp-webhook` sin
+`x-signature` debe responder 401.
+
+### Rollback
+
+- **Paso 2** (el más probable de necesitar revertir si algo del panel deja de guardar):
+  `GRANT UPDATE ON public.ventas TO authenticated;` (restaura el UPDATE a nivel tabla; la
+  policy `ventas_update_admin` sigue limitando a admins). El `REVOKE ALL ... FROM anon` no
+  se revierte salvo que se necesite explícitamente.
+- **Paso 1:** no hace falta revertirlo para volver atrás el backend (la columna es nullable
+  y el backend viejo la ignora). Solo si se quiere eliminar del todo:
+  `DROP INDEX IF EXISTS public.ventas_user_idempotency_key_uidx; ALTER TABLE public.ventas DROP COLUMN IF EXISTS idempotency_key;`
+  (se pierde la trazabilidad de las keys ya guardadas).
+- **Paso 3:** vaciar `MP_WEBHOOK_SECRET` en Render desactiva la exigencia de firma (el
+  webhook vuelve a aceptarse sin firma y se loguea el aviso).
+- **Pasos 4 y 5:** redeploy del commit anterior en Render / Vercel. Si se revierte el
+  backend, revertir también el front (el front nuevo manda `Idempotency-Key` y el backend
+  viejo bloquearía el preflight por CORS). Un front viejo con backend nuevo funciona: no
+  manda la key y el backend se comporta como antes.

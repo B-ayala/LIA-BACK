@@ -2,7 +2,32 @@
 
 ## [Unreleased]
 
+### Changed
+- Productos: `GET /api/products` y `/:id` solo devuelven productos activos al público; un admin con token válido ve también los inactivos (caché separada por audiencia, `Vary: Authorization`).
+- Productos: un `:id` que no sea numérico (1 a 15 dígitos) responde 404 en detalle, edición y baja.
+- Auth: una falla de infraestructura al validar el token (timeout de Supabase Auth, BD) responde 503 `AUTH_UNAVAILABLE` con `Retry-After: 2` en vez de 401; un token inválido sigue siendo 401.
+- Checkout: nombre e imagen del producto se toman de la base (no del body) al persistir la orden y al armar el título de Mercado Pago.
+- Checkout: el email del comprador se toma de la cuenta autenticada; el dueño de una orden se resuelve por `user_id` (filas históricas sin `user_id`, por email) en "Mis compras", cancelación y nudge.
+- Webhook de Mercado Pago: con `MP_WEBHOOK_SECRET` la firma es obligatoria (401 si falta o es inválida, también para notificaciones que no son de pago); sin secreto se acepta y se loguea `mp_webhook_unsigned` al arrancar y por request. Solo invalida el catálogo si marcó órdenes.
+- Login: `email`/`password` deben ser strings (400 en otro caso) y el rastreo de fuerza bruta se purga periódicamente con tope de 10000 cuentas.
+- Auth: timeout de 3 s al verificar el token contra Supabase para no agotar el bulkhead si Auth se degrada.
+- Órdenes: consultas por `id` uuid nativo (usa `ventas_pkey`) en lugar de `id::text`.
+- Órdenes: los productos del carrito se bloquean en orden de id para evitar deadlocks entre checkouts concurrentes.
+- Login: el perfil se busca por el id devuelto por Supabase en lugar de `LOWER(email)`.
+- Insights: el corte de "hoy" usa rango sobre `created_at` para aprovechar el índice de ventas pagadas.
+
 ### Added
+- **Idempotencia de checkout**: header opcional `Idempotency-Key` (8-128 caracteres `[A-Za-z0-9_-]`) en
+  `POST /api/orders/transfer` y `/mp-preference`. Un reintento con la misma key devuelve las órdenes ya
+  creadas sin descontar stock de nuevo (la carrera entre dos requests se resuelve con el índice UNIQUE).
+  Script SQL `db/migrations/2026-10-06_idempotency_key.sql` (`ventas.idempotency_key` + índice único parcial).
+  **Pendiente de aplicar en Supabase antes de que el front envíe el header.** CORS ahora permite `Idempotency-Key`.
+- Idempotencia de checkout: la misma `Idempotency-Key` con un carrito, envío o medio de pago distinto responde 422 `IDEMPOTENCY_KEY_REUSED` en vez de reenviar la reserva original. La huella (sha256 de 12 hex) vive dentro de `ventas.idempotency_key` (`<key>:<huella>:<índice>`); sin cambios de esquema y compatible con filas `<key>:<índice>`. Las requests concurrentes de una misma key se serializan con un advisory lock transaccional.
+- `MP_WEBHOOK_SECRET` documentada (vacía) en `.env.example`.
+- **Tabla `admin_preferences`** (script SQL `db/migrations/2026-10-04_add_admin_preferences.sql`):
+  preferencias por admin (hoy, `variants_tutorial_dismissed`) para que "No volver a mostrar"
+  del tutorial de Variantes sobreviva al logout. RLS: cada admin lee/escribe solo su fila
+  (`is_admin`). Pendiente de aplicar en Supabase.
 - **`ventas.user_id`** (script SQL `db/migrations/2026-09-18_add_user_id_to_ventas.sql`):
   FK real a `auth.users` para identificar al comprador de cada venta, además del
   `buyer_email`/`buyer_name` en texto que ya existía (se conservan como snapshot

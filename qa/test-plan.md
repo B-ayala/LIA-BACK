@@ -1089,6 +1089,378 @@ Esperado: cada columna queda con la fecha/hora real del cambio; el resto de las
 Resultado: no probado — pendiente de aplicar el script SQL en producción
 ```
 
+### Cambios 2026-10-05/06 — catálogo por audiencia, auth 503, idempotencia, webhook firmado, RLS de ventas (`TC-231`–`TC-263`)
+
+> Estado de ejecución: **ningún caso de esta sección se ejecutó contra una base ni un
+> servidor real** (esta pasada fue solo de documentación, leyendo el código). El pedido
+> original mencionaba verificaciones parciales con stubs; **no hay evidencia de ellas en el
+> repo** (`qa/` solo contiene `concurrency-stock-test.js`, `load-test.js` y
+> `_verify_mp_timeout.js`, ninguno cubre estos casos), así que todo figura como
+> `no probado`. Cuando alguien corra un caso, que anote fecha y método (stub / servidor real).
+> Pre-condiciones comunes: scripts SQL `2026-10-06_idempotency_key.sql` y
+> `2026-10-06_ventas_restrict_update.sql` aplicados (donde el caso lo indique), backend en
+> `localhost:3000`, un usuario común y un admin con token válido, un producto activo con
+> stock >= 3 y uno con `status='inactive'`.
+
+```
+ID: TC-231
+Caso: Catálogo público no lista productos inactivos; admin sí
+Tipo: security
+Pre-condición: existe al menos un producto con status 'inactive'
+Pasos:
+  1. GET /api/products?limit=100 sin Authorization
+  2. GET /api/products?limit=100 con token de usuario común
+  3. GET /api/products?limit=100 con token de admin
+Esperado: pasos 1 y 2 no incluyen el inactivo (`total` cuenta solo activos; productos con
+  status NULL cuentan como activos); paso 3 lo incluye y su `total` es mayor; la respuesta
+  del paso 3 trae `Cache-Control: private, no-store` y todas traen `Vary: Authorization`
+Resultado: no probado
+
+ID: TC-232
+Caso: Detalle de producto inactivo — público 404, admin 200
+Tipo: security
+Pasos:
+  1. GET /api/products/:idInactivo sin token
+  2. GET /api/products/:idInactivo con token de admin
+  3. GET /api/products/:idActivo sin token
+Esperado: paso 1 -> 404 "Producto no encontrado"; paso 2 -> 200; paso 3 -> 200
+Resultado: no probado
+
+ID: TC-233
+Caso: La caché del catálogo no se mezcla entre audiencias
+Tipo: edge
+Pasos:
+  1. Reiniciar el backend (caché vacía)
+  2. GET /api/products como admin (calienta la clave `list:admin:...`)
+  3. Inmediatamente GET /api/products sin token
+  4. Repetir invirtiendo el orden (público primero, admin después)
+Esperado: en ambos órdenes el público nunca ve inactivos y el admin siempre los ve
+  (claves `list:public:*` / `list:admin:*` y `detail:public:*` / `detail:admin:*` separadas)
+Resultado: no probado
+
+ID: TC-234
+Caso: Token inválido o falla de auth en endpoint público degrada a anónimo
+Tipo: failure
+Pasos:
+  1. GET /api/products con `Authorization: Bearer basura`
+  2. (Con Supabase Auth bloqueado/lento) GET /api/products con un token válido
+Esperado: ambos responden 200 con la vista pública (sin inactivos); no 401 ni 503; en el
+  paso 2 el log trae `optional_auth_degraded`
+Resultado: no probado
+
+ID: TC-235
+Caso: id de producto inválido responde 404 sin tocar la base
+Tipo: edge
+Pasos:
+  1. GET /api/products/abc, /api/products/1e3, /api/products/-1, /api/products/1234567890123456 (16 dígitos)
+  2. PUT y DELETE a /api/products/abc con token de admin
+Esperado: 404 "Producto no encontrado" en todos (regex `^\d{1,15}$`); ningún 500 ni error de
+  rango de pg; un id válido inexistente (ej. 999999999) también da 404
+Resultado: no probado
+
+ID: TC-236
+Caso: 503 AUTH_UNAVAILABLE cuando Supabase Auth no responde en 3 s (sin 401)
+Tipo: failure
+Pre-condición: poder simular un Supabase Auth lento (proxy/stub que demore > 3 s o corte la conexión)
+Pasos:
+  1. POST /api/orders/transfer con un token válido que NO esté en caché de auth (30 s)
+Esperado: respuesta 503 `{ code: 'AUTH_UNAVAILABLE' }` con header `Retry-After: 2`
+  en ~3 s; log `auth_unavailable`; el mismo token válido funciona al volver Auth
+Resultado: no probado
+
+ID: TC-237
+Caso: Token realmente inválido sigue dando 401 (no 503)
+Tipo: security
+Pasos:
+  1. GET /api/orders/user?email=x@y.com con `Authorization: Bearer token-roto`
+  2. Idem sin header Authorization
+Esperado: paso 1 -> 401 "Token inválido o expirado"; paso 2 -> 401 "Token de autenticación requerido"
+Resultado: no probado
+
+ID: TC-238
+Caso: Front — el 503 AUTH_UNAVAILABLE no cierra la sesión (ver TC-API-01 del front del front)
+Tipo: failure
+Pasos:
+  1. Con la sesión iniciada, forzar el 503 del caso TC-236 durante un checkout
+  2. Observar la UI
+Esperado: el usuario sigue logueado; `apiFetch` reintenta una vez tras `Retry-After`; no se
+  emite `auth:logout`
+Resultado: no probado
+
+ID: TC-239
+Caso: Checkout sin Idempotency-Key funciona igual que antes (compatibilidad)
+Tipo: happy
+Pasos:
+  1. POST /api/orders/transfer sin header, producto stock 3, cantidad 1
+Esperado: 201 con `order_ids`; stock 2; la fila de `ventas` tiene `idempotency_key` NULL
+Resultado: no probado
+
+ID: TC-240
+Caso: Doble click / doble submit con la misma Idempotency-Key no duplica la reserva
+Tipo: edge
+Pre-condición: script `2026-10-06_idempotency_key.sql` aplicado
+Pasos:
+  1. Generar una key (ej. `qa-key-0001`)
+  2. POST /api/orders/transfer con esa key y un carrito de 2 líneas
+  3. Repetir exactamente el mismo POST (misma key, mismo carrito) otra vez, después de que
+     terminó el primero
+Esperado: ambas responden 201 con los mismos `order_ids`; en `ventas` solo hay 2 filas con
+  `idempotency_key` = `qa-key-0001:<12 hex>:0` y `...:1`; el stock se descontó UNA vez;
+  log `order_reserve_replayed` en la segunda
+Resultado: no probado
+
+ID: TC-241
+Caso: Misma key con distinto carrito responde 422
+Tipo: failure
+Pasos:
+  1. POST /api/orders/transfer con key K y carrito A (1 unidad del producto X)
+  2. POST /api/orders/transfer con key K y carrito B (2 unidades de X, o producto Y)
+  3. POST /api/orders/transfer con key K, carrito A pero otro `shippingMethod`
+Esperado: pasos 2 y 3 -> 422 `IDEMPOTENCY_KEY_REUSED` con mensaje "Esta compra no coincide con
+  la que ya se había iniciado..."; no se crean filas nuevas ni se descuenta stock
+Resultado: no probado
+
+ID: TC-242
+Caso: Misma key con distinto medio de pago responde 422
+Tipo: failure
+Pasos:
+  1. POST /api/orders/transfer con key K
+  2. POST /api/orders/mp-preference con key K y el mismo carrito
+Esperado: paso 2 -> 422 `IDEMPOTENCY_KEY_REUSED` (el medio de pago está en la huella y se
+  compara `payment_method` de la fila guardada)
+Resultado: no probado
+
+ID: TC-243
+Caso: Formato inválido de Idempotency-Key responde 400
+Tipo: edge
+Pasos:
+  1. POST /api/orders/transfer con header `Idempotency-Key: corta` (5 caracteres)
+  2. Idem con `abc:def:ghi12345` (contiene ':'), con 129 caracteres y con espacios
+Esperado: 400 `INVALID_IDEMPOTENCY_KEY` en todos; nada persistido, stock intacto
+Resultado: no probado
+
+ID: TC-244
+Caso: Carrera simultánea de N requests con la misma key
+Tipo: edge
+Pasos:
+  1. Disparar 10 POST /api/orders/transfer en paralelo con la misma key y mismo carrito
+     (stock suficiente), desde procesos/conexiones distintas para evitar el single-flight
+     en memoria (`caches.orders.single`)
+Esperado: todas responden 201 con los mismos `order_ids`; en la base solo hay una reserva
+  (N líneas del carrito, no 10 x N); stock descontado una sola vez; sin 500
+Resultado: no probado
+Notas: complementa TC-192; el test automatizado `qa/concurrency-stock-test.js` invoca
+  `reserveOrders` directo y podría extenderse con `idempotencyKey`.
+
+ID: TC-245
+Caso: Replay de mp-preference sobre órdenes que ya no están pendientes responde 409
+Tipo: failure
+Pasos:
+  1. POST /api/orders/mp-preference con key K (queda 'pendiente')
+  2. Cancelar la orden (POST /api/orders/:id/cancel) o dejarla expirar
+  3. Repetir el POST con la misma key y carrito
+Esperado: 409 "Esta compra ya fue procesada, cancelada o venció. Iniciá una nueva compra."
+  (el front debe generar una key nueva para un carrito nuevo)
+Resultado: no probado
+
+ID: TC-246
+Caso: Si Mercado Pago falla tras reservar, la key se libera y se puede reintentar
+Tipo: failure
+Pre-condición: poder forzar un error de MP (ej. `MP_ACCESS_TOKEN` inválido o timeout)
+Pasos:
+  1. POST /api/orders/mp-preference con key K -> MP falla (502)
+  2. Verificar las filas en `ventas`
+  3. Corregir MP y repetir el POST con la misma key K
+Esperado: paso 1 -> 502; paso 2 -> las órdenes quedaron 'cancelado' con `idempotency_key`
+  NULL y el stock restaurado; paso 3 -> 201 con órdenes nuevas (no 409 "ya procesada")
+Resultado: no probado
+
+ID: TC-247
+Caso: Idempotency-Key con la migración SQL sin aplicar
+Tipo: failure
+Pre-condición: base SIN la columna `ventas.idempotency_key`
+Pasos:
+  1. POST /api/orders/transfer con cualquier key válida
+Esperado: 500 "No se pudo registrar la orden. Intentá de nuevo." con rollback y stock intacto
+  (por eso el script SQL va antes del deploy del front; ver flow-despliegue-produccion.md);
+  sin header el mismo POST sigue funcionando (TC-239)
+Resultado: no probado
+
+ID: TC-248
+Caso: Webhook de MP con MP_WEBHOOK_SECRET definido y sin firma
+Tipo: security
+Pre-condición: `MP_WEBHOOK_SECRET` cargada
+Pasos:
+  1. POST /api/orders/mp-webhook?type=payment&data.id=123 sin header x-signature
+  2. Idem con `x-signature: ts=1,v1=00` (firma inválida)
+  3. Idem con `type=merchant_order` y sin firma
+Esperado: los tres -> 401 `{ success: false }`; log `mp_webhook_invalid_signature`; no se
+  consulta la API de MP ni se modifica ninguna orden
+Resultado: no probado
+
+ID: TC-249
+Caso: Webhook con firma válida marca pagada la orden
+Tipo: happy
+Pre-condición: `MP_WEBHOOK_SECRET` cargada; orden MP pendiente; pago aprobado en sandbox
+Pasos:
+  1. Calcular `v1` = HMAC-SHA256(secret, `id:<data.id en minúsculas>;request-id:<x-request-id>;ts:<ts>;`)
+  2. POST al webhook con `x-signature: ts=<ts>,v1=<v1>` y `x-request-id`
+Esperado: 200; la orden pasa a 'pagado'; si no se marcó ninguna fila, el catálogo cacheado no se invalida
+Resultado: no probado
+
+ID: TC-250
+Caso: Webhook sin MP_WEBHOOK_SECRET se acepta y deja aviso
+Tipo: edge
+Pre-condición: `MP_WEBHOOK_SECRET` vacía
+Pasos:
+  1. Arrancar el backend y mirar los logs
+  2. POST al webhook sin firma con un pago aprobado
+Esperado: log `mp_webhook_unsigned` (phase 'startup') al arrancar y por request; el pago se
+  procesa igual tras revalidarlo contra la API de MP (200)
+Resultado: no probado
+
+ID: TC-251
+Caso: Orden con nombre/imagen del producto falsificados en el body
+Tipo: security
+Pasos:
+  1. POST /api/orders/transfer con `items[0].productName = "Producto trucho"` y
+     `productImage = "https://evil.example/x.png"` para un producto real
+  2. Mirar la fila creada en `ventas` y (en MP) el título de la preferencia
+Esperado: `product_name` y `product_image` de la fila son los de `productos`
+  (`name`, `image_url`), no los del body; el título/imagen en MP también
+Resultado: no probado
+Notas: `productName` del body sigue siendo obligatorio (400 si falta), pero no se persiste.
+
+ID: TC-252
+Caso: Orden con email de otra persona en el body
+Tipo: security
+Pasos:
+  1. Con el usuario A logueado: POST /api/orders/transfer con `buyerEmail: "victima@x.com"`
+  2. GET /api/orders/user?email=victima@x.com como usuario A, y como la víctima (tras confirmar pago)
+Esperado: la fila queda con `buyer_email` = email de la cuenta A y `user_id` = A; la orden
+  NO aparece en "Mis compras" de la víctima; el paso 2 como A da 403 (email ajeno)
+Resultado: no probado
+
+ID: TC-253
+Caso: Dueño por user_id con fallback por email en filas históricas
+Tipo: security
+Pre-condición: una orden nueva (con `user_id`) y una histórica sin `user_id` de otro usuario
+Pasos:
+  1. Usuario B: POST /api/orders/:idDeA/cancel y POST /api/orders/nudge con la orden de A
+  2. Usuario dueño de la fila histórica (match por email): cancelar su orden MP pendiente
+  3. Usuario con `user_id` de la orden pero email cambiado: GET /api/orders/user?email=<su email actual>
+Esperado: paso 1 -> 403 (cancel) y `applied: 0` (nudge); paso 2 -> 200; paso 3 -> ve sus
+  compras ligadas a `user_id` aunque el `buyer_email` guardado sea otro
+Resultado: no probado
+
+ID: TC-254
+Caso: Carrito con productId inválido o inexistente
+Tipo: edge
+Pasos:
+  1. POST /api/orders/transfer con `productId: "abc"` (o ausente)
+  2. Idem con `productId: 999999999` (no existe)
+Esperado: paso 1 -> 400 "No se pudo identificar el producto ..."; paso 2 -> 409 "No hay stock
+  suficiente de ..."; en ambos no se persiste nada y los locks se liberan
+Resultado: no probado
+
+ID: TC-255
+Caso: POST /api/users/login con tipos inválidos en el body
+Tipo: edge
+Pasos:
+  1. POST /api/users/login con `{"email": {"a":1}, "password": "x"}`
+  2. Idem con `{"email": ["a@b.com"], "password": "x"}`, `{"email": "a@b.com", "password": 123}`,
+     email de 255+ caracteres, y strings solo con espacios
+Esperado: 400 "Email y contraseña son requeridos" en todos (nunca 500)
+Resultado: no probado
+
+ID: TC-256
+Caso: POST /api/auth/login con tipos inválidos en el body
+Tipo: edge
+Pasos:
+  1. POST /api/auth/login con `{"email": {"a":1}, "password": "x"}`
+Esperado: 400 (mismo criterio que TC-255)
+Resultado: no probado
+Notas: HALLAZGO abierto H-OBJ-LOGIN. Por lectura de código, `authController.login` solo valida
+  `!email || !password` (no `typeof`), y `checkLock(email)` llama `email.toLowerCase()`, que
+  lanza TypeError con un objeto -> cae en el catch y responde 500 "No se pudo validar las
+  credenciales". No se ejecutó para confirmarlo.
+
+ID: TC-257
+Caso: El rastreo de fuerza bruta de login se purga y tiene tope
+Tipo: edge
+Pasos:
+  1. Provocar 3 fallos de login para un email y esperar > 15 min (o simular el reloj)
+  2. Observar que el registro desaparece (purga cada 60 s) y que un nuevo fallo cuenta desde 1
+  3. Provocar fallos con > 10000 emails distintos
+Esperado: los registros vencidos (ventana 15 min y sin bloqueo vigente) se eliminan solos; el
+  Map nunca supera 10000 cuentas (se descartan las más viejas); el proceso puede terminar
+  (timer con `unref`)
+Resultado: no probado
+
+ID: TC-258
+Caso: UPDATE sobre ventas desde el cliente solo permite dispatch_status
+Tipo: security
+Pre-condición: script `2026-10-06_ventas_restrict_update.sql` aplicado; sesión admin de Supabase
+Pasos:
+  1. Con supabase-js (anon key + sesión admin): `update({ dispatch_status: 'despachado' }).eq('id', X)`
+  2. `update({ payment_status: 'pagado' }).eq('id', X)`, y lo mismo con `total_price` y `buyer_email`
+  3. Con la anon key sin sesión: `select` y `update` sobre `ventas`
+Esperado: paso 1 OK y `dispatched_at` queda seteado por el trigger; paso 2 -> error de
+  permisos (42501 / "permission denied for table ventas"); paso 3 -> sin acceso (anon no tiene
+  privilegios)
+Resultado: no probado
+
+ID: TC-259
+Caso: Verificación de privilegios de columna tras aplicar el script
+Tipo: security
+Pasos:
+  1. Ejecutar la consulta de `information_schema.column_privileges` (ver
+     docs/flows/flow-despliegue-produccion.md, "Orden de despliegue 2026-10-06")
+Esperado: para `authenticated` y `UPDATE` solo aparece `dispatch_status`
+Resultado: no probado
+
+ID: TC-260
+Caso: Los flujos del backend siguen actualizando ventas con el UPDATE restringido
+Tipo: edge
+Pasos:
+  1. Confirmar y cancelar una transferencia desde el panel (backend)
+  2. Pagar una orden MP (mp-confirm / webhook) y dejar expirar otra (sweep)
+Esperado: todo funciona (el backend corre como `postgres` y no depende de los GRANT del cliente)
+Resultado: no probado
+
+ID: TC-261
+Caso: Deadlock entre carritos con los mismos productos en orden cruzado
+Tipo: edge
+Pasos:
+  1. Con stock suficiente de A y B, disparar en paralelo (varias rondas, 20+ pares) un
+     checkout con items [A, B] y otro con [B, A], de usuarios distintos y sin key
+Esperado: todos responden 201 (o 409 si se agota stock), ningún 500; ninguna entrada
+  `order_reserve_failed` con code `40P01` en los logs (los locks se toman en orden de id)
+Resultado: no probado
+Notas: antes del cambio, dos transacciones podían bloquearse mutuamente y una caía con 40P01.
+
+ID: TC-262
+Caso: Ids de orden mal formados no revientan las consultas por uuid
+Tipo: edge
+Pasos:
+  1. POST /api/orders/not-a-uuid/cancel con token válido
+  2. PATCH /api/orders/123/confirm-transfer con token de admin
+  3. POST /api/orders/nudge con `orderIds: ["x", "<uuid válido ajeno>"]`
+Esperado: pasos 1 y 2 -> 404 "Orden no encontrada" (sin error de cast de Postgres); paso 3
+  -> 200 con `applied` solo sobre lo que corresponde
+Resultado: no probado
+
+ID: TC-263
+Caso: Insights "hoy" usa el índice y mantiene el corte por día en zona horaria local
+Tipo: edge
+Pasos:
+  1. Con ventas cerca de la medianoche local (23:59 / 00:01), consultar el insight de ventas del día
+  2. `EXPLAIN` de la consulta de `Insights` con `created_at >= inicio_de_hoy AND created_at < inicio_de_hoy + 1 day`
+Esperado: el resultado incluye solo ventas del día local; el plan puede usar `idx_ventas_paid_created`
+  (rango sargable sobre `created_at` en lugar de `date_trunc` sobre la columna)
+Resultado: no probado
+```
+
 ---
 
 ## Casos pendientes sin probar (backlog)
@@ -1119,6 +1491,7 @@ Resultado: no probado — pendiente de aplicar el script SQL en producción
 | — | Checkout con carrito vacío (URL directa) | ✅ OK 2026-07-01 — redirige a /products |
 | — | Safari iOS / Android Chrome — flujo de checkout completo | — |
 | TC-192 | Doble submit del checkout no duplica órdenes | necesita usuario logueado + token MP |
+| TC-231–TC-263 | Cambios 2026-10-05/06 (catálogo por audiencia, auth 503, idempotencia, webhook firmado, UPDATE de ventas, deadlock) | no probados: requieren aplicar los scripts SQL del 2026-10-06 y MP_WEBHOOK_SECRET; ver sección propia |
 
 ## Matriz de cobertura
 
@@ -1136,12 +1509,33 @@ Resultado: no probado — pendiente de aplicar el script SQL en producción
 | Productos (CRUD admin) | TC-210 | TC-211 | — | — | — |
 | Modo compra restringida | TC-212/213/215/216 | TC-216 | TC-215 | TC-214/217 | — |
 | Admin principal (owner) | TC-222 | — | — | TC-220/221 | — |
+| Catálogo por audiencia (público vs admin) | TC-231/232 | TC-233/235 | TC-234 | TC-231/232 | — |
+| Auth 503 AUTH_UNAVAILABLE | — | — | TC-236/238 | TC-237 | — |
+| Idempotencia de checkout | TC-239 | TC-240/243/244 | TC-241/242/245/246/247 | — | TC-244 |
+| Webhook MP firmado | TC-249 | TC-250 | — | TC-248 | — |
+| Datos de orden desde la base / dueño | — | TC-254/262 | — | TC-251/252/253 | TC-261 |
+| Login (validación de tipos / fuerza bruta) | — | TC-255/256/257 | — | TC-255/256 | — |
+| RLS de ventas (UPDATE por columna) | TC-258 | TC-260 | — | TC-258/259 | — |
+| Insights (rango sargable) | — | TC-263 | — | — | — |
 
 ## Cross-browser / device
 Probado en Chrome desktop (Playwright). Pendiente: Safari iOS, Chrome Android
 sobre el flujo de checkout completo.
 
 ## Hallazgos abiertos
+- 🟡 Medio — H-OBJ-LOGIN — `POST /api/auth/login` (`authController.login`) valida solo
+  `!email || !password`; con `email` objeto/array, `checkLock` (`email.toLowerCase()`) lanza
+  TypeError y la respuesta es 500 en vez de 400. `POST /api/users/login` ya valida con
+  `typeof`. Detectado leyendo el código (2026-10-06); sin reproducir. Caso: TC-256.
+- 🟢 Menor — H-REL-RATE — Replay de `transfer` con una Idempotency-Key no chequea el estado
+  de las órdenes originales (solo `mp-preference` devuelve 409 si ya no están pendientes):
+  devuelve los ids originales aunque estén canceladas/expiradas. Comportamiento a confirmar
+  con producto (leído en `replayReservation`, 2026-10-06).
+- 🟡 Medio — H-DEPLOY-1006 — Hasta aplicar `2026-10-06_idempotency_key.sql` en Supabase, un
+  POST con `Idempotency-Key` responde 500 (TC-247). Orden de despliegue en
+  `docs/flows/flow-despliegue-produccion.md`. (2026-10-06)
+- 🟢 Info — H-WEBHOOK-SECRET — Mientras `MP_WEBHOOK_SECRET` no esté cargada en Render, el
+  webhook se acepta sin firma (se revalida el pago contra MP). Pendiente de cargar. (2026-10-06)
 - 🟢 Menor — Panel admin Ventas: las tarjetas de stats ("Total ventas", "Pagadas") no
   cuadran con la lista. "Pendientes de pago" sí cuenta bien en vivo (0↔1). No bloqueante.
   (2026-06-14)
