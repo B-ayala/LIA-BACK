@@ -16,6 +16,11 @@ const FREE_ATTEMPTS = 3; // fallos sin penalidad
 const BASE_LOCK_MS = 30 * 1000; // primer bloqueo
 const MAX_LOCK_MS = 15 * 60 * 1000; // techo del backoff exponencial
 
+// Tope duro de cuentas rastreadas: sin él, un atacante que pruebe millones de
+// emails distintos infla el Map sin límite hasta agotar la memoria del proceso.
+const MAX_TRACKED_ACCOUNTS = 10000;
+const PURGE_INTERVAL_MS = 60 * 1000;
+
 const keyOf = (email) => email.toLowerCase().trim();
 
 const getRecord = (email) => {
@@ -34,6 +39,25 @@ const checkLock = (email) => {
   return { locked, retryAfterSeconds: locked ? Math.ceil((record.lockedUntil - now) / 1000) : 0 };
 };
 
+/** Descarta registros cuya ventana ya venció (y cuyo bloqueo, si lo hubo, terminó). */
+const purgeExpired = () => {
+  const now = Date.now();
+  for (const [key, record] of store) {
+    if (now - record.windowStart > WINDOW_MS && now >= record.lockedUntil) store.delete(key);
+  }
+};
+
+/** Si se supera el tope, se descartan los registros más viejos (el Map conserva el orden de inserción). */
+const enforceCapacity = () => {
+  for (const key of store.keys()) {
+    if (store.size <= MAX_TRACKED_ACCOUNTS) return;
+    store.delete(key);
+  }
+};
+
+// unref: el timer de limpieza no debe impedir que el proceso termine.
+setInterval(purgeExpired, PURGE_INTERVAL_MS).unref();
+
 /** Registra un intento fallido y, a partir del 4°, aplica bloqueo exponencial. */
 const recordFailure = (email) => {
   const existing = getRecord(email);
@@ -47,6 +71,7 @@ const recordFailure = (email) => {
   }
 
   store.set(keyOf(email), { failCount, lockedUntil, windowStart: existing?.windowStart ?? now });
+  enforceCapacity();
 };
 
 /** Login exitoso: borra el historial de fallos de la cuenta. */

@@ -90,7 +90,8 @@ const maxAttemptsResponse = (res, retryAfterSeconds) => {
 exports.login = async (req, res) => {
   try {
     const { email, password } = req.body;
-    if (!email || !password) {
+    // Un email no-string (objeto/array) rompería email.toLowerCase() en el tracker de fuerza bruta.
+    if (typeof email !== 'string' || typeof password !== 'string' || !email || !password) {
       return res.status(400).json({ success: false, message: 'Email y contraseña son requeridos' });
     }
 
@@ -113,7 +114,8 @@ exports.login = async (req, res) => {
       return invalidCredentials(res);
     }
 
-    const profile = await User.findByEmail(email);
+    // El id viene en la respuesta de Supabase: evita un seq scan por LOWER(email) en auth.users.
+    const profile = data.user?.id ? await User.findById(data.user.id) : null;
     if (!profile) return invalidCredentials(res);
 
     recordSuccess(email);

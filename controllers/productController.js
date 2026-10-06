@@ -3,6 +3,10 @@ const { caches, TTL, invalidateProducts } = require('../utils/cache');
 
 const logger = require('../utils/logger');
 
+// Los ids de producto son bigint: se acota a 15 dígitos para que un id absurdo
+// ni siquiera llegue a la base (evita el error de rango de pg y un 500 evitable).
+const PRODUCT_ID_RE = /^\d{1,15}$/;
+
 const MAX_PAGE_SIZE = 100;
 const DEFAULT_PAGE_SIZE = 50;
 
@@ -20,6 +24,29 @@ const serverError = (res, action, error) => {
     code: 'INTERNAL_ERROR',
     message: 'No se pudo completar la operación. Reintentá en unos segundos.',
   });
+};
+
+const isValidProductId = (id) => PRODUCT_ID_RE.test(String(id));
+
+const productNotFound = (res) =>
+  res.status(404).json({ success: false, message: 'Producto no encontrado' });
+
+/** Solo un admin autenticado (ver `optionalAuth`) ve productos no activos. */
+const canSeeInactive = (req) => Boolean(req.user && req.user.role === 'admin');
+
+/**
+ * El catálogo cacheado se separa por audiencia: si admin y público compartieran
+ * clave, el primero en llegar decidiría si el otro ve productos inactivos.
+ */
+const audienceOf = (includeInactive) => (includeInactive ? 'admin' : 'public');
+
+/**
+ * La respuesta depende del token: las cachés compartidas (CDN) deben variar por
+ * `Authorization` y la versión de admin no puede quedar guardada en ninguna.
+ */
+const setAudienceHeaders = (res, includeInactive) => {
+  res.vary('Authorization');
+  if (includeInactive) res.setHeader('Cache-Control', 'private, no-store');
 };
 
 /** Entero saneado dentro de [min, max]; cae al default si no es válido. */
@@ -97,10 +124,13 @@ const createProduct = async (req, res) => {
  * junto con las filas y evita el segundo round trip (dos queries por request se
  * notan cuando hay decenas de lectores simultáneos).
  */
-const fetchProductPage = async (limit, offset) => {
+const fetchProductPage = async (limit, offset, includeInactive) => {
+  // Fragmento fijo (sin input del usuario): COALESCE trata status NULL como activo.
+  const where = includeInactive ? '' : "WHERE COALESCE(status, 'active') = 'active'";
   const result = await pool.query(
     `SELECT *, COUNT(*) OVER()::int AS total_count
        FROM public.productos
+       ${where}
       ORDER BY created_at DESC, id DESC
       LIMIT $1 OFFSET $2`,
     [limit, offset]
@@ -111,7 +141,9 @@ const fetchProductPage = async (limit, offset) => {
 
   // Página vacía (offset fuera de rango): `COUNT(*) OVER()` no devuelve nada,
   // así que el total se resuelve aparte para no reportar 0 productos de más.
-  const countResult = await pool.query('SELECT COUNT(*)::int AS total FROM public.productos');
+  const countResult = await pool.query(
+    `SELECT COUNT(*)::int AS total FROM public.productos ${where}`
+  );
   return { rows, total: countResult.rows[0].total };
 };
 
@@ -120,14 +152,16 @@ const getProducts = async (req, res) => {
   try {
     const limit = boundedInt(req.query.limit, DEFAULT_PAGE_SIZE, 1, MAX_PAGE_SIZE);
     const offset = boundedInt(req.query.offset, 0, 0, Number.MAX_SAFE_INTEGER);
+    const includeInactive = canSeeInactive(req);
+    setAudienceHeaders(res, includeInactive);
 
     // Caché + single-flight: una ráfaga de lecturas de la misma página ejecuta
     // una sola query y comparte el resultado. Se invalida ante cualquier cambio
     // de producto o de stock (ver invalidateProducts).
     const { rows, total } = await caches.products.getOrSet(
-      `list:${limit}:${offset}`,
+      `list:${audienceOf(includeInactive)}:${limit}:${offset}`,
       TTL.products,
-      () => fetchProductPage(limit, offset)
+      () => fetchProductPage(limit, offset, includeInactive)
     );
 
     res.json({
@@ -144,25 +178,31 @@ const getProducts = async (req, res) => {
   }
 };
 
+const fetchProductById = async (id, includeInactive) => {
+  const activeOnly = includeInactive ? '' : "AND COALESCE(status, 'active') = 'active'";
+  const result = await pool.query(`SELECT * FROM public.productos WHERE id = $1 ${activeOnly}`, [id]);
+  return result.rows[0] || null;
+};
+
 // Get product by id
 const getProductById = async (req, res) => {
   try {
     const { id } = req.params;
+    if (!isValidProductId(id)) return productNotFound(res);
+
+    const includeInactive = canSeeInactive(req);
+    setAudienceHeaders(res, includeInactive);
 
     // El detalle de un producto "popular" concentra muchas lecturas iguales:
     // es el caso donde más rinde el coalescing. `null` marca "no existe" y
     // también se cachea, para que un scraper de IDs inexistentes no golpee la BD.
-    const product = await caches.products.getOrSet(`detail:${id}`, TTL.products, async () => {
-      const result = await pool.query('SELECT * FROM public.productos WHERE id = $1', [id]);
-      return result.rows[0] || null;
-    });
+    const product = await caches.products.getOrSet(
+      `detail:${audienceOf(includeInactive)}:${id}`,
+      TTL.products,
+      () => fetchProductById(id, includeInactive)
+    );
 
-    if (!product) {
-      return res.status(404).json({
-        success: false,
-        message: 'Producto no encontrado',
-      });
-    }
+    if (!product) return productNotFound(res);
 
     res.json({
       success: true,
@@ -177,6 +217,8 @@ const getProductById = async (req, res) => {
 const updateProduct = async (req, res) => {
   try {
     const { id } = req.params;
+    if (!isValidProductId(id)) return productNotFound(res);
+
     const {
       name, price, stock, category, imageUrl, publicId,
       description, discount, condition, freeShipping, hoverImageEnabled,
@@ -289,12 +331,7 @@ const updateProduct = async (req, res) => {
 
     const result = await pool.query(query, values);
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: 'Producto no encontrado',
-      });
-    }
+    if (result.rows.length === 0) return productNotFound(res);
 
     invalidateProducts();
 
@@ -311,6 +348,7 @@ const updateProduct = async (req, res) => {
 const deleteProduct = async (req, res) => {
   try {
     const { id } = req.params;
+    if (!isValidProductId(id)) return productNotFound(res);
 
     // Get product to find public_id
     const productResult = await pool.query(
@@ -318,12 +356,7 @@ const deleteProduct = async (req, res) => {
       [id]
     );
 
-    if (productResult.rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: 'Producto no encontrado',
-      });
-    }
+    if (productResult.rows.length === 0) return productNotFound(res);
 
     const productData = productResult.rows[0];
 

@@ -21,6 +21,7 @@ const orderRoutes = require('./routes/orderRoutes');
 const shippingRoutes = require('./routes/shippingRoutes');
 const insightsRoutes = require('./routes/insightsRoutes');
 const { expireStaleOrders } = require('./controllers/orderController');
+const mercadopago = require('./utils/mercadopago');
 
 const app = express();
 
@@ -179,6 +180,10 @@ const registerShutdown = (server, sweepTimer) => {
     server.headersTimeout = 70 * 1000;
     // Una request que no termina en 30 s ocupa recursos sin dar valor.
     server.requestTimeout = 30 * 1000;
+
+    if (!mercadopago.isWebhookSecretConfigured()) {
+      logger.warn('mp_webhook_unsigned', { reason: 'MP_WEBHOOK_SECRET no configurada: el webhook se acepta sin verificar firma', phase: 'startup' });
+    }
 
     // Expira órdenes pendientes vencidas (MP 15 min, transferencia 5 h)
     const sweepTimer = setInterval(expireStaleOrders, ORDER_SWEEP_INTERVAL_MS);

@@ -7,7 +7,7 @@ const {
   updateProduct,
   deleteProduct,
 } = require('../controllers/productController');
-const { authMiddleware, adminMiddleware } = require('../middleware/authMiddleware');
+const { authMiddleware, adminMiddleware, optionalAuth } = require('../middleware/authMiddleware');
 const { createRateLimit } = require('../middleware/rateLimit');
 const { publicCache, noStore } = require('../middleware/httpCache');
 const { validateBody } = require('../middleware/validateBody');
@@ -26,9 +26,10 @@ const readLimit = createRateLimit({ name: 'products-read', windowMs: 60 * 1000, 
 // Escrituras de admin: mucho más caras (invalidan caché, tocan Cloudinary).
 const writeLimit = createRateLimit({ name: 'products-write', windowMs: 60 * 1000, max: 60 });
 
-// Public routes
-router.get('/', readLimit, catalogCache, getProducts);
-router.get('/:id', readLimit, catalogCache, getProductById);
+// Lecturas públicas. `optionalAuth` solo identifica a un admin con token válido
+// (ve también los productos inactivos); para el resto la request sigue anónima.
+router.get('/', readLimit, catalogCache, optionalAuth, getProducts);
+router.get('/:id', readLimit, catalogCache, optionalAuth, getProductById);
 
 // Protected routes (admin only)
 router.post('/', writeLimit, noStore, authMiddleware, adminMiddleware, validateBody(createProductSchema), createProduct);

@@ -1,5 +1,17 @@
 const { pool } = require('../config/database');
 
+// Comparar `id = $1::uuid` (y no `id::text`) permite usar ventas_pkey; los ids mal formados nunca matchean.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const isUuid = (value) => UUID_RE.test(String(value));
+const uuidsOnly = (ids) => ids.map(String).filter(isUuid);
+
+// Nombre del índice UNIQUE parcial (db/migrations/2026-10-06_idempotency_key.sql):
+// permite distinguir su unique_violation de cualquier otra.
+const IDEMPOTENCY_INDEX = 'ventas_user_idempotency_key_uidx';
+const UNIQUE_VIOLATION = '23505';
+// Separa la key del cliente del índice de línea (la key del cliente no admite ':').
+const LINE_SEPARATOR = ':';
+
 /**
  * Acceso a datos de órdenes (tabla public.ventas) y stock (public.productos).
  * Los métodos que reciben `client` participan de una transacción abierta
@@ -10,9 +22,16 @@ class Order {
    * Compras pagadas de un usuario, más recientes primero, paginadas.
    * El total viaja en la misma consulta (`COUNT(*) OVER()`) para no pagar un
    * segundo round trip por request.
+   * Con `ownerUserId` (el propio comprador) también cuenta las compras ligadas a su
+   * `user_id` aunque haya cambiado de email; las filas históricas sin `user_id` se
+   * siguen resolviendo por email. Sin `ownerUserId` (admin consultando) es solo por email.
    * @returns {Promise<{rows: object[], total: number}>}
    */
-  static async findPaidByEmail(email, limit, offset) {
+  static async findPaidByEmail(email, limit, offset, ownerUserId = null) {
+    const ownerFilter = ownerUserId
+      ? '(user_id = $4::uuid OR (user_id IS NULL AND LOWER(buyer_email) = LOWER($1)))'
+      : 'LOWER(buyer_email) = LOWER($1)';
+    const params = ownerUserId ? [email, limit, offset, ownerUserId] : [email, limit, offset];
     const result = await pool.query(
       `SELECT id, user_id, buyer_name, buyer_email, product_id, product_name,
               product_image, quantity, unit_price, total_price, units_config,
@@ -20,10 +39,10 @@ class Order {
               mp_preference_id, origin, created_at, paid_at, dispatched_at,
               COUNT(*) OVER()::int AS total_count
          FROM public.ventas
-        WHERE LOWER(buyer_email) = LOWER($1) AND payment_status = 'pagado'
+        WHERE ${ownerFilter} AND payment_status = 'pagado'
         ORDER BY created_at DESC, id DESC
         LIMIT $2 OFFSET $3`,
-      [email, limit, offset]
+      params
     );
 
     const rows = result.rows.map(({ total_count, ...order }) => order);
@@ -32,8 +51,9 @@ class Order {
 
   /** Bloquea la fila de la orden para actualizarla dentro de una transacción. */
   static async findByIdForUpdate(client, id) {
+    if (!isUuid(id)) return null;
     const result = await client.query(
-      'SELECT * FROM public.ventas WHERE id::text = $1 FOR UPDATE',
+      'SELECT * FROM public.ventas WHERE id = $1::uuid FOR UPDATE',
       [String(id)]
     );
     return result.rows[0] || null;
@@ -47,13 +67,17 @@ class Order {
    * (el `FOR UPDATE` serializa transacciones concurrentes sobre el mismo
    * producto) y, sobre todo, para **tomar el precio de la base y no del cliente**.
    *
+   * También devuelve nombre e imagen: lo persistido y lo que ve Mercado Pago sale
+   * de la base, no del body del cliente.
+   *
    * @returns {Promise<{stock: number, price: number, discount: number|null,
-   *   original_price: number|null}|null>} fila del producto, o null si no existe.
+   *   original_price: number|null, name: string, image_url: string|null}|null>}
+   *   fila del producto, o null si no existe.
    */
   static async getProductForUpdate(client, productId) {
     const result = await client.query(
       `SELECT stock, price::float8 AS price, discount::float8 AS discount,
-              original_price::float8 AS original_price
+              original_price::float8 AS original_price, name, image_url
          FROM public.productos
         WHERE id = $1
           FOR UPDATE`,
@@ -62,13 +86,25 @@ class Order {
     return result.rows[0] || null;
   }
 
+  /**
+   * Toma los locks de varios productos en orden de id ascendente. Dos carritos con
+   * los mismos productos en distinto orden ([A,B] y [B,A]) ya no se bloquean entre sí (deadlock 40P01).
+   */
+  static async lockProductsInOrder(client, productIds) {
+    if (productIds.length === 0) return;
+    await client.query(
+      'SELECT id FROM public.productos WHERE id = ANY($1::bigint[]) ORDER BY id FOR UPDATE',
+      [productIds]
+    );
+  }
+
   /** Suma los totales de las órdenes indicadas (control de monto de un pago). */
   static async sumTotalsByIds(client, ids) {
     const result = await client.query(
       `SELECT COALESCE(SUM(total_price), 0)::float8 AS total
          FROM public.ventas
-        WHERE id::text = ANY($1)`,
-      [ids.map(String)]
+        WHERE id = ANY($1::uuid[])`,
+      [uuidsOnly(ids)]
     );
     return result.rows[0].total;
   }
@@ -82,14 +118,19 @@ class Order {
     );
   }
 
-  /** Inserta una línea de venta pendiente y devuelve su id. */
+  /**
+   * Inserta una línea de venta pendiente y devuelve su id.
+   * `idempotencyKey` / `lineIndex` solo tocan la columna `idempotency_key` cuando el
+   * cliente mandó la key: sin ella el INSERT es el de siempre y no depende de la migración.
+   */
   static async insertPending(client, row) {
+    const keyed = Boolean(row.idempotencyKey);
     const result = await client.query(
       `INSERT INTO public.ventas
         (buyer_name, buyer_email, user_id, product_id, product_name, product_image,
          quantity, unit_price, total_price, units_config,
-         payment_method, payment_status, shipping_method)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pendiente', $12)
+         payment_method, payment_status, shipping_method${keyed ? ', idempotency_key' : ''})
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pendiente', $12${keyed ? ', $13' : ''})
        RETURNING id`,
       [
         row.buyerName || null,
@@ -104,22 +145,77 @@ class Order {
         JSON.stringify(row.unitsConfig || []),
         row.paymentMethod,
         row.shippingMethod || null,
+        ...(keyed ? [Order.buildStoredKey(row)] : []),
       ]
     );
     return result.rows[0].id;
   }
 
-  static async setStatus(client, id, status) {
+  /** Valor persistido: `<key>:<huella>:<índice>` (sin huella, `<key>:<índice>`, formato anterior). */
+  static buildStoredKey({ idempotencyKey, requestHash, lineIndex }) {
+    const parts = requestHash ? [idempotencyKey, requestHash, lineIndex] : [idempotencyKey, lineIndex];
+    return parts.join(LINE_SEPARATOR);
+  }
+
+  /**
+   * Serializa las requests concurrentes del mismo (user_id, Idempotency-Key) hasta el
+   * fin de la transacción. Hace falta porque la huella va dentro del valor: dos carritos
+   * distintos con la misma key no chocarían en el índice UNIQUE.
+   */
+  static async lockIdempotencyKey(client, userId, idempotencyKey) {
+    await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [
+      `${userId}${LINE_SEPARATOR}${idempotencyKey}`,
+    ]);
+  }
+
+  /**
+   * Líneas de una reserva previa de (user_id, Idempotency-Key), en el orden del carrito.
+   * `request_hash` es null en filas con el formato anterior (`<key>:<índice>`).
+   * @returns {Promise<object[]>} vacío si la key nunca se usó.
+   */
+  static async findByIdempotencyKey(client, userId, idempotencyKey) {
+    const result = await client.query(
+      `SELECT id, product_name, product_image, quantity, unit_price::float8 AS unit_price,
+              total_price::float8 AS total_price, payment_method, payment_status,
+              NULLIF(CASE WHEN split_part(idempotency_key, '${LINE_SEPARATOR}', 3) = ''
+                          THEN '' ELSE split_part(idempotency_key, '${LINE_SEPARATOR}', 2) END, '') AS request_hash
+         FROM public.ventas
+        WHERE user_id = $1::uuid
+          AND idempotency_key IS NOT NULL
+          AND split_part(idempotency_key, '${LINE_SEPARATOR}', 1) = $2
+        ORDER BY substring(idempotency_key from '[^${LINE_SEPARATOR}]+$')::int`,
+      [String(userId), idempotencyKey]
+    );
+    return result.rows;
+  }
+
+  /** Libera la key de una reserva compensada (MP falló): permite reintentar con la misma. */
+  static async clearIdempotencyKey(client, id) {
+    if (!isUuid(id)) return;
     await client.query(
-      'UPDATE public.ventas SET payment_status = $2 WHERE id::text = $1',
+      'UPDATE public.ventas SET idempotency_key = NULL WHERE id = $1::uuid AND idempotency_key IS NOT NULL',
+      [String(id)]
+    );
+  }
+
+  /** true si el error es el unique_violation del índice de idempotencia (carrera entre dos requests). */
+  static isIdempotencyConflict(error) {
+    return error.code === UNIQUE_VIOLATION && error.constraint === IDEMPOTENCY_INDEX;
+  }
+
+  static async setStatus(client, id, status) {
+    if (!isUuid(id)) return;
+    await client.query(
+      'UPDATE public.ventas SET payment_status = $2 WHERE id = $1::uuid',
       [String(id), status]
     );
   }
 
   /** Registra la respuesta del nudge post-WhatsApp ('origin') de una orden. */
   static async setOrigin(client, id, origin) {
+    if (!isUuid(id)) return;
     await client.query(
-      'UPDATE public.ventas SET origin = $2 WHERE id::text = $1',
+      'UPDATE public.ventas SET origin = $2 WHERE id = $1::uuid',
       [String(id), origin]
     );
   }
@@ -139,8 +235,8 @@ class Order {
     try {
       await client.query('BEGIN');
       const { rows } = await client.query(
-        'SELECT * FROM public.ventas WHERE id::text = ANY($1) FOR UPDATE',
-        [ids.map(String)]
+        'SELECT * FROM public.ventas WHERE id = ANY($1::uuid[]) FOR UPDATE',
+        [uuidsOnly(ids)]
       );
 
       if (Number.isFinite(paidAmount)) {

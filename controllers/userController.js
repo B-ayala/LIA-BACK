@@ -21,6 +21,11 @@ const serverError = (res, action, error) => {
 const SAFE_USER_VALIDATION_ERROR =
   /^Error al (actualizar|eliminar) usuario: (El nombre no puede tener más de 100 caracteres|El rol debe ser "user" o "admin"|El campo purchase_allowed_exclusive debe ser booleano|Debe proporcionar al menos un campo para actualizar \(name, role o purchase_allowed_exclusive\)|Usuario no encontrado|No se le puede quitar el rol admin al usuario principal|No se puede eliminar al usuario principal)$/;
 
+// Largo máximo de un email según RFC 5321.
+const MAX_EMAIL_LENGTH = 254;
+
+const isNonEmptyString = (value) => typeof value === 'string' && value.trim().length > 0;
+
 /**
  * @desc    Login de usuario
  * @route   POST /api/users/login
@@ -31,7 +36,9 @@ exports.loginUser = async (req, res) => {
   try {
     const { email, password } = req.body;
 
-    if (!email || !password) {
+    // typeof: un objeto/array en el body (`{"email": {"a":1}}`) llegaría truthy a
+    // `checkLock`/`keyOf` y reventaría con un 500 en vez de un 400.
+    if (!isNonEmptyString(email) || !isNonEmptyString(password) || email.length > MAX_EMAIL_LENGTH) {
       return res.status(400).json({
         success: false,
         message: 'Email y contraseña son requeridos'

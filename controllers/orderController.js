@@ -6,6 +6,7 @@ const mercadopago = require('../utils/mercadopago');
 const { CORREO_COST } = require('./shippingController');
 const { caches, invalidateProducts } = require('../utils/cache');
 const logger = require('../utils/logger');
+const { orderFingerprint } = require('../utils/orderFingerprint');
 
 // Ventanas de expiración — deben coincidir con las que muestra el frontend
 // (MP_EXPIRY_MS / TRANSFER_EXPIRY_MS en admin/pages/Sales).
@@ -132,6 +133,24 @@ const orderDedupeKey = (prefix, req) => {
   return `${prefix}:${owner}:${crypto.createHash('sha256').update(payload).digest('hex')}`;
 };
 
+/**
+ * Email del comprador: el de la cuenta autenticada, no el del body (un cliente
+ * podría poner el de otra persona y que la orden le aparezca en "Mis compras").
+ * El del body queda solo como respaldo si la cuenta no tiene email.
+ */
+const resolveBuyerEmail = (req) => req.user.email || req.body.buyerEmail;
+
+/**
+ * Dueño de una orden: por `user_id` cuando existe; las filas históricas sin
+ * `user_id` (anteriores a 2026-09-18) se resuelven por email.
+ */
+const isOrderOwner = (order, user) => {
+  if (order.user_id) return String(order.user_id) === String(user.id);
+  return Boolean(
+    user.email && order.buyer_email && user.email.toLowerCase() === order.buyer_email.toLowerCase()
+  );
+};
+
 const getFrontendOrigin = () =>
   (process.env.FRONTEND_URL || 'http://localhost:5173').split(',')[0].trim();
 
@@ -207,6 +226,197 @@ const buildPreferencePayload = ({ buyerName, buyerEmail, items, shippingCost, or
   return preference;
 };
 
+const fail = (status, message, code) => ({ ok: false, status, message, ...(code && { code }) });
+
+// Header opcional de idempotencia del checkout. Sin ':' a propósito: es el
+// separador que usa Order.insertPending para numerar las líneas del carrito.
+const IDEMPOTENCY_KEY_RE = /^[A-Za-z0-9_-]{8,128}$/;
+const INVALID_IDEMPOTENCY_KEY_MESSAGE =
+  'El header Idempotency-Key debe tener entre 8 y 128 caracteres (letras, números, "-" y "_").';
+const ORDER_ALREADY_PROCESSED_MESSAGE =
+  'Esta compra ya fue procesada, cancelada o venció. Iniciá una nueva compra.';
+const IDEMPOTENCY_KEY_REUSED_MESSAGE =
+  'Esta compra no coincide con la que ya se había iniciado con esa misma clave. Volvé al carrito e iniciá una nueva compra.';
+const IDEMPOTENCY_KEY_REUSED_CODE = 'IDEMPOTENCY_KEY_REUSED';
+const reusedKeyFailure = () => fail(422, IDEMPOTENCY_KEY_REUSED_MESSAGE, IDEMPOTENCY_KEY_REUSED_CODE);
+
+/** Cuerpo de error de una reserva fallida; `code` solo viaja cuando existe. */
+const reservationErrorBody = (reservation) => ({
+  success: false,
+  message: reservation.message,
+  ...(reservation.code && { code: reservation.code }),
+});
+
+/**
+ * Lee `Idempotency-Key` (opcional).
+ * @returns {{ok: true, key: string|null} | {ok: false}} `ok:false` si viene con formato inválido.
+ */
+const readIdempotencyKey = (req) => {
+  const raw = req.get('Idempotency-Key');
+  if (raw === undefined) return { ok: true, key: null };
+  return IDEMPOTENCY_KEY_RE.test(raw) ? { ok: true, key: raw } : { ok: false };
+};
+
+const respondInvalidIdempotencyKey = (res) =>
+  res.status(400).json({
+    success: false,
+    code: 'INVALID_IDEMPOTENCY_KEY',
+    message: INVALID_IDEMPOTENCY_KEY_MESSAGE,
+  });
+
+/** Parte del total de las líneas que no es producto: el envío (se cobra en la 1ª línea). */
+const shippingFromRows = (rows) => {
+  const total = rows.reduce((sum, row) => sum + row.total_price, 0);
+  const products = rows.reduce((sum, row) => sum + row.unit_price * row.quantity, 0);
+  return Math.max(0, Math.round((total - products) * 100) / 100);
+};
+
+/**
+ * Reconstruye, sin tocar stock, la respuesta de una reserva previa con la misma
+ * (user_id, Idempotency-Key). Tiene la misma forma que una reserva nueva.
+ * @returns {Promise<object|null>} null si la key nunca se usó.
+ */
+const replayReservation = async (client, { userId, idempotencyKey, paymentMethod, requestHash }) => {
+  const rows = await Order.findByIdempotencyKey(client, userId, idempotencyKey);
+  if (rows.length === 0) return null;
+
+  if (rows[0].payment_method !== paymentMethod) return reusedKeyFailure();
+  // Filas con el formato anterior no guardaron huella: se reenvían sin comparar.
+  if (rows[0].request_hash && rows[0].request_hash !== requestHash) return reusedKeyFailure();
+  // Una preferencia de MP solo tiene sentido sobre órdenes todavía pendientes.
+  if (paymentMethod === 'mp' && rows.some((row) => row.payment_status !== 'pendiente')) {
+    return fail(409, ORDER_ALREADY_PROCESSED_MESSAGE);
+  }
+
+  logger.info('order_reserve_replayed', { userId, paymentMethod, lines: rows.length });
+  return {
+    ok: true,
+    orderIds: rows.map((row) => row.id),
+    pricedItems: rows.map((row) => ({
+      productName: row.product_name,
+      productImage: row.product_image,
+      quantity: row.quantity,
+      unitPrice: row.unit_price,
+    })),
+    shippingCost: shippingFromRows(rows),
+  };
+};
+
+/**
+ * Valida y reserva UNA línea del carrito (producto bloqueado, stock, precio de
+ * la base) e inserta su venta pendiente.
+ * @returns {Promise<{ok: true, orderId: string, priced: object} | {ok: false, status: number, message: string}>}
+ */
+const reserveLine = async (client, params, { item, index, lineSurcharge }) => {
+  const productId = Number.parseInt(item.productId, 10);
+
+  // Sin producto identificable no hay precio que validar contra la base, y
+  // el precio del body no es confiable: se rechaza la compra entera.
+  if (!Number.isInteger(productId)) {
+    return fail(400, `No se pudo identificar el producto "${item.productName}".`);
+  }
+
+  const product = await Order.getProductForUpdate(client, productId);
+  if (product === null || product.stock < item.quantity) {
+    const label = product === null ? item.productName : product.name;
+    return fail(409, `No hay stock suficiente de "${label}".`);
+  }
+
+  // El importe SIEMPRE sale de la base, nunca del body: un cliente que
+  // manipule `unitPrice`/`totalPrice` termina pagando el precio real.
+  const unitPrice = resolveUnitPrice(product);
+  if (!(unitPrice > 0)) {
+    return fail(409, `El producto "${product.name}" no está disponible para la venta.`);
+  }
+
+  // Nombre e imagen también salen de la base: lo persistido y lo que ve el
+  // comprador en Mercado Pago no lo decide el cliente.
+  const priced = {
+    productName: product.name,
+    productImage: product.image_url,
+    quantity: item.quantity,
+    unitPrice,
+  };
+  const { buyerName, buyerEmail, userId, paymentMethod, shippingMethod, idempotencyKey, requestHash } = params;
+  const orderId = await Order.insertPending(client, {
+    ...priced,
+    buyerName,
+    buyerEmail,
+    userId,
+    productId,
+    // El costo de envío se suma a la primera línea (mismo criterio que el frontend)
+    totalPrice: unitPrice * item.quantity + lineSurcharge,
+    unitsConfig: item.unitsConfig,
+    paymentMethod,
+    shippingMethod,
+    idempotencyKey,
+    requestHash,
+    lineIndex: index,
+  });
+  return { ok: true, orderId, priced };
+};
+
+/** Cuerpo transaccional de `reserveOrders` (BEGIN ... COMMIT). El caller maneja errores y release. */
+const runReservation = async (client, params) => {
+  const { items, shippingMethod, shippingCost, idempotencyKey } = params;
+  await client.query('BEGIN');
+  if (idempotencyKey) await Order.lockIdempotencyKey(client, params.userId, idempotencyKey);
+
+  const shipping = resolveShippingCost(shippingMethod, shippingCost);
+  if (!shipping.ok) {
+    await client.query('ROLLBACK');
+    return fail(400, shipping.message);
+  }
+
+  const lockIds = items.map((item) => Number.parseInt(item.productId, 10)).filter(Number.isInteger);
+  await Order.lockProductsInOrder(client, [...new Set(lockIds)].sort((a, b) => a - b));
+
+  // Después de tomar los locks: si otra request con la misma key estaba en vuelo,
+  // ya commiteó y se ve acá, así que el reintento no descuenta stock de nuevo.
+  if (idempotencyKey) {
+    const replay = await replayReservation(client, params);
+    if (replay) {
+      await client.query('ROLLBACK');
+      return replay;
+    }
+  }
+
+  const orderIds = [];
+  // Líneas ya valorizadas por el servidor: son las que se le cobran a MP.
+  const pricedItems = [];
+  for (const [index, item] of items.entries()) {
+    const lineSurcharge = index === 0 ? shipping.cost : 0;
+    const line = await reserveLine(client, params, { item, index, lineSurcharge });
+    if (!line.ok) {
+      await client.query('ROLLBACK');
+      return line;
+    }
+    orderIds.push(line.orderId);
+    pricedItems.push(line.priced);
+  }
+
+  await client.query('COMMIT');
+  invalidateProducts();
+  return { ok: true, orderIds, pricedItems, shippingCost: shipping.cost };
+};
+
+/** Error durante la reserva: rollback y, si fue la carrera de una misma Idempotency-Key, reenvía la ganadora. */
+const handleReservationError = async (client, error, params) => {
+  await client.query('ROLLBACK').catch(() => undefined);
+
+  if (params.idempotencyKey && Order.isIdempotencyConflict(error)) {
+    const replay = await replayReservation(client, params).catch(() => null);
+    if (replay) return replay;
+  }
+
+  logger.error('order_reserve_failed', {
+    paymentMethod: params.paymentMethod,
+    error: error.message,
+    code: error.code,
+  });
+  return fail(500, 'No se pudo registrar la orden. Intentá de nuevo.');
+};
+
 /**
  * Reserva el stock e inserta las ventas pendientes en una única transacción corta.
  *
@@ -217,90 +427,20 @@ const buildPreferencePayload = ({ buyerName, buyerEmail, items, shippingCost, or
  * ya ven el stock que descontó el trigger en este loop, y dos compras
  * simultáneas del último ítem se serializan (una gana, la otra recibe 409).
  *
+ * Con `idempotencyKey`, una reserva previa del mismo usuario y key se devuelve tal
+ * cual (sin descontar stock otra vez); el índice UNIQUE parcial cubre la carrera.
+ *
  * @returns {Promise<{ok: true, orderIds: string[]} | {ok: false, status: number, message: string}>}
  */
-const reserveOrders = async ({ buyerName, buyerEmail, userId, items, shippingMethod, shippingCost, paymentMethod }) => {
+const reserveOrders = async (rawParams) => {
+  const params = rawParams.idempotencyKey
+    ? { ...rawParams, requestHash: orderFingerprint(rawParams) }
+    : rawParams;
   const client = await pool.connect();
   try {
-    await client.query('BEGIN');
-
-    const shipping = resolveShippingCost(shippingMethod, shippingCost);
-    if (!shipping.ok) {
-      await client.query('ROLLBACK');
-      return { ok: false, status: 400, message: shipping.message };
-    }
-    const surcharge = shipping.cost;
-    const orderIds = [];
-    // Líneas ya valorizadas por el servidor: son las que se le cobran a MP.
-    const pricedItems = [];
-
-    for (const [index, item] of items.entries()) {
-      const productId = Number.parseInt(item.productId, 10);
-
-      // Sin producto identificable no hay precio que validar contra la base, y
-      // el precio del body no es confiable: se rechaza la compra entera.
-      if (!Number.isInteger(productId)) {
-        await client.query('ROLLBACK');
-        return {
-          ok: false,
-          status: 400,
-          message: `No se pudo identificar el producto "${item.productName}".`,
-        };
-      }
-
-      const product = await Order.getProductForUpdate(client, productId);
-      if (product === null || product.stock < item.quantity) {
-        await client.query('ROLLBACK');
-        return {
-          ok: false,
-          status: 409,
-          message: `No hay stock suficiente de "${item.productName}".`,
-        };
-      }
-
-      // El importe SIEMPRE sale de la base, nunca del body: un cliente que
-      // manipule `unitPrice`/`totalPrice` termina pagando el precio real.
-      const unitPrice = resolveUnitPrice(product);
-      if (!(unitPrice > 0)) {
-        await client.query('ROLLBACK');
-        return {
-          ok: false,
-          status: 409,
-          message: `El producto "${item.productName}" no está disponible para la venta.`,
-        };
-      }
-
-      const orderId = await Order.insertPending(client, {
-        buyerName,
-        buyerEmail,
-        userId,
-        productId,
-        productName: item.productName,
-        productImage: item.productImage,
-        quantity: item.quantity,
-        unitPrice,
-        // El costo de envío se suma a la primera línea (mismo criterio que el frontend)
-        totalPrice: unitPrice * item.quantity + (index === 0 ? surcharge : 0),
-        unitsConfig: item.unitsConfig,
-        paymentMethod,
-        shippingMethod,
-      });
-      orderIds.push(orderId);
-      pricedItems.push({
-        productName: item.productName,
-        productImage: item.productImage,
-        quantity: item.quantity,
-        unitPrice,
-      });
-    }
-
-    await client.query('COMMIT');
-    invalidateProducts();
-    return { ok: true, orderIds, pricedItems, shippingCost: surcharge };
+    return await runReservation(client, params);
   } catch (error) {
-    await client.query('ROLLBACK').catch(() => undefined);
-    console.error(`Error al reservar órdenes (${paymentMethod}):`, error.message);
-    return { ok: false, status: 500, message: 'No se pudo registrar la orden. Intentá de nuevo.' };
+    return await handleReservationError(client, error, params);
   } finally {
     client.release();
   }
@@ -313,7 +453,7 @@ const reserveOrders = async ({ buyerName, buyerEmail, userId, items, shippingMet
  * antes —nada persistido— sin haber tenido que mantener la transacción abierta
  * durante la llamada externa.
  */
-const releaseOrders = async (orderIds) => {
+const releaseOrders = async (orderIds, { releaseIdempotencyKey = false } = {}) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -322,6 +462,9 @@ const releaseOrders = async (orderIds) => {
       if (!order || order.payment_status !== 'pendiente') continue;
       await Order.setStatus(client, order.id, 'cancelado');
       await Order.restoreStock(client, order.product_id, order.quantity);
+      // La reserva se deshizo por una falla nuestra/de MP: el cliente debe poder
+      // reintentar con la misma Idempotency-Key en vez de recibir "ya procesada".
+      if (releaseIdempotencyKey) await Order.clearIdempotencyKey(client, order.id);
     }
     await client.query('COMMIT');
     invalidateProducts();
@@ -329,10 +472,27 @@ const releaseOrders = async (orderIds) => {
     await client.query('ROLLBACK').catch(() => undefined);
     // No se propaga: el sweep de órdenes vencidas (cada 60 s) es la red de
     // seguridad si esta compensación falla.
-    console.error('Error al liberar reservas de órdenes:', error.message);
+    logger.error('orders_release_failed', { error: error.message });
   } finally {
     client.release();
   }
+};
+
+/** Mercado Pago no devolvió preferencia: se deshace la reserva y se responde 502. */
+const compensateFailedPreference = async (orderIds, error, idempotencyKey) => {
+  if (error.code === 'MP_TIMEOUT') {
+    logger.warn('mp_create_preference_timeout', { orderIds });
+  } else {
+    logger.error('mp_create_preference_failed', { error: error.message, orderIds });
+  }
+  await releaseOrders(orderIds, { releaseIdempotencyKey: Boolean(idempotencyKey) });
+  return {
+    status: 502,
+    body: {
+      success: false,
+      message: 'No se pudo conectar con Mercado Pago. Intentá de nuevo o elegí transferencia.',
+    },
+  };
 };
 
 /**
@@ -343,14 +503,16 @@ const releaseOrders = async (orderIds) => {
  * durante todo el round trip externo (cientos de ms) y con 20 conexiones
  * bastarían 20 compras simultáneas para frenar toda la API.
  */
-const buildMpCheckout = async (req) => {
-  const { buyerName, buyerEmail, items, shippingMethod, shippingCost } = req.body;
+const buildMpCheckout = async (req, idempotencyKey) => {
+  const { buyerName, items, shippingMethod, shippingCost } = req.body;
+  const buyerEmail = resolveBuyerEmail(req);
 
   const reservation = await reserveOrders({
-    buyerName, buyerEmail, userId: req.user.id, items, shippingMethod, shippingCost, paymentMethod: 'mp',
+    buyerName, buyerEmail, userId: req.user.id, items, shippingMethod, shippingCost,
+    paymentMethod: 'mp', idempotencyKey,
   });
   if (!reservation.ok) {
-    return { status: reservation.status, body: { success: false, message: reservation.message } };
+    return { status: reservation.status, body: reservationErrorBody(reservation) };
   }
 
   try {
@@ -379,19 +541,7 @@ const buildMpCheckout = async (req) => {
       },
     };
   } catch (error) {
-    if (error.code === 'MP_TIMEOUT') {
-      logger.warn('mp_create_preference_timeout', { orderIds: reservation.orderIds });
-    } else {
-      console.error('Error en createMpPreference:', error.message);
-    }
-    await releaseOrders(reservation.orderIds);
-    return {
-      status: 502,
-      body: {
-        success: false,
-        message: 'No se pudo conectar con Mercado Pago. Intentá de nuevo o elegí transferencia.',
-      },
-    };
+    return compensateFailedPreference(reservation.orderIds, error, idempotencyKey);
   }
 };
 
@@ -407,6 +557,9 @@ const createMpPreference = async (req, res) => {
     return res.status(400).json({ success: false, message: validationError });
   }
 
+  const idempotency = readIdempotencyKey(req);
+  if (!idempotency.ok) return respondInvalidIdempotencyKey(res);
+
   if (await blockIfPurchaseNotAllowed(req, res)) return;
 
   if (!mercadopago.isConfigured()) {
@@ -415,7 +568,10 @@ const createMpPreference = async (req, res) => {
 
   // Doble click / reintento con la primera request todavía en vuelo: se comparte
   // la misma ejecución en vez de crear dos juegos de ventas y descontar dos veces.
-  const { status, body } = await caches.orders.single(orderDedupeKey('mp', req), () => buildMpCheckout(req));
+  const { status, body } = await caches.orders.single(
+    orderDedupeKey('mp', req),
+    () => buildMpCheckout(req, idempotency.key)
+  );
   return res.status(status).json(body);
 };
 
@@ -432,16 +588,26 @@ const createTransferOrder = async (req, res) => {
     return res.status(400).json({ success: false, message: validationError });
   }
 
+  const idempotency = readIdempotencyKey(req);
+  if (!idempotency.ok) return respondInvalidIdempotencyKey(res);
+
   if (await blockIfPurchaseNotAllowed(req, res)) return;
 
   const reservation = await caches.orders.single(orderDedupeKey('transfer', req), () =>
     reserveOrders({
-      buyerName, buyerEmail, userId: req.user.id, items, shippingMethod, shippingCost, paymentMethod: 'transfer',
+      buyerName,
+      buyerEmail: resolveBuyerEmail(req),
+      userId: req.user.id,
+      items,
+      shippingMethod,
+      shippingCost,
+      paymentMethod: 'transfer',
+      idempotencyKey: idempotency.key,
     })
   );
 
   if (!reservation.ok) {
-    return res.status(reservation.status).json({ success: false, message: reservation.message });
+    return res.status(reservation.status).json(reservationErrorBody(reservation));
   }
   return res.status(201).json({ success: true, order_ids: reservation.orderIds.map(String) });
 };
@@ -472,7 +638,9 @@ const getUserOrders = async (req, res) => {
     const limit = boundedInt(req.query.limit, DEFAULT_ORDER_PAGE_SIZE, 1, MAX_ORDER_PAGE_SIZE);
     const offset = boundedInt(req.query.offset, 0, 0, Number.MAX_SAFE_INTEGER);
 
-    const { rows, total } = await Order.findPaidByEmail(email, limit, offset);
+    // El propio comprador también ve lo ligado a su user_id (aunque haya cambiado de email);
+    // un admin consulta estrictamente por el email pedido.
+    const { rows, total } = await Order.findPaidByEmail(email, limit, offset, isOwner ? req.user.id : null);
     return res.status(200).json({
       success: true,
       orders: rows,
@@ -508,7 +676,7 @@ const confirmMpPayment = async (req, res) => {
       return res.status(409).json({ success: false, message: 'El pago no está aprobado' });
     }
 
-    const ids = String(payment.external_reference).split(',').map((s) => s.trim()).filter(Boolean);
+    const ids = parseExternalReference(payment.external_reference);
     const updated = ids.length > 0
       ? await Order.markPaidByIds(ids, Number(payment.transaction_amount), PAYMENT_AMOUNT_TOLERANCE)
       : 0;
@@ -543,6 +711,54 @@ const confirmMpPayment = async (req, res) => {
   }
 };
 
+/** `external_reference` de MP ("id1,id2,...") → ids de órdenes. */
+const parseExternalReference = (reference) =>
+  String(reference).split(',').map((s) => s.trim()).filter(Boolean);
+
+/** Marca pagadas las órdenes de un pago aprobado; ignora pagos que no corresponde acreditar. */
+const settleApprovedPayment = async (payment, paymentId) => {
+  if (!payment || payment.status !== 'approved' || !payment.external_reference) return;
+
+  const ids = parseExternalReference(payment.external_reference);
+  if (ids.length === 0) return;
+
+  const updated = await Order.markPaidByIds(ids, Number(payment.transaction_amount), PAYMENT_AMOUNT_TOLERANCE);
+  if (updated === -1) {
+    logger.warn('mp_webhook_amount_mismatch', {
+      paymentId: String(paymentId),
+      paidAmount: Number(payment.transaction_amount),
+      orderIds: ids,
+    });
+    return;
+  }
+  // Sin filas actualizadas el stock no cambió: no hay catálogo cacheado que invalidar.
+  if (updated > 0) invalidateProducts();
+};
+
+/**
+ * Firma HMAC de MP. Con `MP_WEBHOOK_SECRET` definida es obligatoria: firma ausente
+ * o inválida corta con 401 (no se consulta ni se toca nada). Sin secreto se sigue
+ * adelante —el pago se revalida igual contra la API de MP— pero se deja el aviso.
+ * @returns {boolean} true si la request fue rechazada (ya se respondió).
+ */
+const rejectIfSignatureInvalid = (req, res, paymentId) => {
+  const signatureValid = mercadopago.verifyWebhookSignature({
+    signatureHeader: req.headers['x-signature'],
+    requestId: req.headers['x-request-id'],
+    dataId: paymentId,
+  });
+
+  if (signatureValid === null) {
+    logger.warn('mp_webhook_unsigned', { paymentId: paymentId ? String(paymentId) : null });
+    return false;
+  }
+  if (signatureValid) return false;
+
+  logger.warn('mp_webhook_invalid_signature', { paymentId: paymentId ? String(paymentId) : null });
+  res.status(401).json({ success: false });
+  return true;
+};
+
 /**
  * @desc    Webhook de Mercado Pago (server a server). Marca pagadas las órdenes aprobadas.
  * @route   POST /api/orders/mp-webhook
@@ -553,47 +769,21 @@ const mpWebhook = async (req, res) => {
     const paymentId =
       req.query['data.id'] || (req.body && req.body.data && req.body.data.id) || req.query.id;
 
+    // La firma se exige antes de decidir si la notificación nos interesa: así un
+    // request sin firma válida no obtiene ni un 200 de cortesía cuando hay secreto.
+    if (rejectIfSignatureInvalid(req, res, paymentId)) return;
+
     if (topic !== 'payment' || !paymentId || !mercadopago.isConfigured()) {
       return res.status(200).json({ success: true });
     }
 
-    // Firma HMAC de MP. `null` = no hay MP_WEBHOOK_SECRET configurado: se sigue
-    // adelante porque el pago se revalida igual contra la API de MP más abajo.
-    const signatureValid = mercadopago.verifyWebhookSignature({
-      signatureHeader: req.headers['x-signature'],
-      requestId: req.headers['x-request-id'],
-      dataId: paymentId,
-    });
-    if (signatureValid === false) {
-      logger.warn('mp_webhook_invalid_signature', { paymentId: String(paymentId) });
-      return res.status(401).json({ success: false });
-    }
-
-    const payment = await mercadopago.getPayment(paymentId);
-    if (payment && payment.status === 'approved' && payment.external_reference) {
-      const ids = String(payment.external_reference).split(',').map((s) => s.trim()).filter(Boolean);
-      if (ids.length > 0) {
-        const updated = await Order.markPaidByIds(
-          ids, Number(payment.transaction_amount), PAYMENT_AMOUNT_TOLERANCE
-        );
-        if (updated === -1) {
-          logger.warn('mp_webhook_amount_mismatch', {
-            paymentId: String(paymentId),
-            paidAmount: Number(payment.transaction_amount),
-            orderIds: ids,
-          });
-        } else {
-          invalidateProducts();
-        }
-      }
-    }
-
+    await settleApprovedPayment(await mercadopago.getPayment(paymentId), paymentId);
     return res.status(200).json({ success: true });
   } catch (error) {
     if (error.code === 'MP_TIMEOUT') {
       logger.warn('mp_webhook_timeout', { paymentId: req.query && (req.query['data.id'] || req.query.id) });
     } else {
-      console.error('Error en mpWebhook:', error.message);
+      logger.error('mp_webhook_failed', { error: error.message });
     }
     // 500 hace que MP reintente la notificación más tarde
     return res.status(500).json({ success: false });
@@ -615,10 +805,7 @@ const cancelOrder = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Orden no encontrada' });
     }
 
-    const isOwner =
-      req.user.email && order.buyer_email &&
-      req.user.email.toLowerCase() === order.buyer_email.toLowerCase();
-    if (!isOwner && req.user.role !== 'admin') {
+    if (!isOrderOwner(order, req.user) && req.user.role !== 'admin') {
       await client.query('ROLLBACK');
       return res.status(403).json({ success: false, message: 'No podés cancelar esta orden' });
     }
@@ -720,10 +907,7 @@ const canActOnNudgeOrder = (order, user) => {
   if (!order || order.payment_method !== 'transfer' || order.payment_status !== 'pendiente') {
     return false;
   }
-  const isOwner =
-    user.email && order.buyer_email &&
-    user.email.toLowerCase() === order.buyer_email.toLowerCase();
-  return isOwner || user.role === 'admin';
+  return isOrderOwner(order, user) || user.role === 'admin';
 };
 
 /** Aplica la respuesta del nudge: 'wa_abandonado' cancela + devuelve stock; el resto solo marca origin. */

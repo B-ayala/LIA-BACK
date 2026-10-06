@@ -13,6 +13,8 @@ const { pool } = require('../config/database');
  * `AT TIME ZONE` da el instante local correcto.
  */
 const APP_TIMEZONE = 'America/Argentina/Buenos_Aires';
+// Rango sargable sobre created_at (permite usar idx_ventas_paid_created); constante interna, sin input de usuario.
+const TODAY_START_SQL = "(date_trunc('day', now() AT TIME ZONE $1) AT TIME ZONE $1)";
 
 // Canal de origen del pedido. Hoy "transferencia" implica que el cliente pasó por
 // WhatsApp (el checkout abre wa.me con el pedido), así que es nuestro proxy de canal.
@@ -56,7 +58,8 @@ class Insights {
             to_char(date_trunc('minute', created_at), 'YYYYMMDDHH24MI'))::int AS orders
          FROM public.ventas
         WHERE payment_status = 'pagado'
-          AND (created_at AT TIME ZONE $1)::date = (now() AT TIME ZONE $1)::date`,
+          AND created_at >= ${TODAY_START_SQL}
+          AND created_at <  ${TODAY_START_SQL} + interval '1 day'`,
       [APP_TIMEZONE]
     );
 
@@ -65,7 +68,8 @@ class Insights {
               total_price::float8 AS total_price, payment_method, created_at
          FROM public.ventas
         WHERE payment_status = 'pagado'
-          AND (created_at AT TIME ZONE $1)::date = (now() AT TIME ZONE $1)::date
+          AND created_at >= ${TODAY_START_SQL}
+          AND created_at <  ${TODAY_START_SQL} + interval '1 day'
         ORDER BY created_at DESC
         LIMIT $2`,
       [APP_TIMEZONE, limit]

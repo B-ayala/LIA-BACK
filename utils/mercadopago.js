@@ -20,6 +20,11 @@ const getAccessToken = () =>
 
 const isConfigured = () => Boolean(getAccessToken());
 
+const getWebhookSecret = () =>
+  (process.env.MP_WEBHOOK_SECRET || '').trim().replace(/^['"]|['"]$/g, '');
+
+const isWebhookSecretConfigured = () => Boolean(getWebhookSecret());
+
 const mpRequest = async (path, options = {}) => {
   let response;
   try {
@@ -76,13 +81,14 @@ const getPayment = (paymentId) =>
  * usando la clave secreta del webhook (panel de MP → Webhooks).
  *
  * Si `MP_WEBHOOK_SECRET` no está configurada devuelve `null` ("no verificable"),
- * y el caller decide: hoy el webhook igual revalida el pago contra la API de MP,
- * así que sin secreto sigue siendo seguro, solo menos estricto.
+ * y el caller decide: el webhook igual revalida el pago contra la API de MP,
+ * así que sin secreto sigue siendo seguro, solo menos estricto. Con secreto,
+ * una firma ausente o inválida devuelve `false` y el caller debe rechazar.
  *
  * @returns {boolean|null} true/false si se pudo verificar, null si no hay secreto.
  */
 const verifyWebhookSignature = ({ signatureHeader, requestId, dataId }) => {
-  const secret = (process.env.MP_WEBHOOK_SECRET || '').trim().replace(/^['"]|['"]$/g, '');
+  const secret = getWebhookSecret();
   if (!secret) return null;
   if (!signatureHeader || !dataId) return false;
 
@@ -107,4 +113,10 @@ const verifyWebhookSignature = ({ signatureHeader, requestId, dataId }) => {
   return crypto.timingSafeEqual(expectedBuffer, receivedBuffer);
 };
 
-module.exports = { isConfigured, createPreference, getPayment, verifyWebhookSignature };
+module.exports = {
+  isConfigured,
+  isWebhookSecretConfigured,
+  createPreference,
+  getPayment,
+  verifyWebhookSignature,
+};

@@ -9,6 +9,7 @@ const https = require('https');
 const crypto = require('crypto');
 const { pool } = require('../config/database');
 const { caches, TTL } = require('../utils/cache');
+const logger = require('../utils/logger');
 
 const SUPABASE_URL = (process.env.SUPABASE_URL || '').replace(/\/+$/, '');
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || '';
@@ -25,6 +26,8 @@ const tokenCacheKey = (token) => `token:${crypto.createHash('sha256').update(tok
  * Supabase valida firma, expiración y revocación, y devuelve el usuario.
  * @returns {Promise<{id: string}|null>} usuario verificado, o null si el token no es válido.
  */
+const SUPABASE_VERIFY_TIMEOUT_MS = 3000;
+
 const verifySupabaseToken = (token) =>
   new Promise((resolve, reject) => {
     const { hostname, pathname } = new URL(`${SUPABASE_URL}/auth/v1/user`);
@@ -49,6 +52,8 @@ const verifySupabaseToken = (token) =>
         });
       }
     );
+    // Sin timeout, un Supabase Auth lento deja colgada cada request autenticada ocupando un slot del bulkhead.
+    request.setTimeout(SUPABASE_VERIFY_TIMEOUT_MS, () => request.destroy(new Error('supabase auth timeout')));
     request.on('error', reject);
     request.end();
   });
@@ -103,45 +108,89 @@ const resolveRequestUserCached = async (token) => {
   return user;
 };
 
+const AUTH_RETRY_AFTER_SECONDS = 2;
+
+const authConfigured = () => Boolean(SUPABASE_URL && SUPABASE_ANON_KEY);
+
+/** Token Bearer del header Authorization, o null si no viene. */
+const extractBearerToken = (req) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) return null;
+  return authHeader.substring(7);
+};
+
+/**
+ * Falla de infraestructura (timeout de Supabase Auth, red, pool de la BD):
+ * NO significa que el token sea inválido, así que no se responde 401 (el front
+ * cerraría la sesión de un usuario legítimo). Se responde 503 reintentable.
+ */
+const respondAuthUnavailable = (res, error) => {
+  logger.error('auth_unavailable', { error: error.message, code: error.code });
+  res.setHeader('Retry-After', String(AUTH_RETRY_AFTER_SECONDS));
+  return res.status(503).json({
+    success: false,
+    code: 'AUTH_UNAVAILABLE',
+    message: 'No pudimos validar tu sesión en este momento. Reintentá en unos segundos.',
+  });
+};
+
 const authMiddleware = async (req, res, next) => {
-  try {
-    if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
-      console.error('authMiddleware: faltan SUPABASE_URL / SUPABASE_ANON_KEY en el entorno');
-      return res.status(503).json({
-        success: false,
-        message: 'Servicio de autenticación no disponible',
-      });
-    }
-
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({
-        success: false,
-        message: 'Token de autenticación requerido',
-      });
-    }
-
-    const token = authHeader.substring(7);
-
-    const user = await resolveRequestUserCached(token);
-    if (!user) {
-      return res.status(401).json({
-        success: false,
-        message: 'Token inválido o expirado',
-      });
-    }
-
-    req.user = user;
-    req.token = token;
-
-    next();
-  } catch (error) {
-    console.error('authMiddleware: error al validar autenticación:', error.message);
-    return res.status(401).json({
+  if (!authConfigured()) {
+    logger.error('auth_not_configured', { missing: 'SUPABASE_URL / SUPABASE_ANON_KEY' });
+    return res.status(503).json({
       success: false,
-      message: 'No se pudo validar la autenticación',
+      message: 'Servicio de autenticación no disponible',
     });
   }
+
+  const token = extractBearerToken(req);
+  if (!token) {
+    return res.status(401).json({
+      success: false,
+      message: 'Token de autenticación requerido',
+    });
+  }
+
+  let user;
+  try {
+    user = await resolveRequestUserCached(token);
+  } catch (error) {
+    // `resolveRequestUser` devuelve null ante un token inválido; si lanza, es infraestructura.
+    return respondAuthUnavailable(res, error);
+  }
+
+  if (!user) {
+    return res.status(401).json({
+      success: false,
+      message: 'Token inválido o expirado',
+    });
+  }
+
+  req.user = user;
+  req.token = token;
+  return next();
+};
+
+/**
+ * Autenticación opcional para endpoints públicos que muestran más a un admin.
+ * Sin token, con token inválido o ante una falla de infraestructura la request
+ * sigue como anónima (el público siempre ve menos, nunca más). Si el token es
+ * válido, deja `req.user` igual que `authMiddleware`.
+ */
+const optionalAuth = async (req, _res, next) => {
+  const token = extractBearerToken(req);
+  if (!token || !authConfigured()) return next();
+
+  try {
+    const user = await resolveRequestUserCached(token);
+    if (user) {
+      req.user = user;
+      req.token = token;
+    }
+  } catch (error) {
+    logger.warn('optional_auth_degraded', { error: error.message });
+  }
+  return next();
 };
 
 /**
@@ -176,5 +225,6 @@ const adminMiddleware = (req, res, next) => {
 
 module.exports = {
   authMiddleware,
+  optionalAuth,
   adminMiddleware
 };
