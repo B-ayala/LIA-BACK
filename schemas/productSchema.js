@@ -24,6 +24,8 @@ const productBaseSchema = z.object({
   images: z.array(z.string().trim().max(2000)).max(MAX_ARRAY_ITEMS).optional(),
   description: z.string().trim().max(MAX_LONG_TEXT).nullable().optional(),
   discount: z.coerce.number().min(0).max(100).nullable().optional(),
+  // Precio de lista tachado; el controller lo descarta si no es mayor a `price`.
+  originalPrice: z.coerce.number().positive().nullable().optional(),
   condition: z.enum(['new', 'used']).optional(),
   freeShipping: z.boolean().optional(),
   hoverImageEnabled: z.boolean().optional(),

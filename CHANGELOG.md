@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Changed
+- Productos: `POST`/`PUT /api/products` aceptan y persisten `originalPrice` (columna `original_price`); `price` sigue siendo el precio final cobrado y un original que no supere al precio se descarta. `PUT` con `originalPrice: null` lo borra. Script SQL `2026-10-07_add_original_price_to_productos.sql` (idempotente); `init-db` también crea la columna.
 - Productos: `GET /api/products` y `/:id` solo devuelven productos activos al público; un admin con token válido ve también los inactivos (caché separada por audiencia, `Vary: Authorization`).
 - Productos: un `:id` que no sea numérico (1 a 15 dígitos) responde 404 en detalle, edición y baja.
 - Auth: una falla de infraestructura al validar el token (timeout de Supabase Auth, BD) responde 503 `AUTH_UNAVAILABLE` con `Retry-After: 2` en vez de 401; un token inválido sigue siendo 401.

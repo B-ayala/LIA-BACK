@@ -56,12 +56,23 @@ const boundedInt = (raw, fallback, min, max) => {
   return Math.min(Math.max(value, min), max);
 };
 
+// `price` es siempre el precio FINAL (lo que se cobra: ver resolveUnitPrice en
+// orderController); `original_price` es solo el precio de lista tachado. Un
+// tachado que no supere al final no es una promo válida, así que se descarta.
+const resolveOriginalPrice = (originalPrice, price) => {
+  const original = parseFloat(originalPrice);
+  if (!Number.isFinite(original) || original <= 0) return null;
+  const finalPrice = parseFloat(price);
+  if (Number.isFinite(finalPrice) && original <= finalPrice) return null;
+  return original;
+};
+
 // Create product
 const createProduct = async (req, res) => {
   try {
     const {
       name, price, stock, category, imageUrl, publicId,
-      description, discount, condition, freeShipping, hoverImageEnabled,
+      description, discount, originalPrice, condition, freeShipping, hoverImageEnabled,
       variants, specifications, features, faqs, warranty, returnPolicy,
       sizeGuide, status, images,
     } = req.body;
@@ -81,8 +92,8 @@ const createProduct = async (req, res) => {
       `INSERT INTO public.productos
        (name, price, stock, category, image_url, public_id, description,
         discount, condition, free_shipping, hover_image_enabled, variants, specifications, features, faqs,
-        warranty, return_policy, size_guide, status, images)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+        warranty, return_policy, size_guide, status, images, original_price)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
        RETURNING *`,
       [
         name,
@@ -105,6 +116,7 @@ const createProduct = async (req, res) => {
         sizeGuide ? JSON.stringify(sizeGuide) : null,
         status || 'active',
         images ? JSON.stringify(images) : null,
+        resolveOriginalPrice(originalPrice, price),
       ]
     );
 
@@ -221,7 +233,7 @@ const updateProduct = async (req, res) => {
 
     const {
       name, price, stock, category, imageUrl, publicId,
-      description, discount, condition, freeShipping, hoverImageEnabled,
+      description, discount, originalPrice, condition, freeShipping, hoverImageEnabled,
       variants, specifications, features, faqs, warranty, returnPolicy,
       sizeGuide, status, images,
     } = req.body;
@@ -273,6 +285,10 @@ const updateProduct = async (req, res) => {
     if (discount !== undefined) {
       updates.push(`discount = $${paramCount++}`);
       values.push(discount ? parseFloat(discount) : null);
+    }
+    if (originalPrice !== undefined) {
+      updates.push(`original_price = $${paramCount++}`);
+      values.push(resolveOriginalPrice(originalPrice, price));
     }
     if (condition !== undefined) {
       updates.push(`condition = $${paramCount++}`);

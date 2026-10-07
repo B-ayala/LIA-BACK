@@ -135,6 +135,7 @@ const initDatabase = async () => {
       const alteraciones = [
         `ALTER TABLE public.productos ADD COLUMN IF NOT EXISTS description TEXT`,
         `ALTER TABLE public.productos ADD COLUMN IF NOT EXISTS discount NUMERIC(5,2)`,
+        `ALTER TABLE public.productos ADD COLUMN IF NOT EXISTS original_price NUMERIC(10,2)`,
         `ALTER TABLE public.productos ADD COLUMN IF NOT EXISTS condition VARCHAR(10) DEFAULT 'new'`,
         `ALTER TABLE public.productos ADD COLUMN IF NOT EXISTS free_shipping BOOLEAN DEFAULT false`,
         `ALTER TABLE public.productos ADD COLUMN IF NOT EXISTS variants JSONB`,
