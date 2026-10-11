@@ -3,6 +3,19 @@
 ## [Unreleased]
 
 ### Added
+- **Idempotencia real en `POST /api/orders/mp-preference` y `/transfer`** (header
+  `Idempotency-Key`, nuevo `utils/idempotency.js`): reintentar con la misma key y el mismo
+  carrito devuelve la respuesta original en vez de crear otro juego de ventas (y descontar
+  stock dos veces); la misma key con otro carrito responde `422 IDEMPOTENCY_KEY_REUSED`; una
+  key con formato inválido, `400 IDEMPOTENCY_KEY_INVALID`. Solo se recuerdan respuestas `201`
+  (10 min, por usuario y tipo de pago): un 409 o 502 se puede reintentar con la misma key.
+  Sin header, el comportamiento es el de antes (single-flight por carrito).
+- **Persistencia de la idempotencia** (script SQL `db/migrations/2026-10-08_add_idempotency_keys.sql`,
+  `models/IdempotencyKey.js`): la respuesta exitosa se guarda en `public.idempotency_keys`
+  (RLS sin policies) además de en memoria, así el replay sobrevive a reinicios/sleep de Render.
+  Si la tabla no existe todavía, el checkout sigue andando con idempotencia en memoria y se
+  loguea `idempotency_read_failed` / `idempotency_write_failed`. El sweep de órdenes borra las
+  claves de más de 24 h.
 - **`ventas.user_id`** (script SQL `db/migrations/2026-09-18_add_user_id_to_ventas.sql`):
   FK real a `auth.users` para identificar al comprador de cada venta, además del
   `buyer_email`/`buyer_name` en texto que ya existía (se conservan como snapshot
@@ -58,6 +71,9 @@
   `retryAfterSeconds`.
 
 ### Fixed
+- **CORS bloqueaba el checkout (`Failed to fetch` al pagar con Mercado Pago)**: el front envía
+  el header `Idempotency-Key` y `config/cors.js` no lo incluía en `allowedHeaders`, así que el
+  preflight de `POST /api/orders/mp-preference` (y de transferencia) fallaba en el navegador.
 - **`Order.insertPending` guardaba `payment_method`/`payment_status` invertidos**:
   desde el commit que agregó `user_id` (2026-09-18) la lista de columnas del
   `INSERT` quedó desalineada con la lista de `VALUES` — cada orden nueva
@@ -83,6 +99,9 @@
   Usuarios (`admin/pages/Users`) deshabilita esos botones para el owner.
 
 ### Changed
+- **La huella de idempotencia del backend ahora incluye nombre y email del comprador** (antes
+  solo items, envío, costo y total), alineada con la del frontend: un cambio de datos del
+  comprador es otra compra con otra key, y reusar una key con otro comprador da `422`.
 - **`GET /api/orders/user` deja de hacer `SELECT *`**: `Order.findPaidByEmail`
   ahora lista columnas explícitas. Sin cambio de comportamiento visible; evita
   que una columna interna nueva se exponga a "Mis compras" sin decisión

@@ -1,11 +1,13 @@
 const crypto = require('crypto');
 const { pool } = require('../config/database');
 const Order = require('../models/Order');
+const IdempotencyKey = require('../models/IdempotencyKey');
 const User = require('../models/User');
 const mercadopago = require('../utils/mercadopago');
 const { CORREO_COST } = require('./shippingController');
 const { caches, invalidateProducts } = require('../utils/cache');
 const logger = require('../utils/logger');
+const { readIdempotencyKey, withIdempotency } = require('../utils/idempotency');
 
 // Ventanas de expiración — deben coincidir con las que muestra el frontend
 // (MP_EXPIRY_MS / TRANSFER_EXPIRY_MS en admin/pages/Sales).
@@ -121,15 +123,43 @@ const boundedInt = (raw, fallback, min, max) => {
  * mientras la primera request sigue en vuelo), que hoy generaría DOS juegos de
  * ventas pendientes y descontaría el stock dos veces vía trigger.
  */
-const orderDedupeKey = (prefix, req) => {
+const cartFingerprint = (req) => {
+  // Incluye al comprador (igual que la huella del frontend): si cambia el nombre o
+  // el email, el front genera otra key y es otra compra, no un reintento.
   const payload = JSON.stringify({
+    buyerName: String(req.body.buyerName).trim(),
+    buyerEmail: String(req.body.buyerEmail).trim(),
     items: req.body.items,
     shippingMethod: req.body.shippingMethod,
     shippingCost: req.body.shippingCost,
     totalPrice: req.body.totalPrice,
   });
+  return crypto.createHash('sha256').update(payload).digest('hex');
+};
+
+const orderDedupeKey = (prefix, req) => {
   const owner = (req.user && req.user.id) || req.body.buyerEmail || 'anon';
-  return `${prefix}:${owner}:${crypto.createHash('sha256').update(payload).digest('hex')}`;
+  return `${prefix}:${owner}:${cartFingerprint(req)}`;
+};
+
+/**
+ * Ejecuta la creación de una compra respetando `Idempotency-Key` (replay del
+ * resultado exitoso) y, debajo, el single-flight por carrito para el doble submit
+ * sin header. `execute` devuelve `{ status, body }`.
+ */
+const runCheckout = async (prefix, req, res, execute) => {
+  const idempotency = readIdempotencyKey(req);
+  if (idempotency.error) {
+    return res.status(idempotency.error.status).json(idempotency.error.body);
+  }
+
+  const { status, body } = await withIdempotency({
+    scope: `${prefix}:${req.user.id}`,
+    key: idempotency.key,
+    fingerprint: cartFingerprint(req),
+    execute: () => caches.orders.single(orderDedupeKey(prefix, req), execute),
+  });
+  return res.status(status).json(body);
 };
 
 const getFrontendOrigin = () =>
@@ -413,10 +443,20 @@ const createMpPreference = async (req, res) => {
     return res.status(503).json({ success: false, message: MP_NOT_CONFIGURED_MESSAGE });
   }
 
-  // Doble click / reintento con la primera request todavía en vuelo: se comparte
-  // la misma ejecución en vez de crear dos juegos de ventas y descontar dos veces.
-  const { status, body } = await caches.orders.single(orderDedupeKey('mp', req), () => buildMpCheckout(req));
-  return res.status(status).json(body);
+  return runCheckout('mp', req, res, () => buildMpCheckout(req));
+};
+
+/** Reserva las órdenes de transferencia y arma la respuesta `{ status, body }`. */
+const buildTransferCheckout = async (req) => {
+  const { buyerName, buyerEmail, items, shippingMethod, shippingCost } = req.body;
+
+  const reservation = await reserveOrders({
+    buyerName, buyerEmail, userId: req.user.id, items, shippingMethod, shippingCost, paymentMethod: 'transfer',
+  });
+  if (!reservation.ok) {
+    return { status: reservation.status, body: { success: false, message: reservation.message } };
+  }
+  return { status: 201, body: { success: true, order_ids: reservation.orderIds.map(String) } };
 };
 
 /**
@@ -425,7 +465,7 @@ const createMpPreference = async (req, res) => {
  * @route   POST /api/orders/transfer
  */
 const createTransferOrder = async (req, res) => {
-  const { buyerName, buyerEmail, items, shippingMethod, shippingCost, totalPrice } = req.body;
+  const { buyerName, buyerEmail, items, totalPrice } = req.body;
 
   const validationError = validateOrderPayload({ buyerName, buyerEmail, items, totalPrice });
   if (validationError) {
@@ -434,16 +474,7 @@ const createTransferOrder = async (req, res) => {
 
   if (await blockIfPurchaseNotAllowed(req, res)) return;
 
-  const reservation = await caches.orders.single(orderDedupeKey('transfer', req), () =>
-    reserveOrders({
-      buyerName, buyerEmail, userId: req.user.id, items, shippingMethod, shippingCost, paymentMethod: 'transfer',
-    })
-  );
-
-  if (!reservation.ok) {
-    return res.status(reservation.status).json({ success: false, message: reservation.message });
-  }
-  return res.status(201).json({ success: true, order_ids: reservation.orderIds.map(String) });
+  return runCheckout('transfer', req, res, () => buildTransferCheckout(req));
 };
 
 /**
@@ -773,12 +804,25 @@ const recordNudge = async (req, res) => {
   }
 };
 
+// Las respuestas idempotentes solo se reutilizan 10 min: un día de retención sobra.
+const IDEMPOTENCY_RETENTION_HOURS = 24;
+
+/** Limpieza de claves vencidas. Aislada: si la tabla no existe no frena el sweep de órdenes. */
+const purgeIdempotencyKeys = async () => {
+  try {
+    await IdempotencyKey.purgeOlderThan(IDEMPOTENCY_RETENTION_HOURS);
+  } catch (error) {
+    logger.warn('idempotency_purge_failed', { code: error.code, message: error.message });
+  }
+};
+
 /** Sweep periódico: expira órdenes pendientes vencidas (lo programa server.js). */
 let sweepRunning = false;
 const expireStaleOrders = async () => {
   if (sweepRunning) return;
   sweepRunning = true;
   try {
+    await purgeIdempotencyKeys();
     const { mp, transfer } = await Order.expireStale(MP_EXPIRY_MINUTES, TRANSFER_EXPIRY_HOURS);
     if (mp > 0 || transfer > 0) {
       invalidateProducts(); // el sweep devolvió stock: el catálogo cacheado quedó viejo
