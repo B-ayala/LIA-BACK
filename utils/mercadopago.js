@@ -68,7 +68,10 @@ const createPreference = (preference) =>
 const getPayment = (paymentId) =>
   mpRequest(`/v1/payments/${encodeURIComponent(paymentId)}`);
 
-const SEARCH_RESULTS_LIMIT = 20;
+// Una compra acumula un pago por intento (tarjeta rechazada, reintento…). Sin
+// paginar, 50 intentos ordenados del más nuevo al más viejo cubren de sobra un
+// checkout real; el pago aprobado o en curso siempre es de los últimos intentos.
+const SEARCH_RESULTS_LIMIT = 50;
 
 /**
  * Pagos de MP asociados a una `external_reference` (más recientes primero).

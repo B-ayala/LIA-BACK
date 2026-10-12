@@ -20,7 +20,7 @@ const productRoutes = require('./routes/productRoutes');
 const orderRoutes = require('./routes/orderRoutes');
 const shippingRoutes = require('./routes/shippingRoutes');
 const insightsRoutes = require('./routes/insightsRoutes');
-const { expireStaleOrders, warnIfPaymentMigrationMissing } = require('./controllers/orderController');
+const { expireStaleOrders, warnIfPaymentMigrationMissing } = require('./services/orderMaintenance');
 
 const app = express();
 

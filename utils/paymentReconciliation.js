@@ -4,8 +4,9 @@
  * Liberar una reserva por tiempo (sweep) o por navegación (el comprador vuelve
  * con Atrás) es seguro solo si MP no tiene un pago aprobado o en curso para
  * esa compra: de lo contrario el pago se acredita después y la venta queda
- * `pagado` sin unidad física. Medios diferidos (ticket, transferencia) pueden
- * tardar días, por eso un pago "en curso" retiene el stock hasta un tope.
+ * `pagado` sin unidad física. Desde que la preferencia excluye los medios
+ * diferidos (ticket / cajero), un pago "en curso" se resuelve en minutos u
+ * horas, así que la retención tiene un tope corto (ver staleOrderSweep).
  */
 
 const mercadopago = require('./mercadopago');
@@ -18,7 +19,10 @@ const PAYMENT_STATE = {
   unknown: 'unknown',
 };
 
-const IN_FLIGHT_STATUSES = new Set(['pending', 'in_process', 'authorized', 'in_mediation']);
+// `in_mediation` NO está: es la disputa de un pago que YA fue aprobado (el dinero
+// está retenido por el reclamo), no un pago que todavía pueda acreditarse. Retener
+// stock por eso bloquearía la reserva durante toda la disputa sin motivo.
+const IN_FLIGHT_STATUSES = new Set(['pending', 'in_process', 'authorized']);
 
 /** Un pago aprobado manda; si no, uno en curso retiene; si no, no hay nada que esperar. */
 const classifyPayments = (payments) => {
@@ -31,7 +35,7 @@ const classifyPayments = (payments) => {
   return { state: PAYMENT_STATE.none, payment: null };
 };
 
-/** Ids de venta que viajan en la `external_reference` de MP. */
+/** Ids de venta que viajaban en la `external_reference` de las preferencias viejas. */
 const parseOrderIdsFromReference = (externalReference) =>
   String(externalReference || '').split(',').map((id) => id.trim()).filter(Boolean);
 

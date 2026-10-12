@@ -17,14 +17,15 @@ test('un pago aprobado manda sobre cualquier otro', () => {
   assert.equal(result.payment.id, 3);
 });
 
-test('pending / in_process / authorized / in_mediation retienen el stock', () => {
-  for (const status of ['pending', 'in_process', 'authorized', 'in_mediation']) {
+test('pending / in_process / authorized retienen el stock', () => {
+  for (const status of ['pending', 'in_process', 'authorized']) {
     assert.equal(classifyPayments([{ status }]).state, PAYMENT_STATE.inFlight, status);
   }
 });
 
-test('rechazados, cancelados, reembolsados y contracargados no retienen', () => {
-  for (const status of ['rejected', 'cancelled', 'refunded', 'charged_back']) {
+test('rechazados, cancelados, reembolsados, contracargados y en mediación no retienen', () => {
+  // in_mediation es la disputa de un pago ya aprobado, no un pago que pueda acreditarse.
+  for (const status of ['rejected', 'cancelled', 'refunded', 'charged_back', 'in_mediation']) {
     assert.equal(classifyPayments([{ status }]).state, PAYMENT_STATE.none, status);
   }
 });
@@ -48,7 +49,13 @@ test('sweep: pago en curso o consulta fallida retiene el stock dentro del tope',
   assert.equal(decideAction({ state: PAYMENT_STATE.unknown }, hoursAgo(2)), 'hold');
 });
 
-test('sweep: pasado el tope se expira igual (un ticket no bloquea el stock para siempre)', () => {
+test('sweep: el tope de retención es 24 h (sin medios diferidos)', () => {
+  assert.equal(MP_INFLIGHT_MAX_HOURS, 24);
+  assert.equal(decideAction({ state: PAYMENT_STATE.inFlight }, hoursAgo(23)), 'hold');
+  assert.equal(decideAction({ state: PAYMENT_STATE.inFlight }, hoursAgo(25)), 'expire');
+});
+
+test('sweep: pasado el tope se expira igual (un pago en curso no bloquea el stock para siempre)', () => {
   const old = hoursAgo(MP_INFLIGHT_MAX_HOURS + 1);
   assert.equal(isPastHoldLimit(old), true);
   assert.equal(decideAction({ state: PAYMENT_STATE.inFlight }, old), 'expire');

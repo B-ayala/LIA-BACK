@@ -1089,6 +1089,118 @@ Esperado: cada columna queda con la fecha/hora real del cambio; el resto de las
 Resultado: no probado — pendiente de aplicar el script SQL en producción
 ```
 
+### Idempotencia de creación de órdenes (`Idempotency-Key`)
+
+```
+ID: TC-231
+Caso: Reintento con la misma key y el mismo carrito devuelve la orden original
+Tipo: happy / edge
+Pre-condición: usuario logueado, producto con stock
+Pasos:
+  1. POST /api/orders/mp-preference con header Idempotency-Key: <uuid> → 201
+  2. Repetir exactamente la misma request (misma key y body)
+Esperado: la segunda devuelve 201 con los mismos order_ids e init_point; en `ventas` hay un
+  solo juego de filas y el stock se descontó UNA vez
+Resultado: no probado — la lógica de replay sí se verificó con un script unitario (2026-10-08)
+
+ID: TC-238
+Caso: El replay sobrevive a un reinicio del backend
+Tipo: edge
+Pre-condición: migración 2026-10-08_add_idempotency_keys.sql aplicada
+Pasos:
+  1. Crear una compra con la key K (201) y anotar order_ids
+  2. Reiniciar el servicio en Render (Manual Deploy / Restart)
+  3. Repetir la misma request (misma K y mismo body)
+Esperado: 201 con las mismas order_ids; `SELECT * FROM idempotency_keys WHERE key = 'K'` tiene
+  una fila; no hay ventas nuevas ni doble descuento de stock
+Resultado: no probado — con el modelo simulado sí (2026-10-08)
+
+ID: TC-239
+Caso: Sin la tabla, el checkout sigue funcionando
+Tipo: failure / regression
+Pre-condición: migración NO aplicada (o tabla renombrada temporalmente)
+Pasos:
+  1. Completar una compra con Idempotency-Key
+  2. Repetirla con la misma key
+Esperado: ambas responden bien (la 2ª por memoria, misma orden); en los logs aparece
+  `idempotency_write_failed` / `idempotency_read_failed` (código 42P01); el pago no se corta
+Resultado: no probado — con el modelo simulado sí (2026-10-08)
+
+ID: TC-240
+Caso: Misma key con otro nombre o email de comprador
+Tipo: edge
+Pasos:
+  1. Crear una compra con la key K
+  2. Repetir con la misma K cambiando solo buyerName o buyerEmail
+Esperado: 422 IDEMPOTENCY_KEY_REUSED (la huella del backend incluye al comprador)
+Resultado: no probado
+
+ID: TC-241
+Caso: La tabla no es accesible desde el navegador
+Tipo: security
+Pre-condición: migración aplicada
+Pasos:
+  1. Con la anon key (o un usuario logueado) intentar SELECT/INSERT sobre idempotency_keys
+Esperado: permiso denegado / 0 filas (RLS activo sin policies, REVOKE a anon/authenticated)
+Resultado: no probado
+
+ID: TC-232
+Caso: Misma key con carrito distinto
+Tipo: failure
+Pasos:
+  1. Crear una compra con la key K (201)
+  2. Repetir con la misma K pero otra cantidad, otro envío o otro total
+Esperado: 422 { code: 'IDEMPOTENCY_KEY_REUSED' } con mensaje en lenguaje humano; no se crea
+  ninguna venta nueva ni se toca el stock
+Resultado: no probado
+
+ID: TC-233
+Caso: Key con formato inválido
+Tipo: edge / security
+Pasos:
+  1. Enviar Idempotency-Key de 3 caracteres, de 129 caracteres o con espacios/símbolos
+Esperado: 400 { code: 'IDEMPOTENCY_KEY_INVALID' }; nada se persiste
+Resultado: no probado
+
+ID: TC-234
+Caso: Un error no queda "pegado" a la key
+Tipo: failure
+Pre-condición: stock = 0 del producto
+Pasos:
+  1. Crear compra con la key K → 409 sin stock
+  2. Reponer stock y repetir con la misma K
+Esperado: el segundo intento se ejecuta y responde 201 (los 409/502 no se recuerdan)
+Resultado: no probado
+
+ID: TC-235
+Caso: La key no se comparte entre usuarios ni entre tipos de pago
+Tipo: security
+Pasos:
+  1. Usuario A crea una compra MP con la key K (201)
+  2. Usuario B usa la misma K con su carrito; luego A usa K en /transfer
+Esperado: B y /transfer crean órdenes propias (no reciben la respuesta de A)
+Resultado: no probado
+
+ID: TC-236
+Caso: Sin header el comportamiento no cambia
+Tipo: regression
+Pasos:
+  1. Compra por MP y por transferencia sin Idempotency-Key
+  2. Doble click rápido sin header
+Esperado: ambas compras funcionan; el doble click simultáneo sigue creando un solo juego de ventas
+Resultado: no probado
+
+ID: TC-237
+Caso: CORS permite Idempotency-Key desde el dominio del front
+Tipo: regression
+Pasos:
+  1. Desde https://www.liaa.com.ar iniciar "Pagar con Mercado Pago"
+  2. DevTools → Network: ver el preflight OPTIONS de /orders/mp-preference
+Esperado: OPTIONS 204 con Access-Control-Allow-Headers que incluye idempotency-key; el POST
+  responde 201 (antes: "Failed to fetch" por CORS)
+Resultado: no probado
+```
+
 ---
 
 ## Casos pendientes sin probar (backlog)
@@ -1136,6 +1248,8 @@ Resultado: no probado — pendiente de aplicar el script SQL en producción
 | Productos (CRUD admin) | TC-210 | TC-211 | — | — | — |
 | Modo compra restringida | TC-212/213/215/216 | TC-216 | TC-215 | TC-214/217 | — |
 | Admin principal (owner) | TC-222 | — | — | TC-220/221 | — |
+| Conciliación MP / mp-cancel / review_reason (2026-10-14) | TC-253/256/262/266 | TC-254/255/258/263/264/270 | TC-257/259/260/261/265/267 | TC-268/269/271 | TC-272/273 |
+| Productos: edición optimista y borrado | TC-274 | TC-276 | TC-275/277 | TC-278 | TC-275 |
 
 ## Cross-browser / device
 Probado en Chrome desktop (Playwright). Pendiente: Safari iOS, Chrome Android
@@ -1163,3 +1277,54 @@ sobre el flujo de checkout completo.
 - TC-171 "Test QA Cancel" creado → trigger → 8
 - TC-171 cancelar → restaurado → 9
 - **Stock final: 9**
+
+### Stock por talle y conciliación de pagos MP (2026-10-13)
+Pre-condición: migración `2026-10-13_payment_reconciliation_and_schema_hardening.sql` aplicada. Tests automáticos: `node --test qa/unit/*.test.js` (ok, 20/20).
+
+ID: TC-240 — Caso: talle agotado con stock total disponible. Tipo: failure (regresión DATA-004). Pre: producto con Talle M=1, L=3 (stock 4). Pasos: comprar 2 unidades de M (`mp-preference`). Esperado: 409 "No hay stock suficiente del talle M…"; nada se persiste. Resultado: no probado (solo unit test de `validateSizeStock`).
+ID: TC-241 — Caso: la compra descuenta total y talle. Tipo: happy. Pasos: comprar 1 M y 1 L. Esperado: `productos.stock` 4→2 (una sola vez) y `variants` Talle M=0, L=2. Resultado: no probado.
+ID: TC-242 — Caso: cancelar / expirar devuelve el talle. Tipo: happy. Pasos: cancelar la orden de TC-241 (y repetir dejándola expirar). Esperado: stock 4 y M=1, L=3, sin doble restauración. Resultado: no probado.
+ID: TC-243 — Caso: unidad sin talle. Tipo: edge. Pasos: `mp-preference` con `unitsConfig` vacío para un producto con stock por talle. Esperado: 400 "Elegí el talle de cada unidad…". Resultado: no probado.
+ID: TC-244 — Caso: sweep con pago en curso. Tipo: failure. Pasos: pago con ticket (queda `pending`), esperar >15 min. Esperado: la orden sigue `pendiente`, el stock retenido, log `orders_sweep` con `heldMp`; pasadas 72 h expira. Resultado: no probado.
+ID: TC-245 — Caso: sweep con pago aprobado sobre el plazo. Tipo: edge. Pasos: aprobar el pago sandbox sin que llegue el webhook ni `mp-confirm`, esperar >15 min. Esperado: el sweep la pasa a `pagado` con `mp_payment_id`; no queda `expirado`. Resultado: no probado.
+ID: TC-246 — Caso: sweep sin pagos. Tipo: happy. Pasos: crear preferencia y no pagar, esperar >15 min. Esperado: `expirado` + stock restaurado. Resultado: no probado.
+ID: TC-247 — Caso: cancelar mientras MP procesa el pago. Tipo: security/failure. Pasos: pago `in_process` y `POST /:id/cancel`. Esperado: 200 `{ released: false }`, orden `pendiente`, stock intacto; con pago aprobado → 409 y orden `pagado`. Resultado: no probado.
+ID: TC-248 — Caso: pago tardío con stock. Tipo: edge. Pasos: orden `expirado`, luego `mp-confirm` aprobado con stock disponible. Esperado: `pagado`, stock descontado exacto (sin clamp) y talle descontado. Resultado: no probado.
+ID: TC-249 — Caso: pago tardío sin stock. Tipo: failure (DATA-001). Pasos: orden `expirado`, otro comprador se lleva la última unidad, luego `mp-confirm` aprobado. Esperado: `pagado` con `oversold = true`, stock sin tocar, log `oversold_late_payment`, etiqueta "Sin stock: reembolsar" en el panel Ventas. Resultado: no probado.
+ID: TC-250 — Caso: doble pago de la misma compra. Tipo: failure. Pasos: confirmar dos `payment_id` aprobados distintos para las mismas ventas. Esperado: la venta conserva el primero y se loguea `duplicate_approved_payment`. Resultado: no probado.
+ID: TC-251 — Caso: migración sin aplicar. Tipo: failure. Pasos: arrancar el backend contra una base sin las columnas nuevas. Esperado: log `missing_migration` con las columnas faltantes. Resultado: no probado.
+ID: TC-252 — Caso: CHECK de estados. Tipo: security. Pasos: intentar `UPDATE ventas SET payment_status = 'x'` en una transacción con ROLLBACK. Esperado: error de `ventas_payment_status_check`. Resultado: no probado.
+
+### Conciliación MP, mp-cancel, review_reason, confirmación tardía y edición optimista (2026-10-14)
+
+Pre-condiciones comunes: migración `2026-10-14_add_review_reason_to_ventas.sql` aplicada; backend con
+`MP_ACCESS_TOKEN` de sandbox; usuario del sitio logueado. Probar escrituras de stock dentro de una
+transacción con ROLLBACK cuando no haga falta el flujo completo. Unit tests: `node --test qa/unit/*.test.js`
+(57/57 ok al 2026-10-12).
+
+ID: TC-253 — Caso: preferencia con id de compra. Tipo: happy. Pasos: crear `mp-preference` con 3 productos; mirar la preferencia en MP y `ventas`. Esperado: `external_reference` = un uuid (≤ 256 caracteres) igual a `ventas.mp_external_reference` de las 3 líneas; `mp_preference_id` guardado. Resultado: ok (unit test del payload); flujo real no probado.
+ID: TC-254 — Caso: carrito grande. Tipo: edge. Pasos: carrito con 40 líneas. Esperado: la preferencia se crea (antes la lista de ids superaba 256 caracteres). Resultado: no probado.
+ID: TC-255 — Caso: medios diferidos excluidos. Tipo: edge. Pasos: abrir el checkout de MP. Esperado: no aparecen Rapipago / Pago Fácil / cajero. Resultado: ok (unit test del payload); visual no probado.
+ID: TC-256 — Caso: `mp-cancel` sin pago. Tipo: happy. Pasos: crear preferencia, volver con failure; el front llama `POST /api/orders/mp-cancel { orderIds }`. Esperado: `200 { outcome: 'released' }`, ventas `cancelado`, stock total y talle restaurados una vez. Resultado: no probado.
+ID: TC-257 — Caso: `mp-cancel` con pago en curso o MP caído. Tipo: failure. Pasos: pago `in_process` (o MP sin responder) y `mp-cancel`. Esperado: `200 { outcome: 'held' }`, ventas `pendiente`, stock intacto; ninguna conexión del pool retenida durante la consulta (`/health` → `pool.waiting` 0). Resultado: no probado.
+ID: TC-258 — Caso: `mp-cancel` con pago aprobado. Tipo: edge. Pasos: aprobar el pago sin `mp-confirm` ni webhook y llamar `mp-cancel`. Esperado: `200 { outcome: 'paid' }`, ventas `pagado` con `mp_payment_id`. Resultado: no probado.
+ID: TC-259 — Caso: `mp-cancel` body inválido. Tipo: failure. Pasos: `orderIds` ausente, `[]`, 51 ids, un id `"1"`. Esperado: `400 { code: 'INVALID_ORDER_IDS' }`. Resultado: no probado.
+ID: TC-260 — Caso: id de orden no uuid. Tipo: failure. Pasos: `POST /api/orders/abc/cancel`, `PATCH /api/orders/1/confirm-transfer`. Esperado: `400 { code: 'INVALID_ORDER_ID' }`, nunca 500. Resultado: ok (unit test de `isUuid`); endpoint no probado.
+ID: TC-261 — Caso: errores de stock con `code`. Tipo: failure. Pasos: comprar más que el stock; talle agotado; talle borrado por el admin; unidad sin talle; color inexistente; `productId: "abc"`. Esperado: `OUT_OF_STOCK` 409, `SIZE_OUT_OF_STOCK` 409 (+`size`), `SIZE_UNAVAILABLE` 409 (+`size`), `SIZE_REQUIRED` 400, `INVALID_VARIANT` 400, `INVALID_PRODUCT_ID` 400; todos con `productId` y el mensaje humano; con `Idempotency-Key`, el reintento vuelve a ejecutarse. Resultado: ok (unit tests de `evaluateLine`); endpoint no probado.
+ID: TC-262 — Caso: nombre/imagen desde la base. Tipo: happy. Pasos: `mp-preference` con `productName: "X"` y `productImage` de otro dominio. Esperado: `ventas.product_name`/`product_image` y el ítem de MP con el nombre y la primera imagen reales. Resultado: ok (unit test); endpoint no probado.
+ID: TC-263 — Caso: email del comprador desde la sesión. Tipo: edge. Pasos: `transfer` con `buyerEmail` distinto al del usuario logueado. Esperado: `ventas.buyer_email` = email de la sesión; la compra aparece en "Mis compras". Resultado: no probado.
+ID: TC-264 — Caso: monto no coincide. Tipo: edge. Pasos: pago aprobado con `transaction_amount` distinto (o no numérico). Esperado: `mp-confirm` 409 `AMOUNT_MISMATCH`; ventas no pagadas con `review_reason='amount_mismatch'`; log `payment_amount_mismatch`; el sweep no vuelve a consultar MP y las expira recién pasadas 24 h. Resultado: ok (unit tests de settle y sweep); flujo no probado.
+ID: TC-265 — Caso: reembolso / contracargo por webhook. Tipo: failure. Pasos: reembolsar en MP un pago que saldó ventas. Esperado: webhook 200; ventas `pagado` con `review_reason='refunded'` (o `charged_back`), stock y estado sin cambios; log `payment_reversed`. Resultado: ok (unit test); flujo no probado.
+ID: TC-266 — Caso: confirmación tardía de transferencia con stock. Tipo: happy. Pasos: transferencia `expirado`, `PATCH /:id/confirm-late-transfer` (admin). Esperado: `200 { oversold: false }`, `pagado`, stock total y talle descontados una vez, `cancelled_at` sin cambios, `paid_at` seteado. Resultado: no probado.
+ID: TC-267 — Caso: confirmación tardía sin stock / estado incorrecto. Tipo: failure. Pasos: la unidad se vendió a otro y luego confirm-late; repetir sobre una transferencia `pendiente` y sobre una orden MP; repetir con usuario no admin. Esperado: `200 { oversold: true }` sin tocar stock; `409 ORDER_NOT_EXPIRED`; `409 NOT_A_TRANSFER`; 403. Resultado: no probado.
+ID: TC-268 — Caso: `mp-cancel` con una orden ajena. Tipo: security. Pasos: mezclar una venta propia y una de otro usuario. Esperado: `403 { code: 'FORBIDDEN' }` y ninguna venta cambia. Resultado: ok (unit test con modelo stubeado); endpoint no probado.
+ID: TC-269 — Caso: cobro duplicado. Tipo: security. Pasos: confirmar un segundo `payment_id` aprobado sobre ventas ya pagadas. Esperado: conservan el primer `mp_payment_id`, `review_reason='duplicate_payment'`, log `duplicate_approved_payment`. Resultado: no probado.
+ID: TC-270 — Caso: conciliación de compras cerradas. Tipo: edge. Pasos: dejar expirar una compra MP, aprobar el pago sin webhook, esperar hasta 15 min. Esperado: log `closed_order_reconciled`, ventas `pagado` (stock re-descontado u `oversold`). Resultado: no probado.
+ID: TC-271 — Caso: pago tardío de producto borrado. Tipo: security/failure. Pasos: venta `expirado` cuyo producto se borró; pago aprobado. Esperado: `pagado` con `oversold = true`, log `late_payment_without_stock_control`. Resultado: no probado.
+ID: TC-272 — Caso: carritos cruzados sin deadlock. Tipo: concurrencia. Pasos: dos compras simultáneas con productos [A, B] y [B, A]. Esperado: ninguna falla por deadlock (40P01); una gana el último ítem y la otra recibe 409. Resultado: ok (unit test del orden de bloqueo); concurrencia real no probada.
+ID: TC-273 — Caso: sweep con muchas retenidas. Tipo: concurrencia. Pasos: 15 compras con pago en curso vencidas. Esperado: por ciclo hasta 10 consultas, 4 en paralelo, ciclo < 60 s; una retenida no se reconsulta antes de 5 min y todas rotan; un error en una compra no frena las demás ni las transferencias. Resultado: ok (unit tests de rotación y concurrencia); real no probado.
+ID: TC-274 — Caso: edición con `expectedUpdatedAt` vigente. Tipo: happy. Pasos: leer el producto, `PUT` con el `updated_at` leído. Esperado: 200 y `updated_at` nuevo. Resultado: ok (unit test del UPDATE); endpoint no probado.
+ID: TC-275 — Caso: el producto cambió mientras se editaba. Tipo: failure/concurrencia. Pasos: leer `updated_at`, comprar 1 unidad, `PUT` con el valor viejo. Esperado: `409 PRODUCT_CHANGED` con el mensaje "El producto cambió desde que lo abriste…", nada modificado. Resultado: no probado.
+ID: TC-276 — Caso: `PUT` sin `stock`. Tipo: edge. Pasos: editar solo el nombre de un producto con stock por talle. Esperado: la columna `stock` no se escribe. Resultado: ok (unit test); endpoint no probado.
+ID: TC-277 — Caso: borrar producto con ventas pendientes. Tipo: failure. Pasos: reserva pendiente del producto; `DELETE /api/products/:id`. Esperado: `409 PRODUCT_HAS_PENDING_ORDERS`, producto e imagen intactos. Resultado: no probado.
+ID: TC-278 — Caso: ids de producto y fecha inválidos. Tipo: security. Pasos: `GET /api/products/abc`; `PUT` con `expectedUpdatedAt: "2026-13-45T00:00:00Z"` o `"x"`. Esperado: `400 INVALID_PRODUCT_ID`; `400 VALIDATION_ERROR`; nunca 500. Resultado: no probado.

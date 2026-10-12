@@ -5,7 +5,23 @@
 ### Security
 - `npm audit fix`: `proxy-addr` (IP spoofing, crítica), `compression` (DoS por memory leak) y `qs`/`body-parser`/`express` (DoS por parseo) actualizados. Dependencias de producción: 0 vulnerabilidades.
 
+### Changed
+- **`external_reference` de MP es un id de compra** (uuid por carrito guardado en `ventas.mp_external_reference` en la misma transacción de reserva) en vez de la lista de ids de venta: carritos grandes ya no superan los 256 caracteres de MP. Los pagos viejos con lista de ids se siguen resolviendo.
+- La preferencia de MP **excluye medios diferidos** (`ticket`, `atm`) y el tope de retención de stock por pago en curso baja de 72 h a **24 h**; `in_mediation` ya no retiene stock.
+- Errores del checkout con **`code` estable** (`OUT_OF_STOCK`, `SIZE_OUT_OF_STOCK`, `SIZE_UNAVAILABLE`, `SIZE_REQUIRED`, `INVALID_VARIANT`, `INVALID_PRODUCT_ID`, `PRODUCT_UNAVAILABLE`) + `productId`/`size`; todas las respuestas de error de órdenes llevan `{ success:false, code, message }`.
+- Nombre, imagen y `unitsConfig` de cada venta (y del ítem de MP) salen de `productos`, no del body; `unitsConfig` se valida contra las variantes reales y se guarda saneado (`[]` sin variantes).
+- El email del comprador de la venta y de la huella de idempotencia es el de la sesión (`req.user.email`).
+- `markPaidByIds` / `mp-confirm` devuelven las ventas **realmente** pasadas a `pagado` (`orders_paid` = 0 si ya estaban pagadas).
+- Pago tardío sobre un producto borrado o con stock NULL queda `oversold = true`.
+- Ids de orden validados como uuid en el borde (`400 INVALID_ORDER_ID` / `INVALID_ORDER_IDS`) y comparados como `uuid` en SQL; ids de producto no numéricos → `400 INVALID_PRODUCT_ID`.
+- Sweep de pendientes vencidas: rotación de consultas a MP (una compra retenida se reconsulta cada ≥5 min), 4 consultas en paralelo con tope configurable (`ORDER_SWEEP_MAX_MP_LOOKUPS`), try/catch por compra y transferencias en paso independiente.
+- `orderController.js` (943 líneas) dividido en controllers de checkout, cancelación y transferencias + `services/` (checkout, reserva, cancelación MP, transferencias, sweep, conciliación); `models/Order.js` dividido con `models/OrderPayment.js`; `productController` usa `models/Product.js`.
+
 ### Fixed
+- **Conexiones del pool**: `/:id/cancel` ya no retiene una conexión mientras consulta a MP; ningún handler de órdenes hace `pool.connect()` fuera de try/catch y un ROLLBACK fallido descarta la conexión rota (`utils/transaction.js`).
+- **Deadlocks**: la reserva bloquea productos en orden de id; cancelación, expiración (CTE con `ORDER BY id FOR UPDATE`) y pago bloquean ventas por id y productos en orden ascendente.
+- Un `settle` con monto distinto, monto no numérico o que no marcó nada ya no cuenta como pagado en el sweep.
+- Borrar un producto con ventas `pendiente` → `409 PRODUCT_HAS_PENDING_ORDERS`; la imagen de Cloudinary se borra recién después de borrar el producto.
 - **Stock por talle**: `reserveOrders` ahora valida y descuenta `productos.variants[].stockByOption`
   con la fila bloqueada (antes solo se controlaba el total: un talle agotado se seguía vendiendo).
   Cancelar, expirar o liberar una orden devuelve el stock al talle de cada unidad. Talle agotado →
@@ -17,6 +33,12 @@
   reserva (tope 72 h). Nuevo `services/staleOrderSweep.js` y `utils/paymentReconciliation.js`.
 
 ### Added
+- `POST /api/orders/mp-cancel { orderIds }`: cancela las compras MP de un carrito con una consulta a MP por compra y responde `outcome` `released` / `held` / `paid`.
+- `PATCH /api/orders/:id/confirm-late-transfer` (admin): confirma una transferencia `expirado`, re-descuenta stock y responde `{ oversold }`.
+- `ventas.review_reason` (`amount_mismatch` / `duplicate_payment` / `refunded` / `charged_back`): el backend marca las ventas que requieren revisión del admin; el webhook detecta reembolsos y contracargos. Migración `db/migrations/2026-10-14_add_review_reason_to_ventas.sql` (**aplicar antes de desplegar**; el chequeo de arranque la incluye).
+- Conciliación de compras MP cerradas (`services/closedOrderReconciliation.js`): cada 15 min salda pagos aprobados de ventas `expirado`/`cancelado` de las últimas 48 h (log `closed_order_reconciled`).
+- `PUT /api/products/:id` acepta `expectedUpdatedAt` (control optimista atómico) → `409 PRODUCT_CHANGED` si el producto cambió; sin `stock` en el body no se toca la columna `stock`.
+- Tests unitarios nuevos en `qa/unit/` (reglas de checkout, variantes, preferencia MP, transacciones, rotación, liquidación y cancelación).
 - Conciliación de pagos MP: el backend guarda `mp_preference_id`, `mp_external_reference` y
   `mp_payment_id` en `ventas` y loguea `duplicate_approved_payment` si llega otro pago aprobado.
   Migración `db/migrations/2026-10-13_payment_reconciliation_and_schema_hardening.sql` (también agrega

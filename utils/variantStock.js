@@ -26,13 +26,15 @@ const normalizeSize = (value) => String(value ?? '').trim().toUpperCase();
 
 const hasOwn = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
 
+const isSizeVariantName = (name) =>
+  typeof name === 'string' && name.trim().toLowerCase().startsWith(SIZE_VARIANT_PREFIX);
+
 /** Variante de talle que controla stock por opción, o null si el stock es solo a nivel producto. */
 const findSizeStockVariant = (variants) => {
   if (!Array.isArray(variants)) return null;
   const found = variants.find((variant) =>
     variant
-    && typeof variant.name === 'string'
-    && variant.name.trim().toLowerCase().startsWith(SIZE_VARIANT_PREFIX)
+    && isSizeVariantName(variant.name)
     && variant.stockByOption
     && typeof variant.stockByOption === 'object'
     && Object.values(variant.stockByOption).some(Number.isFinite)
@@ -114,6 +116,8 @@ module.exports = {
   DEDUCT,
   RESTORE,
   REASON,
+  normalizeSize,
+  isSizeVariantName,
   findSizeStockVariant,
   validateSizeStock,
   applySizeDelta,
