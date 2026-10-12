@@ -8,6 +8,10 @@ const { CORREO_COST } = require('./shippingController');
 const { caches, invalidateProducts } = require('../utils/cache');
 const logger = require('../utils/logger');
 const { readIdempotencyKey, withIdempotency } = require('../utils/idempotency');
+const { DEDUCT, REASON, validateSizeStock, applySizeDelta } = require('../utils/variantStock');
+const { PAYMENT_STATE, checkPaymentState } = require('../utils/paymentReconciliation');
+const { settleApprovedPayment } = require('../utils/paymentSettlement');
+const { sweepStaleOrders } = require('../services/staleOrderSweep');
 
 // Ventanas de expiración — deben coincidir con las que muestra el frontend
 // (MP_EXPIRY_MS / TRANSFER_EXPIRY_MS en admin/pages/Sales).
@@ -62,10 +66,6 @@ const SHIPPING_COSTS = {
   correo: CORREO_COST,
 };
 const MAX_MOTO_SHIPPING_COST = 100000;
-
-// Diferencia máxima tolerada entre lo acreditado en MP y el total de las
-// órdenes: absorbe redondeos de centavos sin dejar pasar un pago menor.
-const PAYMENT_AMOUNT_TOLERANCE = 1;
 
 /**
  * Precio unitario vigente de un producto, calculado desde la fila de la base.
@@ -237,6 +237,25 @@ const buildPreferencePayload = ({ buyerName, buyerEmail, items, shippingCost, or
   return preference;
 };
 
+const SIZE_STOCK_PROBLEMS = {
+  [REASON.missingSize]: (name) => ({ status: 400, message: `Elegí el talle de cada unidad de "${name}".` }),
+  [REASON.unknownSize]: (name, size) => ({ status: 409, message: `El talle ${size} de "${name}" ya no está disponible.` }),
+  [REASON.noStockForSize]: (name, size) => ({ status: 409, message: `No hay stock suficiente del talle ${size} de "${name}".` }),
+};
+
+/**
+ * Verifica stock total y por talle de una línea contra la fila de producto ya bloqueada.
+ * El trigger solo descuenta el total, así que sin esto un talle agotado se podía seguir vendiendo.
+ * @returns {{status: number, message: string}|null} el problema, o null si hay stock.
+ */
+const findStockProblem = (product, item) => {
+  if (product === null || product.stock < item.quantity) {
+    return { status: 409, message: `No hay stock suficiente de "${item.productName}".` };
+  }
+  const sizeCheck = validateSizeStock(product.variants, item.unitsConfig, item.quantity);
+  return sizeCheck.ok ? null : SIZE_STOCK_PROBLEMS[sizeCheck.reason](item.productName, sizeCheck.size);
+};
+
 /**
  * Reserva el stock e inserta las ventas pendientes en una única transacción corta.
  *
@@ -279,13 +298,10 @@ const reserveOrders = async ({ buyerName, buyerEmail, userId, items, shippingMet
       }
 
       const product = await Order.getProductForUpdate(client, productId);
-      if (product === null || product.stock < item.quantity) {
+      const stockProblem = findStockProblem(product, item);
+      if (stockProblem) {
         await client.query('ROLLBACK');
-        return {
-          ok: false,
-          status: 409,
-          message: `No hay stock suficiente de "${item.productName}".`,
-        };
+        return { ok: false, ...stockProblem };
       }
 
       // El importe SIEMPRE sale de la base, nunca del body: un cliente que
@@ -315,6 +331,8 @@ const reserveOrders = async ({ buyerName, buyerEmail, userId, items, shippingMet
         paymentMethod,
         shippingMethod,
       });
+      const nextVariants = applySizeDelta(product.variants, item.unitsConfig, DEDUCT);
+      if (nextVariants) await Order.setVariants(client, productId, nextVariants);
       orderIds.push(orderId);
       pricedItems.push({
         productName: item.productName,
@@ -351,7 +369,7 @@ const releaseOrders = async (orderIds) => {
       const order = await Order.findByIdForUpdate(client, id);
       if (!order || order.payment_status !== 'pendiente') continue;
       await Order.setStatus(client, order.id, 'cancelado');
-      await Order.restoreStock(client, order.product_id, order.quantity);
+      await Order.restoreStock(client, order.product_id, order.quantity, order.units_config);
     }
     await client.query('COMMIT');
     invalidateProducts();
@@ -362,6 +380,22 @@ const releaseOrders = async (orderIds) => {
     console.error('Error al liberar reservas de órdenes:', error.message);
   } finally {
     client.release();
+  }
+};
+
+/**
+ * Guarda preferencia y referencia de MP en las ventas para poder conciliar después.
+ * No corta el checkout si falla (la compra ya está reservada y la preferencia creada):
+ * esas ventas caen al comportamiento anterior (expiran por tiempo) y queda un error en logs.
+ */
+const recordPaymentRefs = async (orderIds, preferenceId) => {
+  try {
+    await Order.setPaymentRefs(orderIds, {
+      preferenceId,
+      externalReference: orderIds.map(String).join(','),
+    });
+  } catch (error) {
+    logger.error('mp_payment_refs_not_saved', { orderIds: orderIds.map(String), code: error.code, message: error.message });
   }
 };
 
@@ -399,6 +433,8 @@ const buildMpCheckout = async (req) => {
     if (!preference || !preference.init_point) {
       throw new Error('Mercado Pago no devolvió init_point');
     }
+
+    await recordPaymentRefs(reservation.orderIds, preference.id);
 
     return {
       status: 201,
@@ -539,17 +575,14 @@ const confirmMpPayment = async (req, res) => {
       return res.status(409).json({ success: false, message: 'El pago no está aprobado' });
     }
 
-    const ids = String(payment.external_reference).split(',').map((s) => s.trim()).filter(Boolean);
-    const updated = ids.length > 0
-      ? await Order.markPaidByIds(ids, Number(payment.transaction_amount), PAYMENT_AMOUNT_TOLERANCE)
-      : 0;
+    const updated = await settleApprovedPayment(payment);
 
     // El monto acreditado no cubre el total de las órdenes: no se saldan.
     if (updated === -1) {
       logger.warn('mp_confirm_amount_mismatch', {
         paymentId: String(paymentId),
         paidAmount: Number(payment.transaction_amount),
-        orderIds: ids,
+        orderIds: String(payment.external_reference).split(','),
       });
       return res.status(409).json({
         success: false,
@@ -602,20 +635,15 @@ const mpWebhook = async (req, res) => {
 
     const payment = await mercadopago.getPayment(paymentId);
     if (payment && payment.status === 'approved' && payment.external_reference) {
-      const ids = String(payment.external_reference).split(',').map((s) => s.trim()).filter(Boolean);
-      if (ids.length > 0) {
-        const updated = await Order.markPaidByIds(
-          ids, Number(payment.transaction_amount), PAYMENT_AMOUNT_TOLERANCE
-        );
-        if (updated === -1) {
-          logger.warn('mp_webhook_amount_mismatch', {
-            paymentId: String(paymentId),
-            paidAmount: Number(payment.transaction_amount),
-            orderIds: ids,
-          });
-        } else {
-          invalidateProducts();
-        }
+      const updated = await settleApprovedPayment(payment);
+      if (updated === -1) {
+        logger.warn('mp_webhook_amount_mismatch', {
+          paymentId: String(paymentId),
+          paidAmount: Number(payment.transaction_amount),
+          orderIds: String(payment.external_reference).split(','),
+        });
+      } else {
+        invalidateProducts();
       }
     }
 
@@ -631,13 +659,56 @@ const mpWebhook = async (req, res) => {
   }
 };
 
+const isOrderOwnerOrAdmin = (user, order) => {
+  const isOwner =
+    user.email && order.buyer_email &&
+    user.email.toLowerCase() === order.buyer_email.toLowerCase();
+  return Boolean(isOwner) || user.role === 'admin';
+};
+
 /**
- * @desc    Cancela una orden MP pendiente (usuario volvió sin pagar) y devuelve stock
+ * Antes de cancelar una orden de MP se le pregunta a MP si hay un pago para esa compra:
+ * liberar el stock de una compra que MP todavía procesa dejaría una venta pagada sin
+ * unidad. La consulta va ANTES de abrir la transacción (no se retiene el lock durante la
+ * llamada externa). Responde y devuelve true si la cancelación no corresponde.
+ */
+const respondIfPaymentBlocksCancel = async (req, res) => {
+  const order = await Order.findById(req.params.id);
+  const canCheck = order
+    && order.payment_method === 'mp'
+    && order.payment_status === 'pendiente'
+    && order.mp_external_reference
+    && mercadopago.isConfigured()
+    && isOrderOwnerOrAdmin(req.user, order);
+  if (!canCheck) return false;
+
+  const { state, payment } = await checkPaymentState(order.mp_external_reference);
+  if (state === PAYMENT_STATE.approved) {
+    await settleApprovedPayment(payment);
+    invalidateProducts();
+    res.status(409).json({ success: false, message: 'La orden ya fue pagada y no puede cancelarse' });
+    return true;
+  }
+  if (state === PAYMENT_STATE.none) return false;
+
+  res.status(200).json({
+    success: true,
+    released: false,
+    message: 'Tu pago todavía se está procesando. Mantenemos la reserva hasta que se confirme.',
+  });
+  return true;
+};
+
+/**
+ * @desc    Cancela una orden MP pendiente (usuario volvió sin pagar) y devuelve stock.
+ *          Si MP tiene un pago aprobado o en curso, no cancela (ver respondIfPaymentBlocksCancel).
  * @route   POST /api/orders/:id/cancel
  */
 const cancelOrder = async (req, res) => {
   const client = await pool.connect();
   try {
+    if (await respondIfPaymentBlocksCancel(req, res)) return undefined;
+
     await client.query('BEGIN');
 
     const order = await Order.findByIdForUpdate(client, req.params.id);
@@ -646,10 +717,7 @@ const cancelOrder = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Orden no encontrada' });
     }
 
-    const isOwner =
-      req.user.email && order.buyer_email &&
-      req.user.email.toLowerCase() === order.buyer_email.toLowerCase();
-    if (!isOwner && req.user.role !== 'admin') {
+    if (!isOrderOwnerOrAdmin(req.user, order)) {
       await client.query('ROLLBACK');
       return res.status(403).json({ success: false, message: 'No podés cancelar esta orden' });
     }
@@ -671,7 +739,7 @@ const cancelOrder = async (req, res) => {
     }
 
     await Order.setStatus(client, order.id, 'cancelado');
-    await Order.restoreStock(client, order.product_id, order.quantity);
+    await Order.restoreStock(client, order.product_id, order.quantity, order.units_config);
 
     await client.query('COMMIT');
     invalidateProducts();
@@ -715,7 +783,7 @@ const resolveTransferOrder = async (req, res, targetStatus) => {
     }
 
     if (targetStatus === 'cancelado') {
-      await Order.restoreStock(client, order.product_id, order.quantity);
+      await Order.restoreStock(client, order.product_id, order.quantity, order.units_config);
     }
 
     await Order.setStatus(client, order.id, targetStatus);
@@ -760,7 +828,7 @@ const canActOnNudgeOrder = (order, user) => {
 /** Aplica la respuesta del nudge: 'wa_abandonado' cancela + devuelve stock; el resto solo marca origin. */
 const applyNudgeToOrder = async (client, order, origin) => {
   if (origin === NUDGE_ORIGIN.abandonado) {
-    await Order.restoreStock(client, order.product_id, order.quantity);
+    await Order.restoreStock(client, order.product_id, order.quantity, order.units_config);
     await Order.setStatus(client, order.id, 'cancelado');
   }
   await Order.setOrigin(client, order.id, origin);
@@ -823,15 +891,35 @@ const expireStaleOrders = async () => {
   sweepRunning = true;
   try {
     await purgeIdempotencyKeys();
-    const { mp, transfer } = await Order.expireStale(MP_EXPIRY_MINUTES, TRANSFER_EXPIRY_HOURS);
-    if (mp > 0 || transfer > 0) {
-      invalidateProducts(); // el sweep devolvió stock: el catálogo cacheado quedó viejo
-      logger.info('orders_sweep', { expiredMp: mp, expiredTransfer: transfer });
+    const { mp, transfer, paid, held } = await sweepStaleOrders({
+      mpExpiryMinutes: MP_EXPIRY_MINUTES,
+      transferExpiryHours: TRANSFER_EXPIRY_HOURS,
+    });
+    if (mp > 0 || transfer > 0 || paid > 0) {
+      invalidateProducts(); // el sweep movió stock: el catálogo cacheado quedó viejo
+    }
+    if (mp > 0 || transfer > 0 || paid > 0 || held > 0) {
+      logger.info('orders_sweep', { expiredMp: mp, expiredTransfer: transfer, settledMp: paid, heldMp: held });
     }
   } catch (error) {
     console.error('Error en sweep de órdenes:', error.message);
   } finally {
     sweepRunning = false;
+  }
+};
+
+/** Aviso de arranque: sin la migración de conciliación, confirmar pagos fallaría. */
+const warnIfPaymentMigrationMissing = async () => {
+  try {
+    const missing = await Order.findMissingPaymentColumns();
+    if (missing.length > 0) {
+      logger.error('missing_migration', {
+        migration: '2026-10-13_payment_reconciliation_and_schema_hardening.sql',
+        missingColumns: missing,
+      });
+    }
+  } catch (error) {
+    logger.warn('payment_schema_check_failed', { code: error.code, message: error.message });
   }
 };
 
@@ -846,6 +934,7 @@ module.exports = {
   cancelTransfer,
   recordNudge,
   expireStaleOrders,
+  warnIfPaymentMigrationMissing,
   // Expuesto solo para el test de concurrencia (qa/concurrency-stock-test.js):
   // permite invocar la transacción BEGIN/FOR UPDATE/COMMIT directo, sin pasar
   // por auth ni por el single-flight de `caches.orders` (que colapsaría 50

@@ -2,7 +2,27 @@
 
 ## [Unreleased]
 
+### Security
+- `npm audit fix`: `proxy-addr` (IP spoofing, crítica), `compression` (DoS por memory leak) y `qs`/`body-parser`/`express` (DoS por parseo) actualizados. Dependencias de producción: 0 vulnerabilidades.
+
+### Fixed
+- **Stock por talle**: `reserveOrders` ahora valida y descuenta `productos.variants[].stockByOption`
+  con la fila bloqueada (antes solo se controlaba el total: un talle agotado se seguía vendiendo).
+  Cancelar, expirar o liberar una orden devuelve el stock al talle de cada unidad. Talle agotado →
+  `409`; unidad sin talle → `400`. Lógica pura en `utils/variantStock.js` con tests en `qa/unit/`.
+- **Pago tardío sin stock**: `markPaidByIds` ya no re-descuenta con `GREATEST(stock - n, 0)`; si no hay
+  unidades deja la venta `pagado` con `oversold = true` y loguea `oversold_late_payment`.
+- **El sweep y `POST /:id/cancel` ya no liberan stock a ciegas**: consultan a MP los pagos de la
+  compra (`external_reference`); con un pago aprobado lo saldan y con uno en curso retienen la
+  reserva (tope 72 h). Nuevo `services/staleOrderSweep.js` y `utils/paymentReconciliation.js`.
+
 ### Added
+- Conciliación de pagos MP: el backend guarda `mp_preference_id`, `mp_external_reference` y
+  `mp_payment_id` en `ventas` y loguea `duplicate_approved_payment` si llega otro pago aprobado.
+  Migración `db/migrations/2026-10-13_payment_reconciliation_and_schema_hardening.sql` (también agrega
+  `oversold`, CHECK de `payment_status`/`payment_method`/`dispatch_status`, el permiso de UPDATE por
+  columna de `ventas` y `search_path` fijo en `decrement_stock_on_sale`). **Aplicarla antes de
+  desplegar**: al arrancar, el backend loguea `missing_migration` si faltan las columnas.
 - **Idempotencia real en `POST /api/orders/mp-preference` y `/transfer`** (header
   `Idempotency-Key`, nuevo `utils/idempotency.js`): reintentar con la misma key y el mismo
   carrito devuelve la respuesta original en vez de crear otro juego de ventas (y descontar

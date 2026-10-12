@@ -68,6 +68,23 @@ const createPreference = (preference) =>
 const getPayment = (paymentId) =>
   mpRequest(`/v1/payments/${encodeURIComponent(paymentId)}`);
 
+const SEARCH_RESULTS_LIMIT = 20;
+
+/**
+ * Pagos de MP asociados a una `external_reference` (más recientes primero).
+ * Sirve para saber, antes de liberar stock, si hay un pago aprobado o en curso.
+ */
+const searchPaymentsByReference = async (externalReference) => {
+  const query = new URLSearchParams({
+    external_reference: externalReference,
+    sort: 'date_created',
+    criteria: 'desc',
+    limit: String(SEARCH_RESULTS_LIMIT),
+  });
+  const data = await mpRequest(`/v1/payments/search?${query.toString()}`);
+  return Array.isArray(data && data.results) ? data.results : [];
+};
+
 /**
  * Verifica la firma `x-signature` de una notificación de webhook.
  *
@@ -107,4 +124,10 @@ const verifyWebhookSignature = ({ signatureHeader, requestId, dataId }) => {
   return crypto.timingSafeEqual(expectedBuffer, receivedBuffer);
 };
 
-module.exports = { isConfigured, createPreference, getPayment, verifyWebhookSignature };
+module.exports = {
+  isConfigured,
+  createPreference,
+  getPayment,
+  searchPaymentsByReference,
+  verifyWebhookSignature,
+};

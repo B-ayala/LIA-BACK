@@ -20,7 +20,7 @@ const productRoutes = require('./routes/productRoutes');
 const orderRoutes = require('./routes/orderRoutes');
 const shippingRoutes = require('./routes/shippingRoutes');
 const insightsRoutes = require('./routes/insightsRoutes');
-const { expireStaleOrders } = require('./controllers/orderController');
+const { expireStaleOrders, warnIfPaymentMigrationMissing } = require('./controllers/orderController');
 
 const app = express();
 
@@ -168,6 +168,7 @@ const registerShutdown = (server, sweepTimer) => {
   try {
     // Conectar a PostgreSQL/Supabase
     await connectDB();
+    await warnIfPaymentMigrationMissing();
 
     const server = app.listen(PORT, () => {
       logger.info('server_started', { port: PORT, env: process.env.NODE_ENV || 'development' });
