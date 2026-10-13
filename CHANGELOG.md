@@ -2,7 +2,13 @@
 
 ## [Unreleased]
 
+### Security
+- Dependencias: `npm audit fix` (incluye `proxy-addr`, que permitía falsear la IP y eludir rate limit y bloqueo de login). Quedan 3 avisos de `nodemon` (solo desarrollo).
+- Auth: `POST /api/auth/login|refresh|logout` rechazan con 403 un `Origin` fuera de la allowlist de CORS (defensa CSRF de la cookie del refresh token, que es `SameSite=None`).
+- Auth: login fallido registra `auth_login_failed_credentials` (código de Supabase, sin PII).
+
 ### Changed
+- Auth: `login`, `forgot-password` y `resend-confirmation` aceptan `captchaToken` y lo reenvían a Supabase (`gotrue_meta_security`). El login responde `EMAIL_NOT_CONFIRMED` (401) y `CAPTCHA_FAILED` (400); ninguno de los dos cuenta como intento fallido de contraseña.
 - Productos: `POST`/`PUT /api/products` aceptan y persisten `originalPrice` (columna `original_price`); `price` sigue siendo el precio final cobrado y un original que no supere al precio se descarta. `PUT` con `originalPrice: null` lo borra. Script SQL `2026-10-07_add_original_price_to_productos.sql` (idempotente); `init-db` también crea la columna.
 - Productos: `GET /api/products` y `/:id` solo devuelven productos activos al público; un admin con token válido ve también los inactivos (caché separada por audiencia, `Vary: Authorization`).
 - Productos: un `:id` que no sea numérico (1 a 15 dígitos) responde 404 en detalle, edición y baja.

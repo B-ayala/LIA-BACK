@@ -3,6 +3,7 @@ const router = express.Router();
 const { login, refresh, logout, resendConfirmation, forgotPassword } = require('../controllers/authController');
 const { createRateLimit } = require('../middleware/rateLimit');
 const { noStore } = require('../middleware/httpCache');
+const { requireTrustedOrigin } = require('../middleware/requireTrustedOrigin');
 
 // Credenciales de sesión: nunca cacheables.
 router.use(noStore);
@@ -23,9 +24,9 @@ const logoutLimit = createRateLimit({ name: 'auth-logout', windowMs: 60 * 1000, 
 const resendConfirmationLimit = createRateLimit({ name: 'auth-resend-confirmation', windowMs: 5 * 60 * 1000, max: 10 });
 const forgotPasswordLimit = createRateLimit({ name: 'auth-forgot-password', windowMs: 5 * 60 * 1000, max: 10 });
 
-router.post('/login', loginLimit, login);
-router.post('/refresh', refreshLimit, refresh);
-router.post('/logout', logoutLimit, logout);
+router.post('/login', requireTrustedOrigin, loginLimit, login);
+router.post('/refresh', requireTrustedOrigin, refreshLimit, refresh);
+router.post('/logout', requireTrustedOrigin, logoutLimit, logout);
 router.post('/resend-confirmation', resendConfirmationLimit, resendConfirmation);
 router.post('/forgot-password', forgotPasswordLimit, forgotPassword);
 

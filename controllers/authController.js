@@ -66,6 +66,37 @@ const serviceUnavailable = (res) =>
 const invalidCredentials = (res) =>
   res.status(401).json({ success: false, message: 'Credenciales inválidas' });
 
+// Supabase solo responde estos códigos después de validar la contraseña, así
+// que no permiten enumerar cuentas: el front los usa para guiar al usuario.
+const SUPABASE_EMAIL_NOT_CONFIRMED = 'email_not_confirmed';
+const SUPABASE_CAPTCHA_FAILED = 'captcha_failed';
+
+const loginFailureResponse = (res, supabaseErrorCode) => {
+  if (supabaseErrorCode === SUPABASE_EMAIL_NOT_CONFIRMED) {
+    return res.status(401).json({
+      success: false,
+      code: 'EMAIL_NOT_CONFIRMED',
+      message: 'Tu cuenta todavía no está confirmada',
+    });
+  }
+  if (supabaseErrorCode === SUPABASE_CAPTCHA_FAILED) {
+    return res.status(400).json({
+      success: false,
+      code: 'CAPTCHA_FAILED',
+      message: 'No pudimos verificar que sos una persona. Reintentá.',
+    });
+  }
+  return invalidCredentials(res);
+};
+
+// Token de Cloudflare Turnstile: Supabase lo valida si el CAPTCHA está activo en
+// su panel; si no lo está, lo ignora. Acotado en largo para no reenviar basura.
+const MAX_CAPTCHA_TOKEN_LENGTH = 4096;
+const captchaMeta = (captchaToken) =>
+  typeof captchaToken === 'string' && captchaToken && captchaToken.length <= MAX_CAPTCHA_TOKEN_LENGTH
+    ? { gotrue_meta_security: { captcha_token: captchaToken } }
+    : {};
+
 const getFrontendOrigin = () =>
   (process.env.FRONTEND_URL || 'http://localhost:5173').split(',')[0].trim();
 
@@ -89,7 +120,7 @@ const maxAttemptsResponse = (res, retryAfterSeconds) => {
  */
 exports.login = async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const { email, password, captchaToken } = req.body;
     // Un email no-string (objeto/array) rompería email.toLowerCase() en el tracker de fuerza bruta.
     if (typeof email !== 'string' || typeof password !== 'string' || !email || !password) {
       return res.status(400).json({ success: false, message: 'Email y contraseña son requeridos' });
@@ -108,10 +139,18 @@ exports.login = async (req, res) => {
 
     if (!SUPABASE_URL || !SUPABASE_ANON_KEY) return serviceUnavailable(res);
 
-    const { ok, data } = await requestSupabaseToken('password', { email, password });
+    const { ok, data } = await requestSupabaseToken('password', {
+      email,
+      password,
+      ...captchaMeta(captchaToken),
+    });
     if (!ok || !data?.access_token || !data?.refresh_token) {
-      recordFailure(email);
-      return invalidCredentials(res);
+      // Un captcha fallido o una cuenta sin confirmar no cuentan como intento de adivinar la clave.
+      if (data?.error_code !== SUPABASE_CAPTCHA_FAILED && data?.error_code !== SUPABASE_EMAIL_NOT_CONFIRMED) {
+        recordFailure(email);
+      }
+      logger.warn('auth_login_failed_credentials', { supabaseErrorCode: data?.error_code });
+      return loginFailureResponse(res, data?.error_code);
     }
 
     // El id viene en la respuesta de Supabase: evita un seq scan por LOWER(email) en auth.users.
@@ -211,7 +250,7 @@ exports.logout = async (req, res) => {
  */
 exports.resendConfirmation = async (req, res) => {
   try {
-    const { email } = req.body;
+    const { email, captchaToken } = req.body;
     if (!isValidEmail(email)) {
       return res.status(400).json({ success: false, message: 'Email inválido' });
     }
@@ -229,7 +268,7 @@ exports.resendConfirmation = async (req, res) => {
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', apikey: SUPABASE_ANON_KEY },
-        body: JSON.stringify({ type: 'signup', email }),
+        body: JSON.stringify({ type: 'signup', email, ...captchaMeta(captchaToken) }),
       }
     );
 
@@ -256,7 +295,7 @@ exports.resendConfirmation = async (req, res) => {
  */
 exports.forgotPassword = async (req, res) => {
   try {
-    const { email } = req.body;
+    const { email, captchaToken } = req.body;
     if (!isValidEmail(email)) {
       return res.status(400).json({ success: false, message: 'Email inválido' });
     }
@@ -274,7 +313,7 @@ exports.forgotPassword = async (req, res) => {
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', apikey: SUPABASE_ANON_KEY },
-        body: JSON.stringify({ email }),
+        body: JSON.stringify({ email, ...captchaMeta(captchaToken) }),
       }
     );
 
