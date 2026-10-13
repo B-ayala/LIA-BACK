@@ -6,6 +6,7 @@
 - `npm audit fix`: `proxy-addr` (IP spoofing, crítica), `compression` (DoS por memory leak) y `qs`/`body-parser`/`express` (DoS por parseo) actualizados. Dependencias de producción: 0 vulnerabilidades.
 
 ### Changed
+- `GET /api/orders/user` (`Order.findPurchasesByEmail`, antes `findPaidByEmail`) devuelve también las transferencias con `origin='wa_confirmado'` (comprobante avisado) aunque sigan `pendiente`, `cancelado` o `expirado`, además de las `pagado`.
 - **`external_reference` de MP es un id de compra** (uuid por carrito guardado en `ventas.mp_external_reference` en la misma transacción de reserva) en vez de la lista de ids de venta: carritos grandes ya no superan los 256 caracteres de MP. Los pagos viejos con lista de ids se siguen resolviendo.
 - La preferencia de MP **excluye medios diferidos** (`ticket`, `atm`) y el tope de retención de stock por pago en curso baja de 72 h a **24 h**; `in_mediation` ya no retiene stock.
 - Errores del checkout con **`code` estable** (`OUT_OF_STOCK`, `SIZE_OUT_OF_STOCK`, `SIZE_UNAVAILABLE`, `SIZE_REQUIRED`, `INVALID_VARIANT`, `INVALID_PRODUCT_ID`, `PRODUCT_UNAVAILABLE`) + `productId`/`size`; todas las respuestas de error de órdenes llevan `{ success:false, code, message }`.
@@ -33,6 +34,8 @@
   reserva (tope 72 h). Nuevo `services/staleOrderSweep.js` y `utils/paymentReconciliation.js`.
 
 ### Added
+- `carousel_images.navbar_color` (hex `#rrggbb` o NULL): color del texto del menú sobre ese slide del carrusel. Migración `db/migrations/2026-10-16_add_navbar_color_to_carousel_images.sql` (aditiva e idempotente; **aplicar antes de publicar el front**). NULL conserva el comportamiento anterior (color global de Config. del sitio).
+- `carousel_images.kind` (`image` | `banner`) y `carousel_images.design` (jsonb, tope 32 KB) para los banners editables del carrusel. Migración `db/migrations/2026-10-15_add_carousel_banner_slides.sql` (aditiva e idempotente; **aplicar antes de publicar el front**: sin ella el front sigue mostrando imágenes pero no puede guardar banners).
 - `POST /api/orders/mp-cancel { orderIds }`: cancela las compras MP de un carrito con una consulta a MP por compra y responde `outcome` `released` / `held` / `paid`.
 - `PATCH /api/orders/:id/confirm-late-transfer` (admin): confirma una transferencia `expirado`, re-descuenta stock y responde `{ oversold }`.
 - `ventas.review_reason` (`amount_mismatch` / `duplicate_payment` / `refunded` / `charged_back`): el backend marca las ventas que requieren revisión del admin; el webhook detecta reembolsos y contracargos. Migración `db/migrations/2026-10-14_add_review_reason_to_ventas.sql` (**aplicar antes de desplegar**; el chequeo de arranque la incluye).

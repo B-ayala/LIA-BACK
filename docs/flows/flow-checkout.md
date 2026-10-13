@@ -60,7 +60,8 @@ El descuento de stock lo hace el **trigger `trg_decrement_stock`** (AFTER INSERT
 5. Usuario paga en Mercado Pago y vuelve a `/checkout/result?collection_status=approved&payment_id=...`.
 6. Front llama `POST /api/orders/mp-confirm { paymentId }`; el backend verifica el
    pago contra la API de MP y marca las ventas como `'pagado'`. Limpia el carrito.
-7. La compra aparece en "Mis compras" (`GET /api/orders/user?email=` — solo dueño o admin).
+7. La compra aparece en "Mis compras" (`GET /api/orders/user?email=` — solo dueño o admin). Ese
+   endpoint devuelve las `pagado` **y** las transferencias con `origin='wa_confirmado'` (en cualquier estado de pago).
 
 ## Idempotencia de la creación de órdenes
 `mp-preference` y `transfer` aceptan el header `Idempotency-Key` (8-128 caracteres
@@ -95,7 +96,9 @@ El descuento de stock lo hace el **trigger `trg_decrement_stock`** (AFTER INSERT
   abrir WhatsApp (evento `visibilitychange`), el front muestra "¿Pudiste completar tu
   compra?" y registra la respuesta vía `POST /api/orders/nudge { orderIds, response }`
   (auth, solo dueño o admin), que escribe `ventas.origin`:
-  - *Sí, ya envié el comprobante* → `origin='wa_confirmado'` (sigue `pendiente`).
+  - *Sí, ya envié el comprobante* → `origin='wa_confirmado'` (sigue `pendiente`). Desde ese
+    momento la compra aparece en "Mis compras" con el aviso "Verificando tu comprobante", y pasa a
+    `pagado` (con seguimiento de despacho), `cancelado` o `expirado` según lo que resuelva el admin.
   - *Todavía no* → `origin='wa_sin_confirmar'` (sigue `pendiente`, stock retenido).
   - *No, cancelar* → `origin='wa_abandonado'` + `'cancelado'` + stock restaurado.
   Es best-effort: si falla, el sweep de 5 h expira la orden igual. Idempotente (solo

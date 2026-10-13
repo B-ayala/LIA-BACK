@@ -19,11 +19,14 @@ const byProductId = (a, b) => (Number(a.product_id) || 0) - (Number(b.product_id
 
 class Order {
   /**
-   * Compras pagadas de un usuario, más recientes primero, paginadas.
-   * El total viaja en la misma consulta (`COUNT(*) OVER()`).
+   * Compras de un usuario para "Mis compras", más recientes primero, paginadas: las pagadas
+   * más las transferencias cuyo comprador avisó que ya envió el comprobante (`origin =
+   * 'wa_confirmado'`), en el estado que tengan (pendiente de verificación, pagada, cancelada o
+   * expirada) para que vea cuándo las resuelve el admin. El total viaja en la misma consulta
+   * (`COUNT(*) OVER()`).
    * @returns {Promise<{rows: object[], total: number}>}
    */
-  static async findPaidByEmail(email, limit, offset) {
+  static async findPurchasesByEmail(email, limit, offset) {
     const result = await pool.query(
       `SELECT id, user_id, buyer_name, buyer_email, product_id, product_name,
               product_image, quantity, unit_price, total_price, units_config,
@@ -31,7 +34,9 @@ class Order {
               mp_preference_id, origin, created_at, paid_at, dispatched_at,
               COUNT(*) OVER()::int AS total_count
          FROM public.ventas
-        WHERE LOWER(buyer_email) = LOWER($1) AND payment_status = 'pagado'
+        WHERE LOWER(buyer_email) = LOWER($1)
+          AND (payment_status = 'pagado'
+               OR (payment_method = 'transfer' AND origin = 'wa_confirmado'))
         ORDER BY created_at DESC, id DESC
         LIMIT $2 OFFSET $3`,
       [email, limit, offset]

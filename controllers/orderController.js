@@ -120,7 +120,8 @@ const createMpPreference = (req, res) => startCheckout(req, res, 'mp', buildMpCh
 const createTransferOrder = (req, res) => startCheckout(req, res, 'transfer', buildTransferCheckout);
 
 /**
- * @desc    Compras pagadas del usuario (por email). Solo el dueño o un admin.
+ * @desc    Compras del usuario (por email): pagadas + transferencias con comprobante avisado.
+ *          Solo el dueño o un admin.
  * @route   GET /api/orders/user?email=...
  */
 const getUserOrders = async (req, res) => {
@@ -138,7 +139,7 @@ const getUserOrders = async (req, res) => {
     const limit = boundedInt(req.query.limit, DEFAULT_ORDER_PAGE_SIZE, 1, MAX_ORDER_PAGE_SIZE);
     const offset = boundedInt(req.query.offset, 0, 0, Number.MAX_SAFE_INTEGER);
 
-    const { rows, total } = await Order.findPaidByEmail(email, limit, offset);
+    const { rows, total } = await Order.findPurchasesByEmail(email, limit, offset);
     return res.status(200).json({
       success: true, orders: rows, total, limit, offset, hasMore: offset + rows.length < total,
     });

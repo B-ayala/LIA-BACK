@@ -63,7 +63,9 @@ lia-store/
 │
 ├── db/migrations/             # SQL versionado (se corre en el SQL Editor de Supabase)
 │   ├── 2026-06-16_add_origin_to_ventas.sql
-│   └── 2026-08-08_add_performance_indexes.sql   # índices de las consultas calientes
+│   ├── 2026-08-08_add_performance_indexes.sql   # índices de las consultas calientes
+│   ├── 2026-10-13_payment_reconciliation_and_schema_hardening.sql  # mp_*, oversold, CHECKs
+│   └── 2026-10-14_add_review_reason_to_ventas.sql                  # ventas.review_reason
 │
 ├── routes/                    # Endpoints + su rate limit y política de caché HTTP
 │   ├── userRoutes.js          # /api/users            (login con el límite más estricto)
@@ -76,14 +78,19 @@ lia-store/
 ├── controllers/               # Lógica de cada endpoint
 │   ├── userController.js       # login, CRUD de perfiles, signup status/ratelimit, getUserByAuthId
 │   ├── productController.js    # CRUD + catálogo paginado y cacheado; errores 500 genéricos
-│   ├── orderController.js      # reserva de stock, preferencia MP, transferencias, nudge, sweep
+│   ├── orderController.js      # checkout (mp-preference / transfer), Mis compras, mp-confirm, webhook
+│   ├── orderCancellationController.js # /:id/cancel, mp-cancel, nudge
+│   ├── transferOrderController.js     # confirm / cancel / confirm-late de transferencias (admin)
 │   ├── insightsController.js   # analítica del asistente admin (cacheada 60 s)
 │   ├── shippingController.js   # cotización por código postal
 │   └── cloudinaryController.js # firma SHA1, delete, getImages, getConfig, folders
 │
 ├── models/                    # Acceso a datos (SQL parametrizado)
 │   ├── User.js                # profiles
-│   ├── Order.js               # ventas + stock (FOR UPDATE, expiración, pago tardío)
+│   ├── Order.js               # ventas + stock (FOR UPDATE, reserva, cancelación, expiración)
+│   ├── OrderPayment.js        # cobros MP: saldar, pago tardío, review_reason, conciliación
+│   ├── Product.js             # productos: catálogo, update optimista, borrado sin pendientes
+│   ├── IdempotencyKey.js      # respuestas idempotentes de checkout (idempotency_keys)
 │   └── Insights.js            # agregaciones de analítica
 │
 ├── middleware/
@@ -92,16 +99,40 @@ lia-store/
 │   ├── concurrencyLimit.js     # bulkhead + cola con timeout → 503 en vez de colapso
 │   ├── httpCache.js            # Cache-Control público / no-store
 │   ├── securityHeaders.js      # CSP/HSTS/nosniff/X-Frame-Options en toda respuesta
-│   └── signupTracker.js        # rate-limit de signup in-memory (Map por email)
+│   ├── signupTracker.js        # rate-limit de signup in-memory (Map por email)
+│   ├── validateBody.js         # validación de body con Zod
+│   └── validateParams.js       # :id de orden (uuid) y de producto (dígitos) → 400 si no cumple
+│
+├── services/                  # Casos de uso (sin req/res) y tareas periódicas
+│   ├── checkout.js            # mp-preference / transfer → { status, body }
+│   ├── checkoutReservation.js # reserva transaccional (FOR UPDATE por productId) y compensación
+│   ├── mpCancellation.js      # cancelar compras MP consultando a MP antes (released/held/paid)
+│   ├── transferResolution.js  # confirmar / cancelar / confirmar tarde transferencias
+│   ├── staleOrderSweep.js     # sweep de pendientes vencidas (rotación, concurrencia acotada)
+│   ├── closedOrderReconciliation.js # cada 15 min: pagos aprobados de compras ya cerradas
+│   └── orderMaintenance.js    # expireStaleOrders (sweep + purga idempotencia) y chequeo de migraciones
 │
 ├── utils/
 │   ├── cache.js               # caché TTL + single-flight (coalescing) e invalidación del catálogo
+│   ├── checkoutRules.js       # reglas puras del checkout: precio, envío, orden de bloqueo, códigos de error
+│   ├── unitsConfig.js         # validación/saneo de la selección de variantes por unidad
+│   ├── variantStock.js        # stock por talle (stockByOption)
+│   ├── mpPreference.js        # payload de la preferencia de MP (external_reference, medios excluidos)
+│   ├── paymentReconciliation.js # clasificación de pagos de MP (aprobado / en curso / ninguno)
+│   ├── paymentSettlement.js   # saldar pagos aprobados y marcar review_reason
+│   ├── transaction.js         # withTransaction / rollbackWith (descarta conexiones rotas)
+│   ├── lookupRotation.js      # rotación en memoria de consultas a MP por referencia
+│   ├── concurrency.js         # mapWithConcurrency
+│   ├── productUpdateQuery.js  # UPDATE parcial de productos (+ expectedUpdatedAt)
+│   ├── cloudinaryDestroy.js   # borrado de un asset de Cloudinary
+│   ├── idempotency.js         # Idempotency-Key: replay del 201 (memoria + base, fail-open)
 │   ├── logger.js              # logs estructurados JSON, nivelados por LOG_LEVEL
 │   └── mercadopago.js         # cliente de la API de Mercado Pago
 │
 ├── qa/
 │   ├── test-plan.md           # plan de pruebas (incluye TC-180–TC-193 de concurrencia y carga)
-│   └── load-test.js           # suite de carga y concurrencia sin dependencias
+│   ├── load-test.js           # suite de carga y concurrencia sin dependencias
+│   └── unit/*.test.js         # tests unitarios deterministas (`node --test qa/unit/*.test.js`)
 │
 └── docs/flows/
     ├── flow-checkout.md
@@ -127,19 +158,24 @@ routes/*           → define método + path, aplica middlewares
 middleware/*       → authMiddleware (JWT→user_id→rol) + adminMiddleware (rol === 'admin')
    │
    ▼
-controllers/*      → validación de input, orquestación, forma de la respuesta { success, data, ... }
+controllers/*      → validación de input, forma de la respuesta { success, data } / { success:false, code, message }
    │
    ▼
-models/User.js  ó  pool.query(...)   → acceso a PostgreSQL/Supabase
+services/*         → casos de uso de órdenes (transacciones, Mercado Pago), sin req/res
+   │
+   ▼
+models/*           → acceso a PostgreSQL/Supabase (SQL parametrizado)
    │
    ▼
 config/database.js → Pool de conexiones pg
 ```
 
-- **Separación de capas**: routes → controllers → (models | pool). Los controllers no definen
-  rutas; los models encapsulan SQL de `profiles`. **Excepción**: `productController` y
-  `cloudinaryController` ejecutan `pool.query` / llamadas HTTP directamente (no usan una capa
-  model dedicada).
+- **Separación de capas**: routes → controllers → services → models. Los controllers de órdenes y
+  productos no tocan la base; las reglas puras del checkout viven en `utils/` (testeadas en
+  `qa/unit`). **Excepción**: `cloudinaryController` hace llamadas HTTP directamente.
+- **Transacciones**: `utils/transaction.withTransaction` (BEGIN/COMMIT/ROLLBACK; si el ROLLBACK
+  falla, la conexión se descarta con `release(err)`). Orden de bloqueo común: filas de `ventas` por
+  `id`, filas de `productos` por `id` ascendente (evita deadlocks entre reserva, pago, cancelación y sweep).
 - **Respuesta consistente**: todas las respuestas siguen `{ success: boolean, ... }`
   (`data`, `message`, `count/total/limit/offset` en listados).
 - **Arranque ordenado** (`server.js`): primero `connectDB()` (con reintentos), recién entonces
@@ -168,10 +204,10 @@ config/database.js → Pool de conexiones pg
 | Método | Ruta | Auth | Descripción |
 |---|---|---|---|
 | GET | `/api/products` | pública | Lista paginada (`?limit&offset`, máx 100), `ORDER BY created_at DESC`. |
-| GET | `/api/products/:id` | pública | Producto por id. |
+| GET | `/api/products/:id` | pública | Producto por id. `:id` no numérico → **400 `INVALID_PRODUCT_ID`**. |
 | POST | `/api/products` | **Bearer + admin** | Crea producto. Requiere `name` y `price`. |
-| PUT | `/api/products/:id` | **Bearer + admin** | Update dinámico (solo campos presentes). |
-| DELETE | `/api/products/:id` | **Bearer + admin** | Borra producto y su imagen en Cloudinary (best-effort). |
+| PUT | `/api/products/:id` | **Bearer + admin** | Update dinámico (solo campos presentes: sin `stock` en el body, la columna `stock` no se toca). Opcional `expectedUpdatedAt` (el `updated_at` que leyó el admin, ISO con microsegundos): si no coincide con el actual → **409 `PRODUCT_CHANGED`** sin modificar nada (comparación atómica en el mismo UPDATE). |
+| DELETE | `/api/products/:id` | **Bearer + admin** | Borra el producto y después su imagen en Cloudinary (best-effort). Con ventas `pendiente` del producto → **409 `PRODUCT_HAS_PENDING_ORDERS`** (no borra). |
 
 Body de create/update (camelCase → columnas snake_case): `name`, `price`, `stock`, `category`,
 `imageUrl`/`images[]` (se sincroniza `image_url` con la primera), `publicId`, `description`,
@@ -182,14 +218,27 @@ Body de create/update (camelCase → columnas snake_case): `name`, `price`, `sto
 | Método | Ruta | Auth | Descripción |
 |---|---|---|---|
 | POST | `/api/orders/mp-webhook` | pública (server a server) | Notificación de Mercado Pago; verifica el pago contra la API de MP y marca las ventas. Rate limit 240/min. |
-| POST | `/api/orders/transfer` | **Bearer** | Crea la orden por transferencia bancaria (el trigger de la BD descuenta stock). |
-| POST | `/api/orders/mp-preference` | **Bearer** | Valida stock con `SELECT … FOR UPDATE`, inserta ventas `pendiente` y crea la preferencia MP (`init_point`, `order_ids`). **409** si no hay stock; **503** sin `MP_ACCESS_TOKEN`. |
-| POST | `/api/orders/mp-confirm` | **Bearer** | Confirma el pago verificándolo contra la API de MP (no confía en la URL de retorno) y **compara el monto acreditado** con el total de las órdenes: si no coincide, **409**. |
-| GET | `/api/orders/user?email=` | **Bearer** | Órdenes del usuario. Solo el dueño o un admin (ajeno → **403**). |
-| POST | `/api/orders/nudge` | **Bearer** | Registra el recordatorio de pago pendiente. |
-| POST | `/api/orders/:id/cancel` | **Bearer** | Cancela una orden propia y restaura stock (ajena → **403**). |
+| POST | `/api/orders/transfer` | **Bearer** | Crea la orden por transferencia bancaria (el trigger de la BD descuenta stock). Errores de stock: ver abajo. |
+| POST | `/api/orders/mp-preference` | **Bearer** | Valida stock con `SELECT … FOR UPDATE`, inserta ventas `pendiente` y crea la preferencia MP (`init_point`, `order_ids`). Errores de stock: ver abajo; **503** sin `MP_ACCESS_TOKEN`; **502 `MP_UNAVAILABLE`** si MP no responde (se libera la reserva). |
+| POST | `/api/orders/mp-confirm` | **Bearer** | Confirma el pago verificándolo contra la API de MP (no confía en la URL de retorno) y **compara el monto acreditado** con el total de las órdenes: si no coincide, **409 `AMOUNT_MISMATCH`** y las ventas quedan `review_reason='amount_mismatch'`. `orders_paid` = ventas realmente pasadas a `pagado` en esta llamada (0 si ya estaban pagadas). |
+| POST | `/api/orders/mp-cancel` | **Bearer** | Body `{ orderIds: string[] }` (1..50 uuids; si no → **400 `INVALID_ORDER_IDS`**). Cancela las compras MP de esas ventas consultando a MP **una vez por compra** (`mp_external_reference`) antes de abrir la transacción. `200 { success: true, outcome }` con `outcome` ∈ `released` (canceló y devolvió stock, o ya estaba cancelada/expirada) · `held` (pago en curso o MP no respondió: no cancela) · `paid` (pago aprobado: se salda, no cancela); agregado con precedencia `paid > held > released`. Alguna venta ajena (y no admin) → **403 `FORBIDDEN`** sin tocar nada; ids inexistentes se ignoran. Rate limit de mutaciones. |
+| GET | `/api/orders/user?email=` | **Bearer** | Compras del usuario: `pagado` + transferencias con comprobante avisado (`origin='wa_confirmado'`, cualquier `payment_status`). Solo el dueño o un admin (ajeno → **403**). |
+| POST | `/api/orders/nudge` | **Bearer** | Registra el recordatorio de pago pendiente. `orderIds` deben ser uuids (si no → **400 `INVALID_ORDER_IDS`**). |
+| POST | `/api/orders/:id/cancel` | **Bearer** | Cancela una orden propia y restaura stock, total y por talle (ajena → **403**, inexistente → **404**, no MP → **409**). Antes consulta a MP sin retener conexión del pool: pago aprobado → se salda y **409**; pago en curso → `200 { released: false }` sin cancelar. |
 | PATCH | `/api/orders/:id/confirm-transfer` | **Bearer + admin** | Confirma la transferencia → `pagado` (no re-descuenta stock). Ya resuelta → **409**. |
 | PATCH | `/api/orders/:id/cancel-transfer` | **Bearer + admin** | Cancela la transferencia → `cancelado` + stock restaurado. |
+| PATCH | `/api/orders/:id/confirm-late-transfer` | **Bearer + admin** | Confirma una transferencia **`expirado`** (pagó tarde): vuelve a descontar stock y pasa a `pagado`; si ya no hay unidades (o el producto se borró) queda `oversold = true`. `200 { success: true, oversold }`. Otro estado → **409 `ORDER_NOT_EXPIRED`**; no es transferencia → **409 `NOT_A_TRANSFER`**. |
+
+`:id` de órdenes debe ser uuid: cualquier otro formato → **400 `INVALID_ORDER_ID`** (nunca 500).
+Las respuestas de error de órdenes tienen la forma `{ success: false, code, message }`.
+
+**Errores de stock de `mp-preference` / `transfer`** (`{ success:false, code, message, productId, size? }`):
+`OUT_OF_STOCK` **409** (stock total insuficiente, producto inexistente o con `stock` NULL) ·
+`SIZE_OUT_OF_STOCK` **409** (+`size`) · `SIZE_UNAVAILABLE` **409** (+`size`, el talle ya no existe) ·
+`SIZE_REQUIRED` **400** (falta el talle de alguna unidad) · `INVALID_VARIANT` **400** (otra variante
+sin elegir o con una opción inexistente) · `INVALID_PRODUCT_ID` **400** (`productId` no numérico) ·
+`PRODUCT_UNAVAILABLE` **409** (precio no positivo). `message` es el texto humano de siempre.
+Otros: `VALIDATION_ERROR` 400, `INVALID_SHIPPING` 400, `PURCHASES_DISABLED` 403, `MP_NOT_CONFIGURED` 503.
 
 **El importe lo decide el servidor.** `reserveOrders` lee `price`/`discount`/`original_price` en el
 mismo `SELECT … FOR UPDATE` que bloquea el stock y recalcula `unit_price`/`total_price`; el
@@ -197,10 +246,20 @@ mismo `SELECT … FOR UPDATE` que bloquea el stock y recalcula `unit_price`/`tot
 (`src/utils/pricing.ts`): **si cambia una, hay que cambiar la otra**. El costo de envío se valida
 contra la tarifa de `shippingController` (`local` 0, `correo` `CORREO_COST`, `moto` variable
 acotado). Un ítem sin `productId` se rechaza con 400: sin producto no hay precio verificable.
+También salen de la base **el nombre y la imagen** de la venta y del ítem de MP (`productos.name` y
+la primera de `images`, o `image_url`); `productName`/`productImage` del body se ignoran. La
+selección de variantes (`unitsConfig`) se valida contra las variantes reales y se guarda saneada
+(`[]` si el producto no tiene variantes). El email del comprador es el de la sesión
+(`req.user.email`); el del body solo se usa si la sesión no trae email. Los productos se bloquean
+en orden de `productId`.
 
 Rate limits: checkout 12/min (`transfer`, `mp-preference`), mutaciones 40/min. Todo `no-store`.
-Además, `server.js` corre `expireStaleOrders` cada 60 s: expira pendientes vencidas (MP 15 min,
-transferencia 5 h) y restaura stock. Detalle del flujo en `docs/flows/flow-checkout.md`.
+
+`transfer` y `mp-preference` aceptan `Idempotency-Key` (replay del `201`; misma key con otro carrito → **422**, key inválida → **400**). Detalle en `docs/flows/flow-checkout.md`.
+Además, `server.js` corre `expireStaleOrders` (`services/orderMaintenance.js`) cada 60 s: expira
+pendientes vencidas (MP 15 min tras consultar a MP, con retención de hasta 24 h si hay un pago en
+curso; transferencia 5 h) y restaura stock; cada 15 min concilia compras MP cerradas de las últimas
+48 h por si MP acreditó un pago tarde. Detalle del flujo en `docs/flows/flow-checkout.md`.
 
 ### 5.4 Envíos — `/api/shipping` (`shippingRoutes.js` → `shippingController.js`)
 | Método | Ruta | Auth | Descripción |
@@ -274,11 +333,12 @@ Acceso directo con `pg` al Postgres de Supabase (esquemas `public` y `auth`).
 |---|---|---|
 | `profiles` | public | `id UUID` (FK → `auth.users.id`, ON DELETE CASCADE), `name`, `role` (`user`/`admin`), `is_owner`, `purchase_allowed_exclusive`, `created_at`. RLS habilitada; política "Users see their profile". Índice `idx_profiles_role`. **Legacy sin usar** (no las referencia ningún archivo `.js`, vacías en el 100% de las filas): `email`, `password_hash` — restos de un sistema de auth propio reemplazado por Supabase Auth. |
 | `auth.users` | auth | gestionada por Supabase Auth; se lee (`email`, `email_confirmed_at`) y se borra en cascada al eliminar perfil. |
-| `productos` | public | CRUD vía `productController`. Columnas (incluidas por `init-db`): `name`, `price`, `stock`, `category`, `image_url`, `public_id`, `description`, `discount NUMERIC(5,2)`, `condition`, `free_shipping`, `variants/specifications/features/faqs/images JSONB`, `warranty`, `return_policy`, `status`, `featured`, `created_at`, `updated_at`. |
-| `ventas` | public | Una fila = una línea de producto vendido. `id`, `user_id` (FK → `auth.users.id`, `ON DELETE SET NULL`, agregada 2026-09-18), `buyer_name`/`buyer_email` (snapshot del comprador al momento de la venta, se conservan aunque el usuario cambie el email después), `product_id` (FK, `ON DELETE SET NULL`), `product_name`/`product_image` (desnormalizado), `quantity`, `unit_price`, `total_price`, `units_config JSONB`, `payment_method` (`mp`/`transfer`), `payment_status` (`pendiente`/`pagado`/`cancelado`/`expirado`), `shipping_method`, `dispatch_status`, `mp_preference_id`, `origin` (respuesta al nudge de WhatsApp), `created_at`, `paid_at`/`cancelled_at`/`dispatched_at` (agregadas 2026-09-18, las completa el trigger `trg_set_ventas_status_timestamps`). Ver `models/Order.js` y `controllers/orderController.js`. |
+| `productos` | public | CRUD vía `productController` → `models/Product.js`. `updated_at` lo actualiza en cada UPDATE el trigger `update_productos_updated_at` (también cuando una compra descuenta stock): es la base del control optimista `expectedUpdatedAt`. Columnas (incluidas por `init-db`): `name`, `price`, `stock`, `category`, `image_url`, `public_id`, `description`, `discount NUMERIC(5,2)`, `condition`, `free_shipping`, `variants/specifications/features/faqs/images JSONB`, `warranty`, `return_policy`, `status`, `featured`, `created_at`, `updated_at`. |
+| `ventas` | public | Una fila = una línea de producto vendido. `id`, `user_id` (FK → `auth.users.id`, `ON DELETE SET NULL`, agregada 2026-09-18), `buyer_name`/`buyer_email` (snapshot del comprador al momento de la venta, se conservan aunque el usuario cambie el email después), `product_id` (FK, `ON DELETE SET NULL`), `product_name`/`product_image` (desnormalizado), `quantity`, `unit_price`, `total_price`, `units_config JSONB`, `payment_method` (`mp`/`transfer`), `payment_status` (`pendiente`/`pagado`/`cancelado`/`expirado`), `shipping_method`, `dispatch_status`, `mp_preference_id`/`mp_external_reference`/`mp_payment_id` (preferencia, **id de compra** enviado a MP como `external_reference` —uuid compartido por las líneas del carrito; en ventas anteriores es la lista de ids de venta separados por coma— y pago que saldó la venta; migración 2026-10-13), `oversold` (pago acreditado sin stock: reembolsar), `review_reason` (NULL o `amount_mismatch` / `duplicate_payment` / `refunded` / `charged_back`: requiere revisión del admin; solo detección, no cambia estado ni stock; migración 2026-10-14), `origin` (respuesta al nudge de WhatsApp), `created_at`, `paid_at`/`cancelled_at`/`dispatched_at` (agregadas 2026-09-18, las completa el trigger `trg_set_ventas_status_timestamps`). Ver `models/Order.js`, `models/OrderPayment.js` y `services/`. |
+| `idempotency_keys` | public | Respuestas `201` de `mp-preference`/`transfer` por `(scope, key)`: `fingerprint`, `status`, `body JSONB`, `created_at`. RLS activo sin policies (solo el backend). Se reutilizan 10 min; el sweep borra las de más de 24 h. Migración `2026-10-08_add_idempotency_keys.sql`; si falta, el backend usa solo memoria. |
 | `ventas_archivadas` | public | **Legacy sin usar**: mismas columnas que `ventas` + `archived_at`, con RLS y GRANTs configurados, pero ningún archivo `.js` inserta en ella. |
 | `email_tokens` / `refresh_tokens` | public | **Legacy sin usar**: 0 filas, sin código que las referencie. La confirmación de email y el reset de contraseña se resuelven contra la API de Supabase Auth (`authController.js`); la sesión usa el refresh token de Supabase en cookie httpOnly, no estas tablas. |
-| `carousel_images` | public | creada por `init-db` (`id`, `url`, `order`, `is_active`, `created_at`). La escribe el frontend directo; el backend solo la crea. |
+| `carousel_images` | public | creada por `init-db` (`id`, `url`, `order`, `is_active`, `created_at`; por migración también `device_type`, `kind` = `image`/`banner` y `design` jsonb con la composición de los banners editables, ver `2026-10-15_add_carousel_banner_slides.sql`; y `navbar_color` hex nullable con el color del menú sobre ese slide, ver `2026-10-16_add_navbar_color_to_carousel_images.sql`). La escribe el frontend directo (RLS: solo admin escribe); el backend solo la crea. |
 
 **Trigger** (`init-db`): `on_auth_user_created` → `handle_new_user()` inserta una fila en
 `profiles` (rol `user`) cada vez que se crea un usuario en `auth.users`.
@@ -319,6 +379,7 @@ de Supabase Auth y para el login.
 | `SUPABASE_ANON_KEY` | ✅ (auth) | Anon key usada en la verificación del token y en `userController`. |
 | `MP_ACCESS_TOKEN` | ✅ (Mercado Pago) | **Secreto.** Sin ella, `/api/orders/mp-*` responde **503**; la transferencia bancaria sigue funcionando. |
 | `MP_WEBHOOK_URL` | — | URL pública del webhook (`https://…/api/orders/mp-webhook`). En local no aplica salvo que expongas el backend por túnel. |
+| `ORDER_SWEEP_MAX_MP_LOOKUPS` | — (default `10`) | Tope de consultas a MP por ciclo del sweep de pendientes vencidas (4 en paralelo). |
 | `MP_WEBHOOK_SECRET` | — (recomendada en prod) | **Secreto.** Firma del webhook (panel MP → Webhooks). Si está, se valida `x-signature` y se rechaza con **401** lo que no cuadre; si falta, el webhook igual revalida cada pago contra la API de MP. |
 
 ### 8.1 Concurrencia, carga y caché (opcionales)
@@ -483,6 +544,13 @@ El frontend (`../../FRONT/damiana-bella`, repo propio) y este backend están **a
   `src/services/orderService.ts`, `shippingService`, `insightsService` y `productService`.
 - **Transferencias**: el front **no** inserta en `ventas` directo por Supabase (lo bloqueaba RLS);
   usa `POST /api/orders/transfer`, que corre con el pool del backend.
+- **Vuelta de MP sin pagar**: la `external_reference` que vuelve en la URL ya **no** son ids de
+  venta (es el id de compra). El front debe cancelar con `POST /api/orders/mp-cancel` usando los
+  `order_ids` que guardó al crear la preferencia (no parsear `external_reference`).
+- **Errores con `code`**: el checkout devuelve `code` estable (`OUT_OF_STOCK`, `SIZE_OUT_OF_STOCK`,
+  `SIZE_UNAVAILABLE`, `SIZE_REQUIRED`, …) además de `message`; `PUT /api/products/:id` acepta
+  `expectedUpdatedAt` y puede responder `409 PRODUCT_CHANGED`; `ventas.review_reason` y
+  `PATCH /:id/confirm-late-transfer` son para el panel Ventas.
 
 > Al cambiar cualquier contrato de esta lista, actualizar también
 > `../../FRONT/damiana-bella/DOCUMENTACION_FRONTEND.md` §6 en el mismo cambio.
