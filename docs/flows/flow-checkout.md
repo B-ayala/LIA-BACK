@@ -179,6 +179,10 @@ El descuento de stock lo hace el **trigger `trg_decrement_stock`** (AFTER INSERT
 - Replay de `mp-preference` sobre órdenes ya no pendientes -> 409 "Esta compra ya fue procesada, cancelada o venció...".
 - Producto del carrito sin `productId` entero -> 400 "No se pudo identificar el producto ...".
 - Producto inexistente o sin stock suficiente -> 409 "No hay stock suficiente de ..."; precio no vendible (<= 0) -> 409 "no está disponible para la venta"; nada se persiste.
+- Producto inactivo (`status` distinto de `active`) -> 409 "no está disponible para la venta", igual que un precio no vendible: el catálogo lo oculta y la API tampoco lo vende por id directo.
+- El usuario ya tiene `MAX_PENDING_LINES_PER_USER` líneas (default 30) pendientes de pago -> 429 `TOO_MANY_PENDING_ORDERS` "Tenés compras pendientes de pago. Pagalas o cancelalas antes de iniciar otra." Una repetición con la misma `Idempotency-Key` no cuenta (se resuelve antes).
+- `unitsConfig` que no sea una lista de objetos planos de texto (máximo una entrada por unidad, claves <= 60 y valores <= 100 caracteres), o `buyerName` > 120 caracteres -> 400.
+- `mp-confirm` y el webhook ignoran pagos con `paymentId` no numérico o con moneda distinta de ARS (no saldan ninguna orden).
 - Método de envío inválido o costo de moto fuera de rango -> 400.
 - Error inesperado durante la reserva -> 500 "No se pudo registrar la orden. Intentá de nuevo." con rollback.
 - Webhook con `MP_WEBHOOK_SECRET` y firma ausente/inválida -> 401.

@@ -7,6 +7,12 @@ const { CORREO_COST } = require('./shippingController');
 const { caches, invalidateProducts } = require('../utils/cache');
 const logger = require('../utils/logger');
 const { orderFingerprint } = require('../utils/orderFingerprint');
+const {
+  validateBuyerLengths,
+  validateUnitsConfig,
+  isValidPaymentId,
+  isSettleablePayment,
+} = require('../utils/orderInput');
 
 // Ventanas de expiración — deben coincidir con las que muestra el frontend
 // (MP_EXPIRY_MS / TRANSFER_EXPIRY_MS en admin/pages/Sales).
@@ -50,6 +56,18 @@ const NUDGE_ORIGIN = {
 const MAX_NUDGE_ORDERS = 50;
 
 const MAX_ORDER_ITEMS = 50;
+
+// Tope de líneas pendientes (stock reservado sin pagar) por usuario: sin él, una sola
+// cuenta podría retener el stock de todo el catálogo repitiendo reservas que recién
+// vencen a los 15 min (MP) o 5 h (transferencia).
+const DEFAULT_MAX_PENDING_LINES_PER_USER = 30;
+const maxPendingLinesPerUser = () => {
+  const configured = Number.parseInt(process.env.MAX_PENDING_LINES_PER_USER, 10);
+  return Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_MAX_PENDING_LINES_PER_USER;
+};
+const TOO_MANY_PENDING_MESSAGE =
+  'Tenés compras pendientes de pago. Pagalas o cancelalas antes de iniciar otra.';
+const TOO_MANY_PENDING_CODE = 'TOO_MANY_PENDING_ORDERS';
 const DEFAULT_ORDER_PAGE_SIZE = 200;
 const MAX_ORDER_PAGE_SIZE = 500;
 
@@ -160,6 +178,8 @@ const validateOrderPayload = ({ buyerName, buyerEmail, items, totalPrice }) => {
   if (!buyerEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(buyerEmail))) {
     return 'El email del comprador no es válido.';
   }
+  const lengthError = validateBuyerLengths({ buyerName, buyerEmail });
+  if (lengthError) return lengthError;
   if (!Array.isArray(items) || items.length === 0) {
     return 'No hay productos en el carrito para procesar la compra.';
   }
@@ -181,6 +201,8 @@ const validateOrderPayload = ({ buyerName, buyerEmail, items, totalPrice }) => {
     if (!Number.isFinite(item.totalPrice) || item.totalPrice <= 0) {
       return `El total calculado de "${item.productName}" es inválido (totalPrice).`;
     }
+    const unitsError = validateUnitsConfig(item);
+    if (unitsError) return unitsError;
   }
   if (!Number.isFinite(totalPrice) || totalPrice <= 0) return 'El total final es inválido (totalPrice).';
   return null;
@@ -322,6 +344,11 @@ const reserveLine = async (client, params, { item, index, lineSurcharge }) => {
     return fail(409, `No hay stock suficiente de "${label}".`);
   }
 
+  // Un producto inactivo no se publica en el catálogo: tampoco se puede comprar por id directo.
+  if (product.status != null && product.status !== 'active') {
+    return fail(409, `El producto "${product.name}" no está disponible para la venta.`);
+  }
+
   // El importe SIEMPRE sale de la base, nunca del body: un cliente que
   // manipule `unitPrice`/`totalPrice` termina pagando el precio real.
   const unitPrice = resolveUnitPrice(product);
@@ -356,6 +383,15 @@ const reserveLine = async (client, params, { item, index, lineSurcharge }) => {
   return { ok: true, orderId, priced };
 };
 
+/** @returns {Promise<object|null>} fallo 429 si esta compra deja al usuario por encima del tope de pendientes. */
+const checkPendingLimit = async (client, { userId, items }) => {
+  if (!userId) return null;
+  const pending = await Order.countPendingByUser(client, userId);
+  if (pending + items.length <= maxPendingLinesPerUser()) return null;
+  logger.warn('order_blocked_too_many_pending', { userId, pending });
+  return fail(429, TOO_MANY_PENDING_MESSAGE, TOO_MANY_PENDING_CODE);
+};
+
 /** Cuerpo transaccional de `reserveOrders` (BEGIN ... COMMIT). El caller maneja errores y release. */
 const runReservation = async (client, params) => {
   const { items, shippingMethod, shippingCost, idempotencyKey } = params;
@@ -379,6 +415,12 @@ const runReservation = async (client, params) => {
       await client.query('ROLLBACK');
       return replay;
     }
+  }
+
+  const pendingError = await checkPendingLimit(client, params);
+  if (pendingError) {
+    await client.query('ROLLBACK');
+    return pendingError;
   }
 
   const orderIds = [];
@@ -663,7 +705,7 @@ const getUserOrders = async (req, res) => {
 const confirmMpPayment = async (req, res) => {
   try {
     const { paymentId } = req.body;
-    if (!paymentId) {
+    if (!paymentId || !isValidPaymentId(paymentId)) {
       return res.status(400).json({ success: false, message: 'paymentId requerido' });
     }
     if (!mercadopago.isConfigured()) {
@@ -672,7 +714,7 @@ const confirmMpPayment = async (req, res) => {
 
     // El estado se verifica directo contra MP: el cliente no puede forjar un pago.
     const payment = await mercadopago.getPayment(paymentId);
-    if (!payment || payment.status !== 'approved' || !payment.external_reference) {
+    if (!isSettleablePayment(payment)) {
       return res.status(409).json({ success: false, message: 'El pago no está aprobado' });
     }
 
@@ -717,7 +759,7 @@ const parseExternalReference = (reference) =>
 
 /** Marca pagadas las órdenes de un pago aprobado; ignora pagos que no corresponde acreditar. */
 const settleApprovedPayment = async (payment, paymentId) => {
-  if (!payment || payment.status !== 'approved' || !payment.external_reference) return;
+  if (!isSettleablePayment(payment)) return;
 
   const ids = parseExternalReference(payment.external_reference);
   if (ids.length === 0) return;
@@ -773,7 +815,7 @@ const mpWebhook = async (req, res) => {
     // request sin firma válida no obtiene ni un 200 de cortesía cuando hay secreto.
     if (rejectIfSignatureInvalid(req, res, paymentId)) return;
 
-    if (topic !== 'payment' || !paymentId || !mercadopago.isConfigured()) {
+    if (topic !== 'payment' || !isValidPaymentId(paymentId) || !mercadopago.isConfigured()) {
       return res.status(200).json({ success: true });
     }
 

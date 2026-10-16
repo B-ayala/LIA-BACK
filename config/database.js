@@ -5,15 +5,24 @@ const parseIntEnv = (name, fallback) => {
   return Number.isFinite(value) && value > 0 ? value : fallback;
 };
 
+/**
+ * TLS hacia la base. Por defecto se cifra sin validar el certificado (el pooler de
+ * Supabase usa una CA propia que Node no conoce), así que un atacante en la red podría
+ * interponerse. Con DB_SSL_CA (PEM de la CA de Supabase; admite "\n" literales) se
+ * valida el certificado del servidor.
+ */
+const buildSslOptions = () => {
+  const ca = (process.env.DB_SSL_CA || '').split('\\n').join('\n').trim();
+  return ca ? { ca, rejectUnauthorized: true } : { rejectUnauthorized: false };
+};
+
 const pool = new Pool({
   host: process.env.DB_HOST,
   port: process.env.DB_PORT,
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME,
-  ssl: {
-    rejectUnauthorized: false
-  },
+  ssl: buildSslOptions(),
   // Configuración del pool. El techo real lo pone Supabase: su pooler en modo
   // sesión limita el proyecto a 15 clientes y devuelve `EMAXCONNSESSION` al
   // pasarse (verificado en carga con 800 requests concurrentes). Se deja margen

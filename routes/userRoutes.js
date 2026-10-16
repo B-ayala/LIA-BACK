@@ -17,7 +17,9 @@ const { noStore } = require('../middleware/httpCache');
 
 // Login: cada intento dispara una llamada a Supabase Auth + una query. Es el
 // endpoint clásico de fuerza bruta, así que lleva el límite más estricto.
-const loginLimit = createRateLimit({ name: 'users-login', windowMs: 60 * 1000, max: 10 });
+// Comparte el contador `auth-login` con POST /api/auth/login: con nombres distintos un atacante
+// obtenía el doble de intentos por IP alternando entre los dos endpoints.
+const loginLimit = createRateLimit({ name: 'auth-login', windowMs: 60 * 1000, max: 10 });
 
 // Endpoints auxiliares del signup: se llaman en cada tecleo del formulario en
 // algunos flujos, por eso un techo más alto pero acotado.

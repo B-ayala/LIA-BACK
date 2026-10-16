@@ -3,6 +3,14 @@
 ## [Unreleased]
 
 ### Security
+- Checkout: un producto inactivo ya no se puede comprar llamando a la API con su id (409); antes solo se ocultaba del catálogo.
+- Checkout: tope de líneas pendientes de pago por usuario (`MAX_PENDING_LINES_PER_USER`, default 30; 429 `TOO_MANY_PENDING_ORDERS`) para que una cuenta no retenga el stock del catálogo.
+- Checkout: `unitsConfig` (variantes por unidad) y `buyerName`/`buyerEmail` se validan en el borde (forma, cantidad y largo); antes se guardaba cualquier JSON del cliente.
+- Mercado Pago: `mp-confirm` y el webhook exigen `paymentId` numérico y moneda ARS del pago antes de saldar órdenes.
+- Auth: `POST /api/auth/logout` revoca la sesión en Supabase aunque el access token haya vencido (renueva con la cookie de refresh); antes el refresh token seguía vivo.
+- Auth: `POST /api/users/login` comparte el contador de rate limit con `/api/auth/login` (antes alternar endpoints duplicaba los intentos por IP).
+- Base de datos: `DB_SSL_CA` opcional valida el certificado TLS del servidor; sin ella se mantiene el comportamiento anterior.
+- Scripts SQL propuestos (sin aplicar): `db/migrations/2026-10-13_security_hardening_PROPOSED.sql`.
 - Dependencias: `npm audit fix` (incluye `proxy-addr`, que permitía falsear la IP y eludir rate limit y bloqueo de login). Quedan 3 avisos de `nodemon` (solo desarrollo).
 - Auth: `POST /api/auth/login|refresh|logout` rechazan con 403 un `Origin` fuera de la allowlist de CORS (defensa CSRF de la cookie del refresh token, que es `SameSite=None`).
 - Auth: login fallido registra `auth_login_failed_credentials` (código de Supabase, sin PII).
@@ -24,6 +32,7 @@
 - Insights: el corte de "hoy" usa rango sobre `created_at` para aprovechar el índice de ventas pagadas.
 
 ### Added
+- Tests de seguridad automatizados con `node:test` (`npm test`, sin dependencias nuevas): control de acceso, IDOR, webhook de Mercado Pago, precios del servidor, CORS/CSRF, cookies de sesión y rate limit. Corren con la base, Supabase y Mercado Pago simulados.
 - **Idempotencia de checkout**: header opcional `Idempotency-Key` (8-128 caracteres `[A-Za-z0-9_-]`) en
   `POST /api/orders/transfer` y `/mp-preference`. Un reintento con la misma key devuelve las órdenes ya
   creadas sin descontar stock de nuevo (la carrera entre dos requests se resuelve con el índice UNIQUE).

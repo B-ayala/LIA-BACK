@@ -71,13 +71,14 @@ class Order {
    * de la base, no del body del cliente.
    *
    * @returns {Promise<{stock: number, price: number, discount: number|null,
-   *   original_price: number|null, name: string, image_url: string|null}|null>}
+   *   original_price: number|null, name: string, image_url: string|null,
+   *   status: string|null}|null>}
    *   fila del producto, o null si no existe.
    */
   static async getProductForUpdate(client, productId) {
     const result = await client.query(
       `SELECT stock, price::float8 AS price, discount::float8 AS discount,
-              original_price::float8 AS original_price, name, image_url
+              original_price::float8 AS original_price, name, image_url, status
          FROM public.productos
         WHERE id = $1
           FOR UPDATE`,
@@ -96,6 +97,18 @@ class Order {
       'SELECT id FROM public.productos WHERE id = ANY($1::bigint[]) ORDER BY id FOR UPDATE',
       [productIds]
     );
+  }
+
+  /**
+   * Líneas de venta pendientes (stock reservado y sin pagar) de un usuario.
+   * Acota cuánto stock puede retener una sola cuenta sin comprar.
+   */
+  static async countPendingByUser(client, userId) {
+    const result = await client.query(
+      "SELECT COUNT(*)::int AS pending FROM public.ventas WHERE user_id = $1::uuid AND payment_status = 'pendiente'",
+      [String(userId)]
+    );
+    return result.rows[0].pending;
   }
 
   /** Suma los totales de las órdenes indicadas (control de monto de un pago). */

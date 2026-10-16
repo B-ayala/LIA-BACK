@@ -217,6 +217,26 @@ exports.refresh = async (req, res) => {
   }
 };
 
+const supabaseLogout = (accessToken) =>
+  fetch(`${SUPABASE_URL}/auth/v1/logout?scope=global`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${accessToken}`, apikey: SUPABASE_ANON_KEY },
+  });
+
+/**
+ * Revoca la sesión en Supabase. Supabase exige un access token vigente para
+ * cerrar sesión: si el del cliente venció (o no vino), se obtiene uno nuevo con
+ * el refresh token de la cookie. Sin esto, un logout con el access vencido solo
+ * borraba la cookie y el refresh token seguía siendo válido para quien lo hubiera robado.
+ */
+const revokeSession = async (accessToken, refreshToken) => {
+  if (accessToken && (await supabaseLogout(accessToken)).ok) return;
+  if (!refreshToken) return;
+
+  const { ok, data } = await requestSupabaseToken('refresh_token', { refresh_token: refreshToken });
+  if (ok && data?.access_token) await supabaseLogout(data.access_token);
+};
+
 /**
  * @desc    Logout: revoca el refresh token en Supabase (best-effort) y borra
  *          la cookie. Nunca falla del lado del cliente: un logout no puede
@@ -226,13 +246,11 @@ exports.refresh = async (req, res) => {
 exports.logout = async (req, res) => {
   const authHeader = req.headers.authorization;
   const accessToken = authHeader?.startsWith('Bearer ') ? authHeader.substring(7) : null;
+  const refreshToken = req.cookies?.[REFRESH_COOKIE_NAME];
 
-  if (SUPABASE_URL && SUPABASE_ANON_KEY && accessToken) {
+  if (SUPABASE_URL && SUPABASE_ANON_KEY && (accessToken || refreshToken)) {
     try {
-      await fetch(`${SUPABASE_URL}/auth/v1/logout?scope=global`, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${accessToken}`, apikey: SUPABASE_ANON_KEY },
-      });
+      await revokeSession(accessToken, refreshToken);
     } catch (error) {
       logger.warn('auth_logout_revoke_failed', { error: error.message });
     }
