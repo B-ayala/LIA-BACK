@@ -1,17 +1,20 @@
 -- ============================================================================
--- Endurecimiento de base de datos — 2026-10-13  (PROPUESTO: NO EJECUTADO)
+-- Endurecimiento de base de datos — 2026-10-13  (APLICADO el 2026-10-16)
 --
 -- Este script salió de la auditoría de seguridad (SECURITY_AUDIT_REPORT.md,
--- hallazgos SEC-C02, SEC-C03, SEC-C04, SEC-C05 y SEC-L01). Nadie lo aplicó:
--- necesita aprobación y se corre a mano en Supabase -> SQL Editor.
+-- hallazgos SEC-C02, SEC-C03, SEC-C04, SEC-C05 y SEC-L01). Se corrió a mano en
+-- Supabase -> SQL Editor, sección por sección (A a E).
 --
 -- Cada sección es independiente: se puede pegar y ejecutar por separado.
 -- Todo es idempotente. El backend corre como `postgres` (ignora RLS y GRANTs),
 -- así que ninguna sección cambia lo que hace la API.
 --
--- ANTES DE APLICAR: probar en un proyecto de staging o, como mínimo, correr el
--- bloque de VERIFICACION de cada sección y recorrer el panel admin
--- (productos destacados, despachos, usuarios, ventas) y el formulario de contacto.
+-- Verificado en producción: B (destacado y ABM de productos), D (mensaje de
+-- contacto de 5001 caracteres rechazado) y E (audit_log registra cambios de
+-- precio). A y C quedan por verificar con una compra real.
+--
+-- Para una base nueva (por ejemplo tras otra migración de cuenta de Supabase),
+-- correr de nuevo cada sección y su bloque de VERIFICACION.
 -- ============================================================================
 
 

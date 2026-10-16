@@ -10,7 +10,7 @@
 - Auth: `POST /api/auth/logout` revoca la sesión en Supabase aunque el access token haya vencido (renueva con la cookie de refresh); antes el refresh token seguía vivo.
 - Auth: `POST /api/users/login` comparte el contador de rate limit con `/api/auth/login` (antes alternar endpoints duplicaba los intentos por IP).
 - Base de datos: `DB_SSL_CA` opcional valida el certificado TLS del servidor; sin ella se mantiene el comportamiento anterior.
-- Scripts SQL propuestos (sin aplicar): `db/migrations/2026-10-13_security_hardening_PROPOSED.sql`.
+- Base de datos: script SQL de endurecimiento `db/migrations/2026-10-13_security_hardening.sql` (aplicado el 2026-10-16): `search_path` fijo en funciones `SECURITY DEFINER`, `productos` solo con escritura directa de `featured`, CHECK de dominio en `ventas`/`productos`, tope de largo en `contact_messages` y tabla `audit_log` con triggers.
 - Dependencias: `npm audit fix` (incluye `proxy-addr`, que permitía falsear la IP y eludir rate limit y bloqueo de login). Quedan 3 avisos de `nodemon` (solo desarrollo).
 - Auth: `POST /api/auth/login|refresh|logout` rechazan con 403 un `Origin` fuera de la allowlist de CORS (defensa CSRF de la cookie del refresh token, que es `SameSite=None`).
 - Auth: login fallido registra `auth_login_failed_credentials` (código de Supabase, sin PII).
