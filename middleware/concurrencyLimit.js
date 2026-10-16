@@ -14,6 +14,7 @@
  */
 
 const logger = require('../utils/logger');
+const { pathWithoutQuery } = require('../utils/requestPath');
 
 const parseIntEnv = (name, fallback) => {
   const value = Number.parseInt(process.env[name], 10);
@@ -132,7 +133,7 @@ const concurrencyLimit = (req, res, next) => {
       if (!release) {
         logger.warn('request_shed', {
           method: req.method,
-          path: req.originalUrl,
+          path: pathWithoutQuery(req),
           active: bulkhead.active,
           queueLength: bulkhead.queue.length,
         });

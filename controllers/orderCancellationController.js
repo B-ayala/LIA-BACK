@@ -93,7 +93,7 @@ const applyNudge = (ids, user, origin) => withTransaction('record_nudge', async 
   for (const order of actionable) await Order.setOrigin(client, order.id, origin);
   if (origin === NUDGE_ORIGIN.abandonado) await Order.cancelLockedPending(client, actionable);
   return actionable.length;
-});
+}, { actor: user.id });
 
 /**
  * @desc    Registra la respuesta del nudge post-WhatsApp del checkout transferencia.

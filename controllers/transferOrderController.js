@@ -5,7 +5,7 @@ const { resolvePendingTransfer, confirmLateTransfer } = require('../services/tra
 /** Ejecuta una resolución de transferencia y la traduce a HTTP. */
 const respondResolution = async (req, res, action, run, successBody) => {
   try {
-    const result = await run(req.params.id);
+    const result = await run(req.params.id, req.user.id);
     if (!result.ok) return sendError(res, result.status, result.code, result.message);
     return res.status(200).json(successBody(result));
   } catch (error) {
@@ -19,7 +19,7 @@ const respondResolution = async (req, res, action, run, successBody) => {
  * @route   PATCH /api/orders/:id/confirm-transfer
  */
 const confirmTransfer = (req, res) => respondResolution(req, res, 'confirm_transfer',
-  (id) => resolvePendingTransfer(id, 'pagado'),
+  (id, actor) => resolvePendingTransfer(id, 'pagado', actor),
   () => ({ success: true, message: 'Pago confirmado' }));
 
 /**
@@ -27,7 +27,7 @@ const confirmTransfer = (req, res) => respondResolution(req, res, 'confirm_trans
  * @route   PATCH /api/orders/:id/cancel-transfer
  */
 const cancelTransfer = (req, res) => respondResolution(req, res, 'cancel_transfer',
-  (id) => resolvePendingTransfer(id, 'cancelado'),
+  (id, actor) => resolvePendingTransfer(id, 'cancelado', actor),
   () => ({ success: true, message: 'Orden cancelada' }));
 
 /**

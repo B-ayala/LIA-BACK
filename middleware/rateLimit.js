@@ -13,6 +13,7 @@
  */
 
 const logger = require('../utils/logger');
+const { pathWithoutQuery } = require('../utils/requestPath');
 
 const CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
 const MAX_TRACKED_KEYS = 20000;
@@ -104,7 +105,7 @@ const createRateLimit = ({ name, windowMs, max, keyGenerator = defaultKeyGenerat
       limit: name,
       key,
       method: req.method,
-      path: req.originalUrl,
+      path: pathWithoutQuery(req),
       windowSeconds,
       max,
     });

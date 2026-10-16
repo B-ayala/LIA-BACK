@@ -3,6 +3,14 @@
 ## [Unreleased]
 
 ### Security
+- Checkout (SEC-N01): tope de **unidades por línea** (`MAX_QUANTITY_PER_LINE`, default 20; 400) y de **unidades pendientes por usuario** (`MAX_PENDING_UNITS_PER_USER`, default 60; 429 `TOO_MANY_PENDING_ORDERS`). El tope por líneas solo permitía reservar el stock completo de 30 productos con una cuenta.
+- Rate limit por usuario (SEC-N02): `POST /api/orders/transfer|mp-preference` (8/min) y `mp-confirm|mp-cancel|/:id/cancel` (20/min) cuentan por cuenta además de por IP (el límite por IP se evaluaba antes de autenticar).
+- Mercado Pago (SEC-N03): un pago `approved` con devolución parcial (`transaction_amount_refunded` > 0) se marca `review_reason = refunded` para el admin; antes solo se detectaban `refunded`/`charged_back` totales.
+- Logs (SEC-N04): rate limit, load shedding y errores no guardan la query string de la URL (`/api/orders/user?email=...` dejaba el email del cliente en los logs de la plataforma).
+- `GET /health` (SEC-N05): en producción solo devuelve `{ status, uptimeSeconds }`; el detalle (pool, bulkhead, cachés) exige `HEALTH_DETAIL_TOKEN` + header `x-health-token`. En desarrollo sigue completo.
+- Admin (SEC-N06): `adminMiddleware` ya no devuelve `error.message` al cliente; `ADMIN_REQUIRE_MFA=true` (opt-in, apagado por defecto) exige sesión `aal2` en las rutas admin. No activar hasta tener el enrolamiento TOTP en el panel.
+- Auditoría (SEC-N07): las escrituras admin del backend (productos, perfiles, transferencias, nudge) fijan `app.actor` en su transacción (`utils/transaction.js`). Falta aplicar el script SQL propuesto `db/migrations/2026-10-16_audit_actor_PROPOSED.sql` para que el trigger de `audit_log` lo lea; mientras tanto `actor` sigue en NULL y no cambia nada más.
+- Sweep (SEC-N08): el lote de vencidas excluye las compras consultadas hace menos de 5 min; las retenidas ya no dejan sin evaluar a las más nuevas.
 - Checkout: un producto inactivo ya no se puede comprar llamando a la API con su id (409 `PRODUCT_UNAVAILABLE`); antes solo se ocultaba del catálogo.
 - Checkout: tope de líneas pendientes de pago por usuario (`MAX_PENDING_LINES_PER_USER`, default 30; 429 `TOO_MANY_PENDING_ORDERS`) para que una cuenta no retenga el stock del catálogo.
 - Checkout: `buyerName` se acota a 120 caracteres y el email a 254; `unitsConfig` se valida contra las variantes reales del producto y se guarda saneado (antes se guardaba cualquier JSON del cliente).
@@ -54,6 +62,8 @@
   reserva (tope 72 h). Nuevo `services/staleOrderSweep.js` y `utils/paymentReconciliation.js`.
 
 ### Added
+- Tests de la 2.ª pasada de seguridad: `test/security-pass2.test.js` (24 tests con dobles) y `test/integration/real-db.test.js` (16 tests contra un PostgreSQL local real: última unidad concurrente, stock por talle, deadlocks, pagos, pago tardío, auditoría con actor). El de integración se saltea salvo que se defina `LIA_TEST_DB_PORT` y solo corre contra `127.0.0.1` / base `lia_test`.
+- Variables nuevas (todas opcionales, en `.env.example`): `MAX_PENDING_UNITS_PER_USER`, `MAX_QUANTITY_PER_LINE`, `HEALTH_DETAIL_TOKEN`, `ADMIN_REQUIRE_MFA`.
 - Tests de seguridad automatizados con `node:test` (`npm test`, sin dependencias nuevas): control de acceso, IDOR, webhook de Mercado Pago, precios del servidor, CORS/CSRF, cookies de sesión y rate limit. Corren con la base, Supabase y Mercado Pago simulados. `npm test` corre también los tests unitarios de `qa/unit/`.
 - `MP_WEBHOOK_SECRET` documentada (vacía) en `.env.example`.
 - **Tabla `admin_preferences`** (script SQL `db/migrations/2026-10-04_add_admin_preferences.sql`):

@@ -137,7 +137,7 @@ const expireIdsSafely = async (ids) => {
 };
 
 const sweepStaleMp = async (mpExpiryMinutes, now = Date.now()) => {
-  const stale = await Order.findStaleMpOrders(mpExpiryMinutes, STALE_BATCH_SIZE);
+  const stale = await Order.findStaleMpOrders(mpExpiryMinutes, STALE_BATCH_SIZE, rotation.recentlyChecked(now));
   const { legacyIds, groups } = groupStaleOrders(stale, mercadopago.isConfigured());
   const { lookupReferences, flaggedExpiredIds, flaggedHeld } = splitFlaggedGroups(groups, now);
 

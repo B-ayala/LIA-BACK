@@ -9,6 +9,9 @@ const { REASON, validateSizeStock } = require('./variantStock');
 const { UNITS_PROBLEM, validateUnitsConfig } = require('./unitsConfig');
 
 const MAX_ORDER_ITEMS = 50;
+// Tope de unidades de un mismo producto por línea: sin él, una sola línea podía reservar
+// todo el stock de un producto (5 h en transferencia) sin pagar nada.
+const DEFAULT_MAX_QUANTITY_PER_LINE = 20;
 const MAX_MOTO_SHIPPING_COST = 100000;
 // Se persisten tal cual en `ventas`: se acotan para no guardar texto arbitrario.
 const MAX_BUYER_NAME_LENGTH = 120;
@@ -71,12 +74,21 @@ const resolveShippingCost = (shippingMethod, rawCost) => {
   return { ok: true, cost: official };
 };
 
+/** Unidades máximas por línea (`MAX_QUANTITY_PER_LINE`, por defecto 20). */
+const maxQuantityPerLine = () => {
+  const configured = Number.parseInt(process.env.MAX_QUANTITY_PER_LINE, 10);
+  return Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_MAX_QUANTITY_PER_LINE;
+};
+
 const validateItem = (item) => {
   if (!item || !item.productName || !String(item.productName).trim()) {
     return 'Los datos del producto son inválidos (productName).';
   }
   if (!Number.isInteger(item.quantity) || item.quantity <= 0) {
     return `La cantidad seleccionada de "${item.productName}" es inválida (quantity).`;
+  }
+  if (item.quantity > maxQuantityPerLine()) {
+    return `Podés comprar hasta ${maxQuantityPerLine()} unidades de "${item.productName}" por compra.`;
   }
   if (!Number.isFinite(item.unitPrice) || item.unitPrice <= 0) {
     return `El producto "${item.productName}" no tiene un precio válido (unitPrice).`;
@@ -227,6 +239,7 @@ module.exports = {
   resolveUnitPrice,
   resolveShippingCost,
   validateOrderPayload,
+  maxQuantityPerLine,
   parseProductId,
   planReservationLines,
   evaluateLine,

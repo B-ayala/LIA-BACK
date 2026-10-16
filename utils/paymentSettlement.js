@@ -69,8 +69,19 @@ const settleApprovedPayment = async (payment) => {
   return marked;
 };
 
-const isReversedPayment = (payment) =>
-  Boolean(payment) && Object.prototype.hasOwnProperty.call(REVERSED_PAYMENT_REASON, payment.status);
+/** Un pago `approved` con devolución parcial conserva su estado: se detecta por el monto devuelto. */
+const hasPartialRefund = (payment) =>
+  Boolean(payment) && payment.status === 'approved' && Number(payment.transaction_amount_refunded) > 0;
+
+const reversalReason = (payment) => {
+  if (!payment) return null;
+  if (Object.prototype.hasOwnProperty.call(REVERSED_PAYMENT_REASON, payment.status)) {
+    return REVERSED_PAYMENT_REASON[payment.status];
+  }
+  return hasPartialRefund(payment) ? REVIEW_REASON.refunded : null;
+};
+
+const isReversedPayment = (payment) => reversalReason(payment) !== null;
 
 /**
  * Pago reembolsado o contracargado (llega por webhook): solo DETECCIÓN. Marca las
@@ -78,7 +89,7 @@ const isReversedPayment = (payment) =>
  * @returns {Promise<number>} ventas marcadas.
  */
 const flagReversedPayment = async (payment) => {
-  const reason = REVERSED_PAYMENT_REASON[payment.status];
+  const reason = reversalReason(payment);
   const ids = await resolveOrderIds(payment.external_reference);
   if (!reason || ids.length === 0) return 0;
 

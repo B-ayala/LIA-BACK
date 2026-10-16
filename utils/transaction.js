@@ -12,6 +12,7 @@
  */
 
 const logger = require('./logger');
+const { isUuid } = require('./uuid');
 
 const ROLLBACK_MARK = Symbol('rollback');
 
@@ -30,11 +31,24 @@ const rollbackSafely = async (client, context) => {
   }
 };
 
-const createTransactionRunner = (pool) => async (context, work) => {
+/**
+ * Atribuye los cambios de la transacción en curso a un usuario (`audit_log.actor`).
+ * El backend conecta como `postgres`, así que `auth.uid()` es NULL; el trigger de
+ * auditoría lee este valor local (`set_config(..., true)` solo dura hasta el
+ * COMMIT/ROLLBACK, no queda en la conexión del pool). Solo se acepta un uuid: un
+ * id mal formado rompería el cast del trigger y abortaría la escritura auditada.
+ */
+const setTransactionActor = async (client, actor) => {
+  if (!isUuid(actor)) return;
+  await client.query("SELECT set_config('app.actor', $1, true)", [String(actor).toLowerCase()]);
+};
+
+const createTransactionRunner = (pool) => async (context, work, { actor = null } = {}) => {
   const client = await pool.connect();
   let brokenConnection = null;
   try {
     await client.query('BEGIN');
+    await setTransactionActor(client, actor);
     const result = await work(client);
     if (isRollback(result)) {
       brokenConnection = await rollbackSafely(client, context);
@@ -50,10 +64,10 @@ const createTransactionRunner = (pool) => async (context, work) => {
   }
 };
 
-const withTransaction = (context, work) => {
+const withTransaction = (context, work, options) => {
   // Import diferido: los tests unitarios usan createTransactionRunner con un pool falso.
   const { pool } = require('../config/database');
-  return createTransactionRunner(pool)(context, work);
+  return createTransactionRunner(pool)(context, work, options);
 };
 
-module.exports = { withTransaction, rollbackWith, createTransactionRunner };
+module.exports = { withTransaction, rollbackWith, createTransactionRunner, setTransactionActor };

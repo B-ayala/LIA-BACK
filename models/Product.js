@@ -4,17 +4,20 @@ const { buildProductAssignments, buildProductUpdateStatement } = require('../uti
 
 /** Acceso a datos de productos (tabla public.productos) para el CRUD de admin y el catálogo. */
 class Product {
-  static async create(fields) {
-    const result = await pool.query(
-      `INSERT INTO public.productos
-       (name, price, stock, category, image_url, public_id, description,
-        discount, condition, free_shipping, hover_image_enabled, variants, specifications, features, faqs,
-        warranty, return_policy, size_guide, status, images, original_price)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
-       RETURNING *`,
-      fields
-    );
-    return result.rows[0];
+  /** `actor`: uuid del admin que crea el producto (queda en audit_log.actor). */
+  static async create(fields, actor) {
+    return withTransaction('create_product', async (client) => {
+      const result = await client.query(
+        `INSERT INTO public.productos
+         (name, price, stock, category, image_url, public_id, description,
+          discount, condition, free_shipping, hover_image_enabled, variants, specifications, features, faqs,
+          warranty, return_policy, size_guide, status, images, original_price)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+         RETURNING *`,
+        fields
+      );
+      return result.rows[0];
+    }, { actor });
   }
 
   /**
@@ -52,17 +55,19 @@ class Product {
    * UPDATE parcial con control optimista opcional.
    * @returns {Promise<{status: 'updated', product: object} | {status: 'empty'|'not_found'|'changed'}>}
    */
-  static async update(id, body, expectedUpdatedAt) {
+  static async update(id, body, expectedUpdatedAt, actor) {
     const assignments = buildProductAssignments(body);
     if (assignments.length === 0) return { status: 'empty' };
 
     const statement = buildProductUpdateStatement(id, assignments, expectedUpdatedAt);
-    const result = await pool.query(statement.text, statement.values);
-    if (result.rows[0]) return { status: 'updated', product: result.rows[0] };
-    if (!expectedUpdatedAt) return { status: 'not_found' };
+    return withTransaction('update_product', async (client) => {
+      const result = await client.query(statement.text, statement.values);
+      if (result.rows[0]) return { status: 'updated', product: result.rows[0] };
+      if (!expectedUpdatedAt) return { status: 'not_found' };
 
-    const exists = await pool.query('SELECT 1 FROM public.productos WHERE id = $1', [id]);
-    return { status: exists.rowCount > 0 ? 'changed' : 'not_found' };
+      const exists = await client.query('SELECT 1 FROM public.productos WHERE id = $1', [id]);
+      return { status: exists.rowCount > 0 ? 'changed' : 'not_found' };
+    }, { actor });
   }
 
   /**
@@ -73,7 +78,7 @@ class Product {
    * @returns {Promise<{status: 'not_found'|'has_pending_orders'} |
    *   {status: 'deleted', publicId: string|null, imageShared: boolean}>}
    */
-  static async deleteIfNoPendingOrders(id) {
+  static async deleteIfNoPendingOrders(id, actor) {
     return withTransaction('delete_product', async (client) => {
       const product = await client.query('SELECT public_id FROM public.productos WHERE id = $1 FOR UPDATE', [id]);
       if (product.rowCount === 0) return rollbackWith({ status: 'not_found' });
@@ -90,7 +95,7 @@ class Product {
         : { rowCount: 0 };
       await client.query('DELETE FROM public.productos WHERE id = $1', [id]);
       return { status: 'deleted', publicId, imageShared: shared.rowCount > 0 };
-    });
+    }, { actor });
   }
 }
 

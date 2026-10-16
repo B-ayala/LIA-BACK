@@ -95,15 +95,18 @@ class Order {
   }
 
   /**
-   * Líneas de venta pendientes (stock reservado y sin pagar) de un usuario.
+   * Líneas y unidades de venta pendientes (stock reservado y sin pagar) de un usuario.
    * Acota cuánto stock puede retener una sola cuenta sin comprar.
+   * @returns {Promise<{lines: number, units: number}>}
    */
   static async countPendingByUser(client, userId) {
     const result = await client.query(
-      "SELECT COUNT(*)::int AS pending FROM public.ventas WHERE user_id = $1::uuid AND payment_status = 'pendiente'",
+      `SELECT COUNT(*)::int AS pending, COALESCE(SUM(quantity), 0)::int AS units
+         FROM public.ventas WHERE user_id = $1::uuid AND payment_status = 'pendiente'`,
       [String(userId)]
     );
-    return result.rows[0].pending;
+    const row = result.rows[0];
+    return { lines: row.pending, units: Number(row.units) || 0 };
   }
 
   /** Guarda el desglose de stock por talle (la fila del producto ya está bloqueada por el caller). */
@@ -182,16 +185,22 @@ class Order {
     return pending.length;
   }
 
-  /** Órdenes de MP pendientes cuyo plazo venció, las más viejas primero (candidatas a expirar). */
-  static async findStaleMpOrders(mpExpiryMinutes, limit) {
+  /**
+   * Órdenes de MP pendientes cuyo plazo venció, las más viejas primero (candidatas a expirar).
+   * `skipReferences`: compras ya consultadas hace poco y retenidas. Sin excluirlas, las
+   * `limit` más viejas serían siempre las mismas retenidas (pago en curso, MP caído) y las
+   * vencidas más nuevas nunca llegarían a evaluarse (stock acaparado de más).
+   */
+  static async findStaleMpOrders(mpExpiryMinutes, limit, skipReferences = []) {
     const result = await pool.query(
       `SELECT id, mp_external_reference, review_reason, created_at
          FROM public.ventas
         WHERE payment_method = 'mp' AND payment_status = 'pendiente'
           AND created_at < NOW() - ($1 || ' minutes')::interval
+          AND (mp_external_reference IS NULL OR mp_external_reference <> ALL($3::text[]))
         ORDER BY created_at
         LIMIT $2`,
-      [String(mpExpiryMinutes), limit]
+      [String(mpExpiryMinutes), limit, skipReferences.map(String)]
     );
     return result.rows;
   }

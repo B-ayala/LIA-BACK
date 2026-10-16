@@ -23,6 +23,15 @@ const { validateOrderIdParam } = require('../middleware/validateParams');
 // y cortante para un script que intente vaciar el stock a fuerza de reservas.
 const checkoutLimit = createRateLimit({ name: 'orders-checkout', windowMs: 60 * 1000, max: 12 });
 
+// El límite por IP se evalúa ANTES de autenticar (no hay usuario todavía). Estos dos van
+// DESPUÉS de `authMiddleware` y cuentan por usuario: una cuenta no esquiva el tope
+// rotando de IP, ni una oficina detrás de un NAT se bloquea entre sí.
+const checkoutUserLimit = createRateLimit({ name: 'orders-checkout-user', windowMs: 60 * 1000, max: 8 });
+
+// Cada cancelación / confirmación de pago puede costar una consulta a la API de MP
+// (cuota compartida de la cuenta de la tienda): se acota por usuario.
+const mpLookupUserLimit = createRateLimit({ name: 'orders-mp-lookup-user', windowMs: 60 * 1000, max: 20 });
+
 // Mutaciones de estado sobre órdenes propias.
 const orderMutationLimit = createRateLimit({ name: 'orders-mutation', windowMs: 60 * 1000, max: 40 });
 
@@ -40,13 +49,13 @@ router.param('id', validateOrderIdParam);
 router.post('/mp-webhook', webhookLimit, mpWebhook);
 
 // ─── Usuario autenticado ───
-router.post('/transfer', checkoutLimit, authMiddleware, createTransferOrder);
-router.post('/mp-preference', checkoutLimit, authMiddleware, createMpPreference);
-router.post('/mp-confirm', orderMutationLimit, authMiddleware, confirmMpPayment);
-router.post('/mp-cancel', orderMutationLimit, authMiddleware, cancelMpOrders);
+router.post('/transfer', checkoutLimit, authMiddleware, checkoutUserLimit, createTransferOrder);
+router.post('/mp-preference', checkoutLimit, authMiddleware, checkoutUserLimit, createMpPreference);
+router.post('/mp-confirm', orderMutationLimit, authMiddleware, mpLookupUserLimit, confirmMpPayment);
+router.post('/mp-cancel', orderMutationLimit, authMiddleware, mpLookupUserLimit, cancelMpOrders);
 router.get('/user', orderMutationLimit, authMiddleware, getUserOrders);
 router.post('/nudge', orderMutationLimit, authMiddleware, recordNudge);
-router.post('/:id/cancel', orderMutationLimit, authMiddleware, cancelOrder);
+router.post('/:id/cancel', orderMutationLimit, authMiddleware, mpLookupUserLimit, cancelOrder);
 
 // ─── Solo admin ───
 router.patch('/:id/confirm-transfer', orderMutationLimit, authMiddleware, adminMiddleware, confirmTransfer);

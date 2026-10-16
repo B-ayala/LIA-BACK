@@ -24,6 +24,10 @@ const createLookupRotation = ({ minIntervalMs = 0, maxEntries = DEFAULT_MAX_ENTR
       .sort((a, b) => checkedAt(a) - checkedAt(b))
       .slice(0, limit);
 
+  /** Referencias consultadas hace menos de `minIntervalMs`: todavía no les toca una nueva consulta. */
+  const recentlyChecked = (now = Date.now()) =>
+    [...lastCheckedAt].filter(([, at]) => now - at < minIntervalMs).map(([reference]) => reference);
+
   const markChecked = (reference, now = Date.now()) => {
     lastCheckedAt.delete(reference);
     lastCheckedAt.set(reference, now);
@@ -40,7 +44,7 @@ const createLookupRotation = ({ minIntervalMs = 0, maxEntries = DEFAULT_MAX_ENTR
     }
   };
 
-  return { pick, markChecked, forget, pruneOlderThan, size: () => lastCheckedAt.size };
+  return { pick, recentlyChecked, markChecked, forget, pruneOlderThan, size: () => lastCheckedAt.size };
 };
 
 module.exports = { createLookupRotation };

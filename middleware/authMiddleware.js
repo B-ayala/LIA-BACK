@@ -194,6 +194,27 @@ const optionalAuth = async (req, _res, next) => {
 };
 
 /**
+ * Nivel de aseguramiento de la sesión (`aal` del JWT de Supabase: aal1 = solo contraseña,
+ * aal2 = además segundo factor). Se lee SIN verificar firma a propósito: `authMiddleware`
+ * ya validó el token contra Supabase Auth, así que acá solo se interpreta su contenido.
+ */
+const tokenAssuranceLevel = (token) => {
+  try {
+    const payload = JSON.parse(Buffer.from(String(token).split('.')[1], 'base64url').toString('utf8'));
+    return payload && typeof payload.aal === 'string' ? payload.aal : null;
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * MFA para admin, opt-in: con `ADMIN_REQUIRE_MFA=true` las rutas admin exigen una sesión aal2.
+ * NO activar hasta que el panel tenga el enrolamiento/desafío TOTP de Supabase, o el admin
+ * queda bloqueado (ver SEC-A04 en SECURITY_AUDIT_REPORT.md).
+ */
+const mfaRequired = () => String(process.env.ADMIN_REQUIRE_MFA || '').trim().toLowerCase() === 'true';
+
+/**
  * Middleware para validar rol de administrador
  * Debe usarse DESPUÉS de authMiddleware
  */
@@ -213,12 +234,22 @@ const adminMiddleware = (req, res, next) => {
       });
     }
 
+    if (mfaRequired() && tokenAssuranceLevel(req.token) !== 'aal2') {
+      logger.warn('admin_mfa_required', { userId: req.user.id });
+      return res.status(403).json({
+        success: false,
+        code: 'MFA_REQUIRED',
+        message: 'Se requiere verificación en dos pasos para operar como administrador'
+      });
+    }
+
     next();
   } catch (error) {
+    // El detalle va al log: `error.message` puede traer internals y no se le muestra al cliente.
+    logger.error('admin_role_check_failed', { error: error.message });
     return res.status(500).json({
       success: false,
-      message: 'Error al validar rol',
-      error: error.message
+      message: 'Error al validar rol'
     });
   }
 };
@@ -226,5 +257,6 @@ const adminMiddleware = (req, res, next) => {
 module.exports = {
   authMiddleware,
   optionalAuth,
-  adminMiddleware
+  adminMiddleware,
+  tokenAssuranceLevel
 };

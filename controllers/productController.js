@@ -81,7 +81,7 @@ const toInsertValues = (body) => {
 // marcado "Sin stock" y no se puede comprar (el front pide confirmación antes).
 const createProduct = async (req, res) => {
   try {
-    const product = await Product.create(toInsertValues(req.body));
+    const product = await Product.create(toInsertValues(req.body), req.user.id);
     invalidateProducts();
     return res.status(201).json({ success: true, data: product });
   } catch (error) {
@@ -144,7 +144,7 @@ const UPDATE_FAILURES = {
 const updateProduct = async (req, res) => {
   try {
     const { expectedUpdatedAt, ...fields } = req.body;
-    const result = await Product.update(req.params.id, fields, expectedUpdatedAt);
+    const result = await Product.update(req.params.id, fields, expectedUpdatedAt, req.user.id);
     if (result.status !== 'updated') {
       const [status, code, message] = UPDATE_FAILURES[result.status];
       return sendError(res, status, code, message);
@@ -176,7 +176,7 @@ const removeProductImage = async ({ publicId, imageShared }) => {
 
 const deleteProduct = async (req, res) => {
   try {
-    const result = await Product.deleteIfNoPendingOrders(req.params.id);
+    const result = await Product.deleteIfNoPendingOrders(req.params.id, req.user.id);
     if (result.status === 'not_found') return sendError(res, 404, 'PRODUCT_NOT_FOUND', PRODUCT_NOT_FOUND_MESSAGE);
     if (result.status === 'has_pending_orders') {
       return sendError(res, 409, 'PRODUCT_HAS_PENDING_ORDERS',

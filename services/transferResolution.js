@@ -44,7 +44,7 @@ const notExpiredConflict = (current) => ({
 });
 
 /** Confirma (`pagado`) o cancela (`cancelado`) una transferencia pendiente. */
-const resolvePendingTransfer = async (orderId, targetStatus) => {
+const resolvePendingTransfer = async (orderId, targetStatus, actor) => {
   const result = await withTransaction(`resolve_transfer_${targetStatus}`, async (client) => {
     const order = await Order.findByIdForUpdate(client, orderId);
     const problem = findTransferProblem(order, 'pendiente', notPendingConflict);
@@ -56,7 +56,7 @@ const resolvePendingTransfer = async (orderId, targetStatus) => {
       await Order.setStatus(client, order.id, targetStatus);
     }
     return { ok: true };
-  });
+  }, { actor });
   if (result.ok && targetStatus === 'cancelado') invalidateProducts();
   return result;
 };
@@ -65,7 +65,7 @@ const resolvePendingTransfer = async (orderId, targetStatus) => {
  * Confirma una transferencia que ya había expirado (el comprador pagó tarde).
  * @returns {Promise<{ok: true, oversold: boolean} | {ok: false, status: number, code: string, message: string}>}
  */
-const confirmLateTransfer = async (orderId) => {
+const confirmLateTransfer = async (orderId, actor) => {
   const result = await withTransaction('confirm_late_transfer', async (client) => {
     const order = await Order.findByIdForUpdate(client, orderId);
     const problem = findTransferProblem(order, 'expirado', notExpiredConflict);
@@ -74,7 +74,7 @@ const confirmLateTransfer = async (orderId) => {
     const rededucted = await OrderPayment.redeductForLatePayment(client, order);
     await OrderPayment.markLateTransferPaid(client, order.id, !rededucted);
     return { ok: true, oversold: !rededucted, productId: order.product_id, quantity: order.quantity };
-  });
+  }, { actor });
   if (!result.ok) return result;
 
   invalidateProducts();

@@ -11,8 +11,10 @@ const { corsOptions } = require('./config/cors');
 const { concurrencyLimit, concurrencyStats } = require('./middleware/concurrencyLimit');
 const { createRateLimit, rateLimitStats } = require('./middleware/rateLimit');
 const { securityHeaders } = require('./middleware/securityHeaders');
+const { canSeeHealthDetail } = require('./middleware/healthAccess');
 const { cacheStats } = require('./utils/cache');
 const logger = require('./utils/logger');
+const { pathWithoutQuery } = require('./utils/requestPath');
 const authRoutes = require('./routes/authRoutes');
 const userRoutes = require('./routes/userRoutes');
 const cloudinaryRoutes = require('./routes/cloudinaryRoutes');
@@ -82,10 +84,12 @@ app.get('/', (req, res) => {
 // Ruta de health check. Queda fuera del rate limit y del bulkhead a propósito:
 // tiene que responder incluso con el servidor saturado, que es justo cuando más
 // se necesita leer estas métricas.
-app.get('/health', (_req, res) => {
-  res.json({
-    status: 'OK',
-    uptimeSeconds: Math.round(process.uptime()),
+app.get('/health', (req, res) => {
+  const base = { status: 'OK', uptimeSeconds: Math.round(process.uptime()) };
+  // El detalle interno (pool, bulkhead, cachés) no es público en producción: ver healthAccess.
+  if (!canSeeHealthDetail(req)) return res.json(base);
+  return res.json({
+    ...base,
     db: getPoolStats(),
     concurrency: concurrencyStats(),
     rateLimit: rateLimitStats(),
@@ -111,7 +115,7 @@ app.use((err, req, res, _next) => {
     return res.status(400).json({ success: false, code: 'INVALID_JSON', message: 'El cuerpo de la solicitud no es JSON válido' });
   }
 
-  logger.error('unhandled_error', { method: req.method, path: req.originalUrl, error: err.message });
+  logger.error('unhandled_error', { method: req.method, path: pathWithoutQuery(req), error: err.message });
   res.status(500).json({
     success: false,
     message: process.env.NODE_ENV === 'production'

@@ -1,4 +1,5 @@
 const { pool } = require('../config/database');
+const { setTransactionActor } = require('../utils/transaction');
 
 class User {
   /**
@@ -109,11 +110,12 @@ class User {
   /**
    * Actualizar perfil de usuario
    */
-  static async findByIdAndUpdate(id, updateData) {
+  static async findByIdAndUpdate(id, updateData, actor) {
     const client = await pool.connect();
     
     try {
       await client.query('BEGIN');
+      await setTransactionActor(client, actor);
 
       const { name, role, purchase_allowed_exclusive: purchaseAllowedExclusive } = updateData;
       const updates = [];
@@ -220,11 +222,12 @@ class User {
   /**
    * Eliminar usuario
    */
-  static async findByIdAndDelete(id) {
+  static async findByIdAndDelete(id, actor) {
     const client = await pool.connect();
     
     try {
       await client.query('BEGIN');
+      await setTransactionActor(client, actor);
 
       const ownerCheck = await client.query(
         'SELECT is_owner FROM public.profiles WHERE id = $1',

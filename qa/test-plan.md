@@ -1460,6 +1460,136 @@ Pasos:
   2. `EXPLAIN` de la consulta de `Insights` con `created_at >= inicio_de_hoy AND created_at < inicio_de_hoy + 1 day`
 Esperado: el resultado incluye solo ventas del día local; el plan puede usar `idx_ventas_paid_created`
   (rango sargable sobre `created_at` en lugar de `date_trunc` sobre la columna)
+### Segunda pasada de seguridad (2026-10-16)
+
+ID: TC-334
+Caso: Una sola línea no puede reservar todo el stock de un producto
+Tipo: security
+Pre-condición: producto activo con stock >= 25; usuario común logueado
+Pasos:
+  1. POST /api/orders/transfer con un ítem de quantity 21
+  2. Repetir con quantity 20
+  3. Con MAX_QUANTITY_PER_LINE=3 en el entorno, probar quantity 4 y 3
+Esperado: paso 1 -> 400 VALIDATION_ERROR sin filas nuevas en ventas ni cambio de stock; paso 2 -> 201;
+  paso 3 -> 400 y 201
+Resultado: OK 2026-10-16 con dobles (test/security-pass2.test.js, SEC-N01); falla en el código anterior
+
+ID: TC-335
+Caso: Tope de unidades pendientes por cuenta (MAX_PENDING_UNITS_PER_USER, default 60)
+Tipo: security
+Pre-condición: usuario común sin pendientes; producto con stock >= 100
+Pasos:
+  1. Crear 3 compras de 20 unidades por transferencia (quedan pendientes)
+  2. Pedir 1 unidad más
+  3. Cancelar una de las 3 y repetir el paso 2
+Esperado: paso 2 -> 429 TOO_MANY_PENDING_ORDERS sin reservar; paso 3 -> 201 (se liberaron 20)
+Resultado: OK 2026-10-16 contra PostgreSQL local real (test/integration/real-db.test.js); stock final 440 de 500
+
+ID: TC-336
+Caso: Rate limit de checkout por cuenta (no solo por IP)
+Tipo: security
+Pasos:
+  1. Con el usuario A, hacer 9 POST /api/orders/transfer en menos de 1 minuto
+  2. Sin esperar, con el usuario B desde la misma IP, hacer 1 POST
+Esperado: la 9.ª de A -> 429 RATE_LIMITED con Retry-After; B no recibe 429
+Resultado: OK 2026-10-16 con dobles (SEC-N02). Falta confirmar en Render, detrás de Cloudflare, qué IP ve req.ip (ver SEC-N09)
+
+ID: TC-337
+Caso: La misma Idempotency-Key de dos usuarios no cruza respuestas
+Tipo: security
+Pasos:
+  1. Usuario A hace POST /transfer con Idempotency-Key K
+  2. Usuario B hace POST /transfer con la misma K y su propio carrito
+  3. A repite con K y el mismo carrito; luego con K y otro carrito
+Esperado: B recibe SUS propios order_ids; A recibe lo mismo sin reservar otra vez; con otro carrito 422
+  IDEMPOTENCY_KEY_REUSED
+Resultado: OK 2026-10-16 con dobles (control ya existente, ahora fijado por test)
+
+ID: TC-338
+Caso: Devolución parcial de un pago aprobado queda marcada para el admin
+Tipo: failure
+Pre-condición: sandbox de Mercado Pago, una compra pagada
+Pasos:
+  1. Devolver parte del importe desde el panel de MP
+  2. Esperar la notificación (o reenviar el webhook firmado desde el panel de MP)
+Esperado: la venta sigue 'pagado', queda review_reason = 'refunded', log payment_reversed; el stock no cambia
+Resultado: OK 2026-10-16 con dobles y contra PostgreSQL local real (SEC-N03). Pendiente con MP sandbox
+
+ID: TC-339
+Caso: Los logs no guardan emails de la query string
+Tipo: security
+Pasos:
+  1. Superar el rate limit de GET /api/orders/user?email=<email de prueba> (40/min)
+  2. Revisar el log rate_limit_blocked
+Esperado: path = /api/orders/user, sin el email
+Resultado: OK 2026-10-16 con dobles (SEC-N04)
+
+ID: TC-340
+Caso: Pruebas de integración contra un PostgreSQL local aislado
+Tipo: edge / concurrencia
+Pre-condición: PostgreSQL 16 local con SSL activo (initdb, ssl = on con certificado autofirmado), base lia_test
+  con db/migracion-nueva-cuenta/01_schema_public.sql (sin las extensiones de Supabase), un esquema auth con
+  users(id, email, raw_user_meta_data) y auth.uid(), los roles anon / authenticated / service_role, y los scripts
+  de db/migrations/ aplicados en orden de fecha
+Pasos:
+  1. LIA_TEST_DB_PORT=<puerto> npm test
+Esperado: los 16 tests de test/integration/real-db.test.js pasan: 25 compradores de la última unidad -> 1 gana;
+  última unidad de un talle; 20 carritos cruzados sin deadlock; tope de 60 unidades; pagos (monto menor, duplicado,
+  tardío con y sin stock); doble cancelación simultánea; SQL de IdempotencyKey, findPurchasesByEmail, expiración,
+  conciliación y devoluciones; barrido; auditoría con actor
+Resultado: OK 2026-10-16 (16/16). Sin LIA_TEST_DB_PORT los tests se saltean. Nunca apuntar a la base de Supabase
+Notas: reemplaza a qa/concurrency-stock-test.js, que importa reserveOrders de un módulo que ya no la exporta
+
+ID: TC-341
+Caso: GET /health en producción no expone el detalle interno
+Tipo: security
+Pasos:
+  1. GET /health sin header
+  2. Con HEALTH_DETAIL_TOKEN definido, GET /health con x-health-token correcto e incorrecto
+Esperado: 1 -> solo { status, uptimeSeconds }; 2 -> detalle solo con el token correcto
+Resultado: OK 2026-10-16 con dobles (SEC-N05). Verificado en vivo ANTES del cambio: lia-back.onrender.com/health devolvía pool, bulkhead y cachés
+
+ID: TC-342
+Caso: MFA de admin (opt-in)
+Tipo: security
+Pre-condición: ADMIN_REQUIRE_MFA=true, TOTP de Supabase activado y enrolado para el admin de prueba
+Pasos:
+  1. Con sesión de solo contraseña (aal1) llamar a una ruta admin
+  2. Verificar el segundo factor y repetir con el token nuevo (aal2)
+Esperado: 1 -> 403 MFA_REQUIRED; 2 -> la ruta responde normal; usuario común -> 403 igual
+Resultado: lógica OK 2026-10-16 con dobles (SEC-N06). No probado con Supabase real: el panel no tiene el desafío TOTP
+
+ID: TC-343
+Caso: audit_log atribuye al admin los cambios hechos por la API
+Tipo: security
+Pre-condición: script 2026-10-16_audit_actor_PROPOSED.sql aplicado (hoy pendiente de aprobación)
+Pasos:
+  1. Desde el panel (PUT /api/products/:id) cambiar el precio del producto de prueba
+  2. SELECT at, actor, table_name FROM public.audit_log ORDER BY id DESC LIMIT 3
+  3. Dejar que el sweep expire una orden (sin usuario)
+Esperado: paso 2 -> actor = uuid del admin; paso 3 -> actor NULL (sistema); un actor mal formado no rompe la escritura
+Resultado: OK 2026-10-16 contra PostgreSQL local real (SEC-N07); falta aplicarlo en Supabase
+
+ID: TC-344
+Caso: El barrido no se queda siempre con las mismas compras retenidas
+Tipo: edge
+Pasos:
+  1. Tener >= 1 compra de MP retenida (pago en curso) consultada hace < 5 min y otra vencida sin consultar
+  2. Ejecutar un ciclo del sweep
+Esperado: la retenida no vuelve a salir en el lote; la otra se evalúa
+Resultado: OK 2026-10-16 contra PostgreSQL local real (SEC-N08)
+
+ID: TC-345
+Caso: Matriz de permisos por rol contra el esquema real (anon / usuario / admin)
+Tipo: security
+Pre-condición: base local de TC-340 con los scripts de RLS
+Pasos:
+  1. Con SET LOCAL ROLE y request.jwt.claim.sub, ejecutar SELECT / UPDATE / INSERT / DELETE sobre ventas, productos,
+     profiles, audit_log, contact_messages y las funciones SECURITY DEFINER para anon, un usuario común y un admin
+Esperado: anon y usuario común sin acceso a ventas ni audit_log; usuario sin escritura en productos ni en profiles;
+  admin solo UPDATE de productos.featured y de ventas.dispatch_status; EXECUTE de las funciones definer denegado
+Resultado: OK 2026-10-16 (35 verificaciones, todas como se esperaba; la de site_content quedó inconclusa por tabla vacía). Es el esquema de los scripts, no la base de Supabase
+
 ### Idempotencia de creación de órdenes (`Idempotency-Key`)
 
 ```
@@ -1630,6 +1760,10 @@ Resultado: no probado
 | Insights (rango sargable) | — | TC-333 | — | — | — |
 | Conciliación MP / mp-cancel / review_reason (2026-10-14) | TC-253/256/262/266 | TC-254/255/258/263/264/270 | TC-257/259/260/261/265/267 | TC-268/269/271 | TC-272/273 |
 | Productos: edición optimista y borrado | TC-274 | TC-276 | TC-275/277 | TC-278 | TC-275 |
+| Acaparamiento de stock / rate limit por cuenta | — | TC-334/335 | — | TC-334/335/336 | TC-340 |
+| Idempotencia entre usuarios | — | — | — | TC-337 | — |
+| Devoluciones parciales y auditoría con actor | — | TC-338 | — | TC-343 | — |
+| Hardening (logs, /health, MFA opt-in, RLS por rol) | — | TC-344 | — | TC-339/341/342/345 | TC-340 |
 
 ## Cross-browser / device
 Probado en Chrome desktop (Playwright). Pendiente: Safari iOS, Chrome Android

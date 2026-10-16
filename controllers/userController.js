@@ -235,7 +235,7 @@ exports.updateUser = async (req, res) => {
       });
     }
 
-    const user = await User.findByIdAndUpdate(id, updateData);
+    const user = await User.findByIdAndUpdate(id, updateData, req.user.id);
 
     if (!user) {
       return res.status(404).json({
@@ -282,7 +282,7 @@ exports.deleteUser = async (req, res) => {
       });
     }
 
-    const user = await User.findByIdAndDelete(id);
+    const user = await User.findByIdAndDelete(id, req.user.id);
 
     if (!user) {
       return res.status(404).json({

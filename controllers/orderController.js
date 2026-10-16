@@ -192,13 +192,15 @@ const readWebhookNotification = (req) => ({
   paymentId: req.query['data.id'] || (req.body && req.body.data && req.body.data.id) || req.query.id,
 });
 
-/** Aprobado → se salda. Reembolsado / contracargado → solo se marca para revisión. */
+/**
+ * Aprobado → se salda. Reembolsado / contracargado (o aprobado con devolución parcial)
+ * → solo se marca para revisión del admin; no se toca el estado ni el stock.
+ */
 const applyWebhookPayment = async (payment) => {
   if (!payment || !payment.external_reference) return;
   if (payment.status === 'approved') {
     const updated = await settleApprovedPayment(payment);
     if (updated > 0) invalidateProducts();
-    return;
   }
   if (isReversedPayment(payment)) await flagReversedPayment(payment);
 };

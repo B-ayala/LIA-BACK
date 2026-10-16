@@ -215,7 +215,9 @@ El descuento de stock lo hace el **trigger `trg_decrement_stock`** (AFTER INSERT
 - Producto del carrito sin `productId` entero -> 400 "No se pudo identificar el producto ...".
 - Producto inexistente o sin stock suficiente -> 409 "No hay stock suficiente de ..."; precio no vendible (<= 0) -> 409 "no está disponible para la venta"; nada se persiste.
 - Producto inactivo (`status` distinto de `active`) -> 409 "no está disponible para la venta", igual que un precio no vendible: el catálogo lo oculta y la API tampoco lo vende por id directo.
-- El usuario ya tiene `MAX_PENDING_LINES_PER_USER` líneas (default 30) pendientes de pago -> 429 `TOO_MANY_PENDING_ORDERS` "Tenés compras pendientes de pago. Pagalas o cancelalas antes de iniciar otra." Una repetición con la misma `Idempotency-Key` no cuenta (se resuelve antes).
+- El usuario ya tiene `MAX_PENDING_LINES_PER_USER` líneas (default 30) **o** `MAX_PENDING_UNITS_PER_USER` unidades (default 60) pendientes de pago, contando lo que está pidiendo -> 429 `TOO_MANY_PENDING_ORDERS` "Tenés compras pendientes de pago. Pagalas o cancelalas antes de iniciar otra." Una repetición con la misma `Idempotency-Key` no cuenta (se resuelve antes). El tope por unidades existe porque una sola línea puede llevar muchas unidades.
+- Una línea con más de `MAX_QUANTITY_PER_LINE` unidades (default 20) -> 400 `VALIDATION_ERROR` "Podés comprar hasta 20 unidades de ... por compra." (sin esto, una línea reservaba todo el stock de un producto: 15 min en MP, 5 h en transferencia).
+- Más de 8 compras por minuto desde la misma cuenta (`POST /transfer` y `/mp-preference` comparten el cupo) -> 429 `RATE_LIMITED`. Hay además un tope por IP (12/min) que se evalúa antes de autenticar; el de 8/min cuenta por usuario. Las cancelaciones y confirmaciones que pueden consultar a MP (`mp-confirm`, `mp-cancel`, `/:id/cancel`) tienen un tope por usuario de 20/min.
 - `unitsConfig` que no sea una lista de objetos planos de texto (máximo una entrada por unidad, claves <= 60 y valores <= 100 caracteres), o `buyerName` > 120 caracteres -> 400.
 - `mp-confirm` y el webhook ignoran pagos con `paymentId` no numérico o con moneda distinta de ARS (no saldan ninguna orden).
 - Método de envío inválido o costo de moto fuera de rango -> 400.
@@ -245,7 +247,9 @@ El descuento de stock lo hace el **trigger `trg_decrement_stock`** (AFTER INSERT
     hasta **24 h** desde la creación (sin medios diferidos, un pago en curso se resuelve rápido);
   - **ninguno**, o pasadas las 24 h → `'expirado'` + stock restaurado (total y talle).
   `in_mediation` (disputa de un pago ya aprobado) no retiene.
-  Límites por ciclo: hasta `ORDER_SWEEP_MAX_MP_LOOKUPS` (10) consultas, 4 en paralelo. Rotación en
+  Límites por ciclo: hasta `ORDER_SWEEP_MAX_MP_LOOKUPS` (10) consultas, 4 en paralelo. Las compras
+  consultadas hace menos de 5 min **se excluyen de la consulta SQL** del lote (200 más viejas), para que
+  las retenidas no ocupen siempre los mismos lugares y dejen sin evaluar a las vencidas más nuevas. Rotación en
   memoria: primero las compras nunca consultadas o consultadas hace más; una compra retenida no se
   reconsulta antes de 5 min. Cada compra se procesa con su propio try/catch (un error no aborta el
   ciclo) y las transferencias son un paso independiente.
@@ -266,7 +270,9 @@ El descuento de stock lo hace el **trigger `trg_decrement_stock`** (AFTER INSERT
   - `duplicate_payment` → segundo pago aprobado con otro `payment_id` para ventas ya pagadas; log
     `duplicate_approved_payment`.
   - `refunded` / `charged_back` → el webhook notifica un reembolso o contracargo del pago que saldó
-    la venta; log `payment_reversed`.
+    la venta; log `payment_reversed`. Una **devolución parcial** (el pago sigue `approved` pero trae
+    `transaction_amount_refunded` > 0) también queda `refunded`. Solo se detecta por webhook: si MP no
+    lo envía, hay que mirar el panel de MP.
 - `external_reference` de pagos viejos (lista de ids de venta separados por coma) se sigue
   resolviendo: primero se buscan ventas con esa `mp_external_reference`; si no hay, se parsea la lista.
 

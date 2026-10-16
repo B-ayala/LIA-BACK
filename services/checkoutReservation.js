@@ -27,6 +27,8 @@ const HTTP_SERVER_ERROR = 500;
 // Cuánto stock puede retener una sola cuenta sin pagar: sin tope, un script con una
 // cuenta barata vacía el catálogo a fuerza de reservas hasta que vencen (15 min).
 const DEFAULT_MAX_PENDING_LINES_PER_USER = 30;
+// Y cuántas UNIDADES: el tope por líneas solo no alcanza (una línea puede llevar muchas unidades).
+const DEFAULT_MAX_PENDING_UNITS_PER_USER = 60;
 const TOO_MANY_PENDING_CODE = 'TOO_MANY_PENDING_ORDERS';
 const TOO_MANY_PENDING_MESSAGE = 'Tenés compras pendientes de pago. Pagalas o cancelalas antes de iniciar otra.';
 
@@ -35,11 +37,20 @@ const maxPendingLinesPerUser = () => {
   return Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_MAX_PENDING_LINES_PER_USER;
 };
 
+const maxPendingUnitsPerUser = () => {
+  const configured = Number.parseInt(process.env.MAX_PENDING_UNITS_PER_USER, 10);
+  return Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_MAX_PENDING_UNITS_PER_USER;
+};
+
+const sumUnits = (lines) => lines.reduce((total, line) => total + line.item.quantity, 0);
+
 /** @returns {Promise<object|null>} el fallo a devolver, o null si el usuario puede reservar más. */
 const checkPendingLimit = async (client, userId, newLines) => {
   const pending = await Order.countPendingByUser(client, userId);
-  if (pending + newLines <= maxPendingLinesPerUser()) return null;
-  logger.warn('order_blocked_too_many_pending', { userId, pending });
+  const withinLines = pending.lines + newLines.length <= maxPendingLinesPerUser();
+  const withinUnits = pending.units + sumUnits(newLines) <= maxPendingUnitsPerUser();
+  if (withinLines && withinUnits) return null;
+  logger.warn('order_blocked_too_many_pending', { userId, pendingLines: pending.lines, pendingUnits: pending.units });
   return {
     ok: false, status: HTTP_TOO_MANY_REQUESTS, code: TOO_MANY_PENDING_CODE, message: TOO_MANY_PENDING_MESSAGE,
   };
@@ -83,7 +94,7 @@ const reserveLine = async (client, line, order) => {
 };
 
 const reserveLines = async (client, lines, order) => {
-  const blocked = await checkPendingLimit(client, order.buyer.userId, lines.length);
+  const blocked = await checkPendingLimit(client, order.buyer.userId, lines);
   if (blocked) return rollbackWith(blocked);
 
   const reserved = new Array(lines.length);
