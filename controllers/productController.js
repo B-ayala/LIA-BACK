@@ -1,35 +1,28 @@
-const { pool } = require('../config/database');
+const Product = require('../models/Product');
 const { caches, TTL, invalidateProducts } = require('../utils/cache');
-
 const logger = require('../utils/logger');
-
-// Los ids de producto son bigint: se acota a 15 dígitos para que un id absurdo
-// ni siquiera llegue a la base (evita el error de rango de pg y un 500 evitable).
-const PRODUCT_ID_RE = /^\d{1,15}$/;
+const { sendError } = require('../utils/httpResponses');
+const { destroyCloudinaryImage } = require('../utils/cloudinaryDestroy');
+const { resolveOriginalPrice } = require('../utils/productUpdateQuery');
 
 const MAX_PAGE_SIZE = 100;
 const DEFAULT_PAGE_SIZE = 50;
 
+// Postgres rechaza un timestamp con forma válida pero fecha imposible (ej. mes 13).
+const INVALID_DATETIME_CODES = new Set(['22007', '22008']);
+
+const PRODUCT_NOT_FOUND_MESSAGE = 'Producto no encontrado';
+const PRODUCT_CHANGED_MESSAGE =
+  'El producto cambió desde que lo abriste (por ejemplo, por una compra). Recargalo y volvé a aplicar tus cambios.';
+
 /**
- * Responde un error de servidor sin exponer internals.
- *
- * Los errores de `pg` traen detalle de infraestructura (por ejemplo
- * `EMAXCONNSESSION ... pool_size: 15`, que revela el dimensionamiento de la
- * base). Eso va al log estructurado, no al cliente.
+ * Responde un error de servidor sin exponer internals: los errores de `pg` traen
+ * detalle de infraestructura que va al log estructurado, no al cliente.
  */
 const serverError = (res, action, error) => {
   logger.error(`products_${action}_failed`, { error: error.message, code: error.code });
-  return res.status(500).json({
-    success: false,
-    code: 'INTERNAL_ERROR',
-    message: 'No se pudo completar la operación. Reintentá en unos segundos.',
-  });
+  return sendError(res, 500, 'INTERNAL_ERROR', 'No se pudo completar la operación. Reintentá en unos segundos.');
 };
-
-const isValidProductId = (id) => PRODUCT_ID_RE.test(String(id));
-
-const productNotFound = (res) =>
-  res.status(404).json({ success: false, message: 'Producto no encontrado' });
 
 /** Solo un admin autenticado (ver `optionalAuth`) ve productos no activos. */
 const canSeeInactive = (req) => Boolean(req.user && req.user.role === 'admin');
@@ -56,110 +49,46 @@ const boundedInt = (raw, fallback, min, max) => {
   return Math.min(Math.max(value, min), max);
 };
 
-// `price` es siempre el precio FINAL (lo que se cobra: ver resolveUnitPrice en
-// orderController); `original_price` es solo el precio de lista tachado. Un
-// tachado que no supere al final no es una promo válida, así que se descarta.
-const resolveOriginalPrice = (originalPrice, price) => {
-  const original = parseFloat(originalPrice);
-  if (!Number.isFinite(original) || original <= 0) return null;
-  const finalPrice = parseFloat(price);
-  if (Number.isFinite(finalPrice) && original <= finalPrice) return null;
-  return original;
+/** Valores del INSERT de un producto (el body ya lo validó el schema Zod de la ruta). */
+const toInsertValues = (body) => {
+  const { images, imageUrl } = body;
+  return [
+    body.name,
+    Number.parseFloat(body.price),
+    body.stock || 0,
+    body.category || null,
+    images && images.length > 0 ? images[0] : (imageUrl || ''),
+    body.publicId || '',
+    body.description || null,
+    body.discount ? Number.parseFloat(body.discount) : null,
+    body.condition || 'new',
+    body.freeShipping || false,
+    body.hoverImageEnabled !== undefined ? body.hoverImageEnabled : true,
+    body.variants ? JSON.stringify(body.variants) : null,
+    body.specifications ? JSON.stringify(body.specifications) : null,
+    body.features ? JSON.stringify(body.features) : null,
+    body.faqs ? JSON.stringify(body.faqs) : null,
+    body.warranty || null,
+    body.returnPolicy || null,
+    body.sizeGuide ? JSON.stringify(body.sizeGuide) : null,
+    body.status || 'active',
+    images ? JSON.stringify(images) : null,
+    resolveOriginalPrice(body.originalPrice, body.price),
+  ];
 };
 
-// Create product
+// Un producto "Activo" sin stock es un estado válido: se muestra en la tienda
+// marcado "Sin stock" y no se puede comprar (el front pide confirmación antes).
 const createProduct = async (req, res) => {
   try {
-    const {
-      name, price, stock, category, imageUrl, publicId,
-      description, discount, originalPrice, condition, freeShipping, hoverImageEnabled,
-      variants, specifications, features, faqs, warranty, returnPolicy,
-      sizeGuide, status, images,
-    } = req.body;
-
-    // name y price ya vienen validados por el schema Zod de la ruta (ver
-    // schemas/productSchema.js).
-
-    // Un producto "Activo" sin stock es un estado válido: se muestra en la
-    // tienda marcado "Sin stock" y no se puede comprar (el front pide
-    // confirmación explícita antes de llegar acá).
-
-    // Derive imageUrl from images array if provided
-    const resolvedImageUrl = (images && images.length > 0) ? images[0] : (imageUrl || '');
-    const resolvedPublicId = publicId || '';
-
-    const result = await pool.query(
-      `INSERT INTO public.productos
-       (name, price, stock, category, image_url, public_id, description,
-        discount, condition, free_shipping, hover_image_enabled, variants, specifications, features, faqs,
-        warranty, return_policy, size_guide, status, images, original_price)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
-       RETURNING *`,
-      [
-        name,
-        parseFloat(price),
-        stock || 0,
-        category || null,
-        resolvedImageUrl,
-        resolvedPublicId,
-        description || null,
-        discount ? parseFloat(discount) : null,
-        condition || 'new',
-        freeShipping || false,
-        hoverImageEnabled !== undefined ? hoverImageEnabled : true,
-        variants ? JSON.stringify(variants) : null,
-        specifications ? JSON.stringify(specifications) : null,
-        features ? JSON.stringify(features) : null,
-        faqs ? JSON.stringify(faqs) : null,
-        warranty || null,
-        returnPolicy || null,
-        sizeGuide ? JSON.stringify(sizeGuide) : null,
-        status || 'active',
-        images ? JSON.stringify(images) : null,
-        resolveOriginalPrice(originalPrice, price),
-      ]
-    );
-
+    const product = await Product.create(toInsertValues(req.body));
     invalidateProducts();
-
-    res.status(201).json({
-      success: true,
-      data: result.rows[0],
-    });
+    return res.status(201).json({ success: true, data: product });
   } catch (error) {
     return serverError(res, 'create', error);
   }
 };
 
-/**
- * Página del catálogo en UNA sola consulta: `COUNT(*) OVER()` devuelve el total
- * junto con las filas y evita el segundo round trip (dos queries por request se
- * notan cuando hay decenas de lectores simultáneos).
- */
-const fetchProductPage = async (limit, offset, includeInactive) => {
-  // Fragmento fijo (sin input del usuario): COALESCE trata status NULL como activo.
-  const where = includeInactive ? '' : "WHERE COALESCE(status, 'active') = 'active'";
-  const result = await pool.query(
-    `SELECT *, COUNT(*) OVER()::int AS total_count
-       FROM public.productos
-       ${where}
-      ORDER BY created_at DESC, id DESC
-      LIMIT $1 OFFSET $2`,
-    [limit, offset]
-  );
-
-  const rows = result.rows.map(({ total_count, ...product }) => product);
-  if (rows.length > 0) return { rows, total: result.rows[0].total_count };
-
-  // Página vacía (offset fuera de rango): `COUNT(*) OVER()` no devuelve nada,
-  // así que el total se resuelve aparte para no reportar 0 productos de más.
-  const countResult = await pool.query(
-    `SELECT COUNT(*)::int AS total FROM public.productos ${where}`
-  );
-  return { rows, total: countResult.rows[0].total };
-};
-
-// Get all products
 const getProducts = async (req, res) => {
   try {
     const limit = boundedInt(req.query.limit, DEFAULT_PAGE_SIZE, 1, MAX_PAGE_SIZE);
@@ -167,290 +96,95 @@ const getProducts = async (req, res) => {
     const includeInactive = canSeeInactive(req);
     setAudienceHeaders(res, includeInactive);
 
-    // Caché + single-flight: una ráfaga de lecturas de la misma página ejecuta
-    // una sola query y comparte el resultado. Se invalida ante cualquier cambio
-    // de producto o de stock (ver invalidateProducts).
+    // Caché + single-flight: una ráfaga de lecturas de la misma página ejecuta una
+    // sola query. Se invalida ante cualquier cambio de producto o de stock.
     const { rows, total } = await caches.products.getOrSet(
       `list:${audienceOf(includeInactive)}:${limit}:${offset}`,
       TTL.products,
-      () => fetchProductPage(limit, offset, includeInactive)
+      () => Product.findPage(limit, offset, includeInactive)
     );
-
-    res.json({
-      success: true,
-      data: rows,
-      count: rows.length,
-      total,
-      limit,
-      offset,
-      hasMore: offset + rows.length < total,
+    return res.json({
+      success: true, data: rows, count: rows.length, total, limit, offset, hasMore: offset + rows.length < total,
     });
   } catch (error) {
     return serverError(res, 'list', error);
   }
 };
 
-const fetchProductById = async (id, includeInactive) => {
-  const activeOnly = includeInactive ? '' : "AND COALESCE(status, 'active') = 'active'";
-  const result = await pool.query(`SELECT * FROM public.productos WHERE id = $1 ${activeOnly}`, [id]);
-  return result.rows[0] || null;
-};
-
-// Get product by id
 const getProductById = async (req, res) => {
   try {
     const { id } = req.params;
-    if (!isValidProductId(id)) return productNotFound(res);
-
     const includeInactive = canSeeInactive(req);
     setAudienceHeaders(res, includeInactive);
 
-    // El detalle de un producto "popular" concentra muchas lecturas iguales:
-    // es el caso donde más rinde el coalescing. `null` marca "no existe" y
-    // también se cachea, para que un scraper de IDs inexistentes no golpee la BD.
+    // `null` ("no existe") también se cachea: un scraper de ids inexistentes no golpea la BD.
+    // Un producto inactivo es "no existe" para el público, no solo "oculto".
     const product = await caches.products.getOrSet(
       `detail:${audienceOf(includeInactive)}:${id}`,
       TTL.products,
-      () => fetchProductById(id, includeInactive)
+      () => Product.findById(id, includeInactive)
     );
-
-    if (!product) return productNotFound(res);
-
-    res.json({
-      success: true,
-      data: product,
-    });
+    if (!product) return sendError(res, 404, 'PRODUCT_NOT_FOUND', PRODUCT_NOT_FOUND_MESSAGE);
+    return res.json({ success: true, data: product });
   } catch (error) {
     return serverError(res, 'detail', error);
   }
 };
 
-// Update product
+const UPDATE_FAILURES = {
+  empty: [400, 'NO_FIELDS', 'No hay campos para actualizar'],
+  not_found: [404, 'PRODUCT_NOT_FOUND', PRODUCT_NOT_FOUND_MESSAGE],
+  changed: [409, 'PRODUCT_CHANGED', PRODUCT_CHANGED_MESSAGE],
+};
+
+/**
+ * `expectedUpdatedAt` (opcional): `updated_at` tal como lo leyó el admin. Si el
+ * producto cambió desde entonces (ej. una compra descontó stock) → 409 sin tocar nada.
+ */
 const updateProduct = async (req, res) => {
   try {
-    const { id } = req.params;
-    if (!isValidProductId(id)) return productNotFound(res);
-
-    const {
-      name, price, stock, category, imageUrl, publicId,
-      description, discount, originalPrice, condition, freeShipping, hoverImageEnabled,
-      variants, specifications, features, faqs, warranty, returnPolicy,
-      sizeGuide, status, images,
-    } = req.body;
-
-    // Un producto "Activo" sin stock es un estado válido: se muestra en la
-    // tienda marcado "Sin stock" y no se puede comprar (el front pide
-    // confirmación explícita antes de llegar acá).
-
-    // Build dynamic update query
-    const updates = [];
-    const values = [];
-    let paramCount = 1;
-
-    if (name !== undefined) {
-      updates.push(`name = $${paramCount++}`);
-      values.push(name);
+    const { expectedUpdatedAt, ...fields } = req.body;
+    const result = await Product.update(req.params.id, fields, expectedUpdatedAt);
+    if (result.status !== 'updated') {
+      const [status, code, message] = UPDATE_FAILURES[result.status];
+      return sendError(res, status, code, message);
     }
-    if (price !== undefined) {
-      updates.push(`price = $${paramCount++}`);
-      values.push(parseFloat(price));
-    }
-    if (stock !== undefined) {
-      updates.push(`stock = $${paramCount++}`);
-      values.push(stock);
-    }
-    if (category !== undefined) {
-      updates.push(`category = $${paramCount++}`);
-      values.push(category);
-    }
-    if (images !== undefined) {
-      updates.push(`images = $${paramCount++}`);
-      values.push(JSON.stringify(images));
-      // Keep image_url in sync with first image
-      const firstImage = (images && images.length > 0) ? images[0] : (imageUrl || '');
-      updates.push(`image_url = $${paramCount++}`);
-      values.push(firstImage);
-    } else if (imageUrl !== undefined) {
-      updates.push(`image_url = $${paramCount++}`);
-      values.push(imageUrl);
-    }
-    if (publicId !== undefined) {
-      updates.push(`public_id = $${paramCount++}`);
-      values.push(publicId);
-    }
-    if (description !== undefined) {
-      updates.push(`description = $${paramCount++}`);
-      values.push(description);
-    }
-    if (discount !== undefined) {
-      updates.push(`discount = $${paramCount++}`);
-      values.push(discount ? parseFloat(discount) : null);
-    }
-    if (originalPrice !== undefined) {
-      updates.push(`original_price = $${paramCount++}`);
-      values.push(resolveOriginalPrice(originalPrice, price));
-    }
-    if (condition !== undefined) {
-      updates.push(`condition = $${paramCount++}`);
-      values.push(condition);
-    }
-    if (freeShipping !== undefined) {
-      updates.push(`free_shipping = $${paramCount++}`);
-      values.push(freeShipping);
-    }
-    if (hoverImageEnabled !== undefined) {
-      updates.push(`hover_image_enabled = $${paramCount++}`);
-      values.push(hoverImageEnabled);
-    }
-    if (variants !== undefined) {
-      updates.push(`variants = $${paramCount++}`);
-      values.push(JSON.stringify(variants));
-    }
-    if (specifications !== undefined) {
-      updates.push(`specifications = $${paramCount++}`);
-      values.push(JSON.stringify(specifications));
-    }
-    if (features !== undefined) {
-      updates.push(`features = $${paramCount++}`);
-      values.push(JSON.stringify(features));
-    }
-    if (faqs !== undefined) {
-      updates.push(`faqs = $${paramCount++}`);
-      values.push(JSON.stringify(faqs));
-    }
-    if (warranty !== undefined) {
-      updates.push(`warranty = $${paramCount++}`);
-      values.push(warranty);
-    }
-    if (returnPolicy !== undefined) {
-      updates.push(`return_policy = $${paramCount++}`);
-      values.push(returnPolicy);
-    }
-    if (sizeGuide !== undefined) {
-      updates.push(`size_guide = $${paramCount++}`);
-      values.push(sizeGuide ? JSON.stringify(sizeGuide) : null);
-    }
-    if (status !== undefined) {
-      updates.push(`status = $${paramCount++}`);
-      values.push(status);
-    }
-
-    if (updates.length === 0) {
-      return res.status(400).json({
-        success: false,
-        message: 'No hay campos para actualizar',
-      });
-    }
-
-    values.push(id);
-    const query = `UPDATE public.productos SET ${updates.join(', ')}, updated_at = NOW() WHERE id = $${paramCount} RETURNING *`;
-
-    const result = await pool.query(query, values);
-
-    if (result.rows.length === 0) return productNotFound(res);
-
     invalidateProducts();
-
-    res.json({
-      success: true,
-      data: result.rows[0],
-    });
+    return res.json({ success: true, data: result.product });
   } catch (error) {
+    if (INVALID_DATETIME_CODES.has(error.code)) {
+      return sendError(res, 400, 'VALIDATION_ERROR', 'La fecha de última modificación no es válida.');
+    }
     return serverError(res, 'update', error);
   }
 };
 
-// Delete product (and Cloudinary image)
+/** No borrar el asset si otro producto usa el mismo `public_id` (Cloudinary borra por public_id). */
+const removeProductImage = async ({ publicId, imageShared }) => {
+  if (!publicId) return;
+  if (imageShared) {
+    logger.warn('cloudinary_asset_shared', { publicId });
+    return;
+  }
+  try {
+    await destroyCloudinaryImage(publicId);
+  } catch (error) {
+    // El producto ya se borró: un asset huérfano en Cloudinary no debe fallar la operación.
+    logger.warn('cloudinary_delete_failed', { error: error.message });
+  }
+};
+
 const deleteProduct = async (req, res) => {
   try {
-    const { id } = req.params;
-    if (!isValidProductId(id)) return productNotFound(res);
-
-    // Get product to find public_id
-    const productResult = await pool.query(
-      'SELECT public_id FROM public.productos WHERE id = $1',
-      [id]
-    );
-
-    if (productResult.rows.length === 0) return productNotFound(res);
-
-    const productData = productResult.rows[0];
-
-    // No borrar el asset de Cloudinary si otro producto usa el mismo `public_id`
-    // (imagen compartida): Cloudinary borra por public_id, así que si otro producto
-    // resuelve al mismo asset, borrarlo le rompería la imagen.
-    let imageSharedWithOther = false;
-    if (productData.public_id) {
-      const shared = await pool.query(
-        'SELECT 1 FROM public.productos WHERE id <> $1 AND public_id = $2 LIMIT 1',
-        [id, productData.public_id]
-      );
-      imageSharedWithOther = shared.rows.length > 0;
-      if (imageSharedWithOther) {
-        logger.warn('cloudinary_asset_shared', { publicId: productData.public_id });
-      }
+    const result = await Product.deleteIfNoPendingOrders(req.params.id);
+    if (result.status === 'not_found') return sendError(res, 404, 'PRODUCT_NOT_FOUND', PRODUCT_NOT_FOUND_MESSAGE);
+    if (result.status === 'has_pending_orders') {
+      return sendError(res, 409, 'PRODUCT_HAS_PENDING_ORDERS',
+        'El producto tiene compras pendientes de pago. Esperá a que se paguen, cancelen o expiren antes de eliminarlo.');
     }
-
-    // Delete from Cloudinary via our endpoint
-    if (productData.public_id && !imageSharedWithOther) {
-      try {
-        const https = require('https');
-        const auth = Buffer.from(
-          `${process.env.CLOUDINARY_API_KEY}:${process.env.CLOUDINARY_API_SECRET}`
-        ).toString('base64');
-
-        const postData = `public_ids%5B%5D=${encodeURIComponent(productData.public_id)}`;
-
-        await new Promise((resolve, reject) => {
-          const options = {
-            hostname: 'api.cloudinary.com',
-            path: `/v1_1/${process.env.CLOUDINARY_CLOUD_NAME}/resources/image/destroy`,
-            method: 'POST',
-            headers: {
-              'Authorization': `Basic ${auth}`,
-              'Content-Type': 'application/x-www-form-urlencoded',
-              'Content-Length': Buffer.byteLength(postData),
-            },
-          };
-
-          const request = https.request(options, (response) => {
-            let data = '';
-            response.on('data', (chunk) => {
-              data += chunk;
-            });
-            response.on('end', () => {
-              try {
-                const result = JSON.parse(data);
-                if (result.deleted && result.deleted[productData.public_id]) {
-                  resolve(result);
-                } else {
-                  reject(new Error('Imagen no encontrada en Cloudinary'));
-                }
-              } catch (e) {
-                reject(e);
-              }
-            });
-          });
-
-          request.on('error', reject);
-          request.write(postData);
-          request.end();
-        });
-      } catch (cloudinaryError) {
-        logger.warn('cloudinary_delete_failed', { error: cloudinaryError.message });
-        // Don't fail if Cloudinary deletion fails, just warn
-      }
-    }
-
-    // Delete from PostgreSQL
-    await pool.query('DELETE FROM public.productos WHERE id = $1', [id]);
-
     invalidateProducts();
-
-    res.json({
-      success: true,
-      message: 'Producto eliminado exitosamente',
-    });
+    await removeProductImage(result);
+    return res.json({ success: true, message: 'Producto eliminado exitosamente' });
   } catch (error) {
     return serverError(res, 'delete', error);
   }

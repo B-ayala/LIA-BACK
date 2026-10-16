@@ -73,6 +73,26 @@ const createPreference = (preference) =>
 const getPayment = (paymentId) =>
   mpRequest(`/v1/payments/${encodeURIComponent(paymentId)}`);
 
+// Una compra acumula un pago por intento (tarjeta rechazada, reintento…). Sin
+// paginar, 50 intentos ordenados del más nuevo al más viejo cubren de sobra un
+// checkout real; el pago aprobado o en curso siempre es de los últimos intentos.
+const SEARCH_RESULTS_LIMIT = 50;
+
+/**
+ * Pagos de MP asociados a una `external_reference` (más recientes primero).
+ * Sirve para saber, antes de liberar stock, si hay un pago aprobado o en curso.
+ */
+const searchPaymentsByReference = async (externalReference) => {
+  const query = new URLSearchParams({
+    external_reference: externalReference,
+    sort: 'date_created',
+    criteria: 'desc',
+    limit: String(SEARCH_RESULTS_LIMIT),
+  });
+  const data = await mpRequest(`/v1/payments/search?${query.toString()}`);
+  return Array.isArray(data && data.results) ? data.results : [];
+};
+
 /**
  * Verifica la firma `x-signature` de una notificación de webhook.
  *
@@ -118,5 +138,6 @@ module.exports = {
   isWebhookSecretConfigured,
   createPreference,
   getPayment,
+  searchPaymentsByReference,
   verifyWebhookSignature,
 };

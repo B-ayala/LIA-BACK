@@ -7,6 +7,9 @@ const USER = { id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', email: 'user@example.
 const OTHER = { id: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', email: 'other@example.test' };
 const ROLES = { [ADMIN.id]: 'admin', [USER.id]: 'user', [OTHER.id]: 'user' };
 const FOREIGN_ORDER = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+const FOREIGN_ORDER_ROW = {
+  id: FOREIGN_ORDER, user_id: OTHER.id, buyer_email: OTHER.email, payment_status: 'pendiente', product_id: 1, quantity: 1,
+};
 
 const pool = installFakeDatabase((sql, params) => {
   if (sql.startsWith('SELECT id, role, name FROM public.profiles')) {
@@ -14,9 +17,13 @@ const pool = installFakeDatabase((sql, params) => {
     return role ? { rows: [{ id: params[0], role, name: 'Test' }] } : { rows: [] };
   }
   if (sql.includes('COUNT(*) as count')) return { rows: [{ count: '0' }] };
-  if (sql.includes('FROM public.ventas WHERE id = $1::uuid FOR UPDATE')) {
-    // Orden de OTRO usuario, de Mercado Pago y todavía pendiente.
-    return { rows: [{ id: FOREIGN_ORDER, user_id: OTHER.id, buyer_email: OTHER.email, payment_method: 'mp', payment_status: 'pendiente', product_id: 1, quantity: 1 }] };
+  if (sql.includes('FROM public.ventas WHERE id = $1::uuid')) {
+    // Orden de OTRO usuario, de Mercado Pago y todavía pendiente (con o sin FOR UPDATE).
+    return { rows: [{ ...FOREIGN_ORDER_ROW, payment_method: 'mp' }] };
+  }
+  if (sql.includes('FROM public.ventas WHERE id = ANY($1::uuid[])')) {
+    // Para el nudge (solo actúa sobre transferencias pendientes): una orden ajena de ese tipo.
+    return { rows: [{ ...FOREIGN_ORDER_ROW, payment_method: 'transfer' }] };
   }
   if (sql.includes('SELECT is_owner')) return { rows: [{ is_owner: false }] };
   if (sql.includes('UPDATE public.profiles')) return { rows: [{ id: params[params.length - 1], name: 'x', role: 'user' }] };
@@ -160,10 +167,10 @@ describe('Mass assignment (prueba B)', () => {
 });
 
 describe('Validación de entradas en rutas públicas', () => {
-  test('NEGATIVO: id de producto con inyección SQL responde 404 y no consulta la base', async () => {
+  test('NEGATIVO: id de producto con inyección SQL responde 400 y no consulta la base', async () => {
     pool.queries.length = 0;
     const { status } = await call('GET', `/api/products/${encodeURIComponent("1 OR 1=1; DROP TABLE productos--")}`);
-    assert.equal(status, 404);
+    assert.equal(status, 400);
     assert.equal(pool.queries.length, 0);
   });
 

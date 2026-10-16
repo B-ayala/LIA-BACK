@@ -7,7 +7,7 @@
     "start": "node server.js",
     "dev": "nodemon server.js",
     "init-db": "node config/initDatabase.js",
-    "test": "node --test \"test/**/*.test.js\"",
+    "test": "node --test \"test/**/*.test.js\" \"qa/unit/*.test.js\"",
     "audit": "npm audit --audit-level=high",
     "preflight": "npm run audit"
   },

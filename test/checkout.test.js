@@ -51,7 +51,10 @@ const insertedRow = () => pool.queries.find((q) => q.sql.startsWith('INSERT INTO
 beforeEach(() => {
   pool.queries.length = 0;
   pendingLines = 0;
-  product = { stock: 5, price: 10000, discount: null, original_price: null, name: 'Remera Lisa', image_url: 'db.jpg', status: 'active' };
+  product = {
+    stock: 5, price: 10000, discount: null, original_price: null, name: 'Remera Lisa',
+    image: 'db.jpg', variants: null, status: 'active',
+  };
 });
 
 describe('El servidor decide el importe (prueba 4)', () => {
@@ -145,33 +148,57 @@ describe('Retención de stock por una sola cuenta (prueba 12/H)', () => {
 });
 
 describe('Entradas maliciosas en la orden (prueba 10)', () => {
+  // El servidor valida `unitsConfig` contra las variantes REALES del producto y solo
+  // persiste la selección saneada: nunca el JSON que mande el cliente.
+  const withVariants = () => {
+    product.variants = [
+      { name: 'Talle', options: ['M', 'L'], stockByOption: { M: 3, L: 2 } },
+      { name: 'Color', options: ['Negro'] },
+    ];
+  };
+
   test('NEGATIVO: unitsConfig con objetos anidados se rechaza', async () => {
-    const res = await placeTransfer(validBody({ item: { unitsConfig: [{ Talle: { $gt: '' } }] } }));
+    withVariants();
+    const res = await placeTransfer(validBody({ item: { unitsConfig: [{ Talle: { $gt: '' }, Color: 'Negro' }] } }));
     assert.equal(res.statusCode, 400);
     assert.equal(insertedRow(), undefined);
   });
 
   test('NEGATIVO: unitsConfig con más unidades que la cantidad se rechaza', async () => {
+    withVariants();
     const res = await placeTransfer(validBody({ item: { quantity: 1, unitsConfig: [{ Talle: 'M' }, { Talle: 'L' }] } }));
     assert.equal(res.statusCode, 400);
+    assert.equal(insertedRow(), undefined);
   });
 
   test('NEGATIVO: unitsConfig que no es una lista se rechaza', async () => {
+    withVariants();
     const res = await placeTransfer(validBody({ item: { unitsConfig: '<img src=x onerror=alert(1)>' } }));
     assert.equal(res.statusCode, 400);
+    assert.equal(insertedRow(), undefined);
   });
 
-  test('NEGATIVO: valor de variante gigante se rechaza', async () => {
-    const res = await placeTransfer(validBody({ item: { unitsConfig: [{ Talle: 'M'.repeat(5000) }] } }));
-    assert.equal(res.statusCode, 400);
+  test('NEGATIVO: valor de variante gigante o inexistente se rechaza y no se guarda', async () => {
+    withVariants();
+    const res = await placeTransfer(validBody({ item: { unitsConfig: [{ Talle: 'M'.repeat(5000), Color: 'Negro' }] } }));
+    assert.ok([400, 409].includes(res.statusCode), `esperaba 400/409, llegó ${res.statusCode}`);
+    assert.equal(insertedRow(), undefined);
   });
 
   test('NEGATIVO: nombre de comprador desmedido se rechaza', async () => {
     const res = await placeTransfer(validBody({ body: { buyerName: 'A'.repeat(500) } }));
     assert.equal(res.statusCode, 400);
+    assert.equal(insertedRow(), undefined);
+  });
+
+  test('NEGATIVO: en un producto sin variantes el unitsConfig del cliente no se persiste', async () => {
+    const res = await placeTransfer(validBody({ item: { unitsConfig: [{ '<img src=x>': 'x'.repeat(500) }] } }));
+    assert.equal(res.statusCode, 201);
+    assert.equal(insertedRow().params[9], '[]');
   });
 
   test('POSITIVO: variantes por unidad legítimas (talle y color) se guardan como JSON', async () => {
+    withVariants();
     const config = [{ Talle: 'M', Color: 'Negro' }];
     const res = await placeTransfer(validBody({ item: { unitsConfig: config } }));
     assert.equal(res.statusCode, 201);
@@ -195,6 +222,6 @@ describe('Idempotencia y reintentos (prueba 7/E)', () => {
       res
     );
     assert.equal(res.statusCode, 400);
-    assert.equal(res.body.code, 'INVALID_IDEMPOTENCY_KEY');
+    assert.equal(res.body.code, 'IDEMPOTENCY_KEY_INVALID');
   });
 });

@@ -3,15 +3,15 @@
 ## [Unreleased]
 
 ### Security
-- Checkout: un producto inactivo ya no se puede comprar llamando a la API con su id (409); antes solo se ocultaba del catálogo.
+- Checkout: un producto inactivo ya no se puede comprar llamando a la API con su id (409 `PRODUCT_UNAVAILABLE`); antes solo se ocultaba del catálogo.
 - Checkout: tope de líneas pendientes de pago por usuario (`MAX_PENDING_LINES_PER_USER`, default 30; 429 `TOO_MANY_PENDING_ORDERS`) para que una cuenta no retenga el stock del catálogo.
-- Checkout: `unitsConfig` (variantes por unidad) y `buyerName`/`buyerEmail` se validan en el borde (forma, cantidad y largo); antes se guardaba cualquier JSON del cliente.
-- Mercado Pago: `mp-confirm` y el webhook exigen `paymentId` numérico y moneda ARS del pago antes de saldar órdenes.
+- Checkout: `buyerName` se acota a 120 caracteres y el email a 254; `unitsConfig` se valida contra las variantes reales del producto y se guarda saneado (antes se guardaba cualquier JSON del cliente).
+- Mercado Pago: `mp-confirm` y el webhook exigen `paymentId` numérico (el webhook lo comprueba después de la firma) y saldar un pago exige moneda ARS (otra moneda queda como `amount_mismatch` para revisión).
 - Auth: `POST /api/auth/logout` revoca la sesión en Supabase aunque el access token haya vencido (renueva con la cookie de refresh); antes el refresh token seguía vivo.
 - Auth: `POST /api/users/login` comparte el contador de rate limit con `/api/auth/login` (antes alternar endpoints duplicaba los intentos por IP).
 - Base de datos: `DB_SSL_CA` opcional valida el certificado TLS del servidor; sin ella se mantiene el comportamiento anterior.
 - Base de datos: script SQL de endurecimiento `db/migrations/2026-10-13_security_hardening.sql` (aplicado el 2026-10-16): `search_path` fijo en funciones `SECURITY DEFINER`, `productos` solo con escritura directa de `featured`, CHECK de dominio en `ventas`/`productos`, tope de largo en `contact_messages` y tabla `audit_log` con triggers.
-- Dependencias: `npm audit fix` (incluye `proxy-addr`, que permitía falsear la IP y eludir rate limit y bloqueo de login). Quedan 3 avisos de `nodemon` (solo desarrollo).
+- Dependencias: `npm audit fix` (`proxy-addr`, que permitía falsear la IP y eludir rate limit y bloqueo de login; `compression`; `qs`/`body-parser`/`express`). Dependencias de producción: 0 vulnerabilidades; quedan 3 avisos de `nodemon` (solo desarrollo).
 - Auth: `POST /api/auth/login|refresh|logout` rechazan con 403 un `Origin` fuera de la allowlist de CORS (defensa CSRF de la cookie del refresh token, que es `SameSite=None`).
 - Auth: login fallido registra `auth_login_failed_credentials` (código de Supabase, sin PII).
 
@@ -19,31 +19,74 @@
 - Auth: `login`, `forgot-password` y `resend-confirmation` aceptan `captchaToken` y lo reenvían a Supabase (`gotrue_meta_security`). El login responde `EMAIL_NOT_CONFIRMED` (401) y `CAPTCHA_FAILED` (400); ninguno de los dos cuenta como intento fallido de contraseña.
 - Productos: `POST`/`PUT /api/products` aceptan y persisten `originalPrice` (columna `original_price`); `price` sigue siendo el precio final cobrado y un original que no supere al precio se descarta. `PUT` con `originalPrice: null` lo borra. Script SQL `2026-10-07_add_original_price_to_productos.sql` (idempotente); `init-db` también crea la columna.
 - Productos: `GET /api/products` y `/:id` solo devuelven productos activos al público; un admin con token válido ve también los inactivos (caché separada por audiencia, `Vary: Authorization`).
-- Productos: un `:id` que no sea numérico (1 a 15 dígitos) responde 404 en detalle, edición y baja.
 - Auth: una falla de infraestructura al validar el token (timeout de Supabase Auth, BD) responde 503 `AUTH_UNAVAILABLE` con `Retry-After: 2` en vez de 401; un token inválido sigue siendo 401.
-- Checkout: nombre e imagen del producto se toman de la base (no del body) al persistir la orden y al armar el título de Mercado Pago.
-- Checkout: el email del comprador se toma de la cuenta autenticada; el dueño de una orden se resuelve por `user_id` (filas históricas sin `user_id`, por email) en "Mis compras", cancelación y nudge.
+- Checkout: el dueño de una orden se resuelve por `user_id` (filas históricas sin `user_id`, por email) en "Mis compras", cancelación y nudge.
 - Webhook de Mercado Pago: con `MP_WEBHOOK_SECRET` la firma es obligatoria (401 si falta o es inválida, también para notificaciones que no son de pago); sin secreto se acepta y se loguea `mp_webhook_unsigned` al arrancar y por request. Solo invalida el catálogo si marcó órdenes.
 - Login: `email`/`password` deben ser strings (400 en otro caso) y el rastreo de fuerza bruta se purga periódicamente con tope de 10000 cuentas.
 - Auth: timeout de 3 s al verificar el token contra Supabase para no agotar el bulkhead si Auth se degrada.
-- Órdenes: consultas por `id` uuid nativo (usa `ventas_pkey`) en lugar de `id::text`.
-- Órdenes: los productos del carrito se bloquean en orden de id para evitar deadlocks entre checkouts concurrentes.
 - Login: el perfil se busca por el id devuelto por Supabase en lugar de `LOWER(email)`.
 - Insights: el corte de "hoy" usa rango sobre `created_at` para aprovechar el índice de ventas pagadas.
+- `GET /api/orders/user` (`Order.findPurchasesByEmail`, antes `findPaidByEmail`) devuelve también las transferencias con `origin='wa_confirmado'` (comprobante avisado) aunque sigan `pendiente`, `cancelado` o `expirado`, además de las `pagado`.
+- **`external_reference` de MP es un id de compra** (uuid por carrito guardado en `ventas.mp_external_reference` en la misma transacción de reserva) en vez de la lista de ids de venta: carritos grandes ya no superan los 256 caracteres de MP. Los pagos viejos con lista de ids se siguen resolviendo.
+- La preferencia de MP **excluye medios diferidos** (`ticket`, `atm`) y el tope de retención de stock por pago en curso baja de 72 h a **24 h**; `in_mediation` ya no retiene stock.
+- Errores del checkout con **`code` estable** (`OUT_OF_STOCK`, `SIZE_OUT_OF_STOCK`, `SIZE_UNAVAILABLE`, `SIZE_REQUIRED`, `INVALID_VARIANT`, `INVALID_PRODUCT_ID`, `PRODUCT_UNAVAILABLE`) + `productId`/`size`; todas las respuestas de error de órdenes llevan `{ success:false, code, message }`.
+- Nombre, imagen y `unitsConfig` de cada venta (y del ítem de MP) salen de `productos`, no del body; `unitsConfig` se valida contra las variantes reales y se guarda saneado (`[]` sin variantes).
+- El email del comprador de la venta y de la huella de idempotencia es el de la sesión (`req.user.email`).
+- `markPaidByIds` / `mp-confirm` devuelven las ventas **realmente** pasadas a `pagado` (`orders_paid` = 0 si ya estaban pagadas).
+- Pago tardío sobre un producto borrado o con stock NULL queda `oversold = true`.
+- Ids de orden validados como uuid en el borde (`400 INVALID_ORDER_ID` / `INVALID_ORDER_IDS`) y comparados como `uuid` en SQL; ids de producto no numéricos → `400 INVALID_PRODUCT_ID` (antes 404).
+- Sweep de pendientes vencidas: rotación de consultas a MP (una compra retenida se reconsulta cada ≥5 min), 4 consultas en paralelo con tope configurable (`ORDER_SWEEP_MAX_MP_LOOKUPS`), try/catch por compra y transferencias en paso independiente.
+- `orderController.js` (943 líneas) dividido en controllers de checkout, cancelación y transferencias + `services/` (checkout, reserva, cancelación MP, transferencias, sweep, conciliación); `models/Order.js` dividido con `models/OrderPayment.js`; `productController` usa `models/Product.js`.
+
+### Fixed
+- **Conexiones del pool**: `/:id/cancel` ya no retiene una conexión mientras consulta a MP; ningún handler de órdenes hace `pool.connect()` fuera de try/catch y un ROLLBACK fallido descarta la conexión rota (`utils/transaction.js`).
+- **Deadlocks**: la reserva bloquea productos en orden de id; cancelación, expiración (CTE con `ORDER BY id FOR UPDATE`) y pago bloquean ventas por id y productos en orden ascendente.
+- Un `settle` con monto distinto, monto no numérico o que no marcó nada ya no cuenta como pagado en el sweep.
+- Borrar un producto con ventas `pendiente` → `409 PRODUCT_HAS_PENDING_ORDERS`; la imagen de Cloudinary se borra recién después de borrar el producto.
+- **Stock por talle**: `reserveOrders` ahora valida y descuenta `productos.variants[].stockByOption`
+  con la fila bloqueada (antes solo se controlaba el total: un talle agotado se seguía vendiendo).
+  Cancelar, expirar o liberar una orden devuelve el stock al talle de cada unidad. Talle agotado →
+  `409`; unidad sin talle → `400`. Lógica pura en `utils/variantStock.js` con tests en `qa/unit/`.
+- **Pago tardío sin stock**: `markPaidByIds` ya no re-descuenta con `GREATEST(stock - n, 0)`; si no hay
+  unidades deja la venta `pagado` con `oversold = true` y loguea `oversold_late_payment`.
+- **El sweep y `POST /:id/cancel` ya no liberan stock a ciegas**: consultan a MP los pagos de la
+  compra (`external_reference`); con un pago aprobado lo saldan y con uno en curso retienen la
+  reserva (tope 72 h). Nuevo `services/staleOrderSweep.js` y `utils/paymentReconciliation.js`.
 
 ### Added
-- Tests de seguridad automatizados con `node:test` (`npm test`, sin dependencias nuevas): control de acceso, IDOR, webhook de Mercado Pago, precios del servidor, CORS/CSRF, cookies de sesión y rate limit. Corren con la base, Supabase y Mercado Pago simulados.
-- **Idempotencia de checkout**: header opcional `Idempotency-Key` (8-128 caracteres `[A-Za-z0-9_-]`) en
-  `POST /api/orders/transfer` y `/mp-preference`. Un reintento con la misma key devuelve las órdenes ya
-  creadas sin descontar stock de nuevo (la carrera entre dos requests se resuelve con el índice UNIQUE).
-  Script SQL `db/migrations/2026-10-06_idempotency_key.sql` (`ventas.idempotency_key` + índice único parcial).
-  **Pendiente de aplicar en Supabase antes de que el front envíe el header.** CORS ahora permite `Idempotency-Key`.
-- Idempotencia de checkout: la misma `Idempotency-Key` con un carrito, envío o medio de pago distinto responde 422 `IDEMPOTENCY_KEY_REUSED` en vez de reenviar la reserva original. La huella (sha256 de 12 hex) vive dentro de `ventas.idempotency_key` (`<key>:<huella>:<índice>`); sin cambios de esquema y compatible con filas `<key>:<índice>`. Las requests concurrentes de una misma key se serializan con un advisory lock transaccional.
+- Tests de seguridad automatizados con `node:test` (`npm test`, sin dependencias nuevas): control de acceso, IDOR, webhook de Mercado Pago, precios del servidor, CORS/CSRF, cookies de sesión y rate limit. Corren con la base, Supabase y Mercado Pago simulados. `npm test` corre también los tests unitarios de `qa/unit/`.
 - `MP_WEBHOOK_SECRET` documentada (vacía) en `.env.example`.
 - **Tabla `admin_preferences`** (script SQL `db/migrations/2026-10-04_add_admin_preferences.sql`):
   preferencias por admin (hoy, `variants_tutorial_dismissed`) para que "No volver a mostrar"
   del tutorial de Variantes sobreviva al logout. RLS: cada admin lee/escribe solo su fila
   (`is_admin`). Pendiente de aplicar en Supabase.
+- `carousel_images.navbar_color` (hex `#rrggbb` o NULL): color del texto del menú sobre ese slide del carrusel. Migración `db/migrations/2026-10-16_add_navbar_color_to_carousel_images.sql` (aditiva e idempotente; **aplicar antes de publicar el front**). NULL conserva el comportamiento anterior (color global de Config. del sitio).
+- `carousel_images.kind` (`image` | `banner`) y `carousel_images.design` (jsonb, tope 32 KB) para los banners editables del carrusel. Migración `db/migrations/2026-10-15_add_carousel_banner_slides.sql` (aditiva e idempotente; **aplicar antes de publicar el front**: sin ella el front sigue mostrando imágenes pero no puede guardar banners).
+- `POST /api/orders/mp-cancel { orderIds }`: cancela las compras MP de un carrito con una consulta a MP por compra y responde `outcome` `released` / `held` / `paid`.
+- `PATCH /api/orders/:id/confirm-late-transfer` (admin): confirma una transferencia `expirado`, re-descuenta stock y responde `{ oversold }`.
+- `ventas.review_reason` (`amount_mismatch` / `duplicate_payment` / `refunded` / `charged_back`): el backend marca las ventas que requieren revisión del admin; el webhook detecta reembolsos y contracargos. Migración `db/migrations/2026-10-14_add_review_reason_to_ventas.sql` (**aplicar antes de desplegar**; el chequeo de arranque la incluye).
+- Conciliación de compras MP cerradas (`services/closedOrderReconciliation.js`): cada 15 min salda pagos aprobados de ventas `expirado`/`cancelado` de las últimas 48 h (log `closed_order_reconciled`).
+- `PUT /api/products/:id` acepta `expectedUpdatedAt` (control optimista atómico) → `409 PRODUCT_CHANGED` si el producto cambió; sin `stock` en el body no se toca la columna `stock`.
+- Tests unitarios nuevos en `qa/unit/` (reglas de checkout, variantes, preferencia MP, transacciones, rotación, liquidación y cancelación).
+- Conciliación de pagos MP: el backend guarda `mp_preference_id`, `mp_external_reference` y
+  `mp_payment_id` en `ventas` y loguea `duplicate_approved_payment` si llega otro pago aprobado.
+  Migración `db/migrations/2026-10-13_payment_reconciliation_and_schema_hardening.sql` (también agrega
+  `oversold`, CHECK de `payment_status`/`payment_method`/`dispatch_status`, el permiso de UPDATE por
+  columna de `ventas` y `search_path` fijo en `decrement_stock_on_sale`). **Aplicarla antes de
+  desplegar**: al arrancar, el backend loguea `missing_migration` si faltan las columnas.
+- **Idempotencia real en `POST /api/orders/mp-preference` y `/transfer`** (header
+  `Idempotency-Key`, nuevo `utils/idempotency.js`): reintentar con la misma key y el mismo
+  carrito devuelve la respuesta original en vez de crear otro juego de ventas (y descontar
+  stock dos veces); la misma key con otro carrito responde `422 IDEMPOTENCY_KEY_REUSED`; una
+  key con formato inválido, `400 IDEMPOTENCY_KEY_INVALID`. Solo se recuerdan respuestas `201`
+  (10 min, por usuario y tipo de pago): un 409 o 502 se puede reintentar con la misma key.
+  Sin header, el comportamiento es el de antes (single-flight por carrito). CORS permite `Idempotency-Key`.
+- **Persistencia de la idempotencia** (script SQL `db/migrations/2026-10-08_add_idempotency_keys.sql`,
+  `models/IdempotencyKey.js`): la respuesta exitosa se guarda en `public.idempotency_keys`
+  (RLS sin policies) además de en memoria, así el replay sobrevive a reinicios/sleep de Render.
+  Si la tabla no existe todavía, el checkout sigue andando con idempotencia en memoria y se
+  loguea `idempotency_read_failed` / `idempotency_write_failed`. El sweep de órdenes borra las
+  claves de más de 24 h.
 - **`ventas.user_id`** (script SQL `db/migrations/2026-09-18_add_user_id_to_ventas.sql`):
   FK real a `auth.users` para identificar al comprador de cada venta, además del
   `buyer_email`/`buyer_name` en texto que ya existía (se conservan como snapshot
@@ -99,6 +142,9 @@
   `retryAfterSeconds`.
 
 ### Fixed
+- **CORS bloqueaba el checkout (`Failed to fetch` al pagar con Mercado Pago)**: el front envía
+  el header `Idempotency-Key` y `config/cors.js` no lo incluía en `allowedHeaders`, así que el
+  preflight de `POST /api/orders/mp-preference` (y de transferencia) fallaba en el navegador.
 - **`Order.insertPending` guardaba `payment_method`/`payment_status` invertidos**:
   desde el commit que agregó `user_id` (2026-09-18) la lista de columnas del
   `INSERT` quedó desalineada con la lista de `VALUES` — cada orden nueva
@@ -124,6 +170,9 @@
   Usuarios (`admin/pages/Users`) deshabilita esos botones para el owner.
 
 ### Changed
+- **La huella de idempotencia del backend ahora incluye nombre y email del comprador** (antes
+  solo items, envío, costo y total), alineada con la del frontend: un cambio de datos del
+  comprador es otra compra con otra key, y reusar una key con otro comprador da `422`.
 - **`GET /api/orders/user` deja de hacer `SELECT *`**: `Order.findPaidByEmail`
   ahora lista columnas explícitas. Sin cambio de comportamiento visible; evita
   que una columna interna nueva se exponga a "Mis compras" sin decisión

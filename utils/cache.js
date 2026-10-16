@@ -149,6 +149,7 @@ const caches = {
   insights: new TtlCache({ name: 'insights', maxEntries: 50 }),
   auth: new TtlCache({ name: 'auth', maxEntries: 1000 }),
   orders: new TtlCache({ name: 'orders', maxEntries: 200 }),
+  idempotency: new TtlCache({ name: 'idempotency', maxEntries: 500 }),
 };
 
 const TTL = {

@@ -9,7 +9,7 @@ process.env.MP_WEBHOOK_SECRET = WEBHOOK_SECRET;
 
 const pool = installFakeDatabase();
 const mercadopago = require(abs('utils/mercadopago.js'));
-const Order = require(abs('models/Order.js'));
+const OrderPayment = require(abs('models/OrderPayment.js'));
 const { mpWebhook, confirmMpPayment } = require(abs('controllers/orderController.js'));
 
 const ORDER_ID = '11111111-1111-4111-8111-111111111111';
@@ -41,7 +41,7 @@ const stubPayments = (payment) => {
   getPaymentCalls = [];
   markPaidCalls = [];
   mercadopago.getPayment = async (id) => { getPaymentCalls.push(String(id)); return payment; };
-  Order.markPaidByIds = async (ids, amount) => { markPaidCalls.push({ ids, amount }); return ids.length; };
+  OrderPayment.markPaidByIds = async (ids, amount) => { markPaidCalls.push({ ids, amount }); return ids.length; };
 };
 
 describe('Webhook de Mercado Pago (prueba 6 y 7)', () => {
@@ -137,8 +137,8 @@ describe('mp-confirm: el navegador no decide si se pagó (prueba 5)', () => {
   });
 });
 
-describe('Order.markPaidByIds: monto e idempotencia (prueba 7)', () => {
-  const realMarkPaid = Order.markPaidByIds;
+describe('OrderPayment.markPaidByIds: monto e idempotencia (prueba 7)', () => {
+  const realMarkPaid = OrderPayment.markPaidByIds;
   const lastTx = () => pool.queries.map((q) => q.sql);
 
   const withRows = (rows, total) => {
@@ -153,26 +153,27 @@ describe('Order.markPaidByIds: monto e idempotencia (prueba 7)', () => {
         return { rows: [], rowCount: 0 };
       },
     });
-    Order.markPaidByIds = realMarkPaid;
+    OrderPayment.markPaidByIds = realMarkPaid;
   };
 
   const updates = () => lastTx().filter((sql) => sql.startsWith('UPDATE'));
 
   test('NEGATIVO: webhook repetido sobre una orden ya pagada no actualiza ni toca el stock', async () => {
     withRows([{ id: ORDER_ID, payment_status: 'pagado', product_id: 7, quantity: 2 }], 5000);
-    assert.equal(await Order.markPaidByIds([ORDER_ID], 5000, 1), 1);
+    // Devuelve las órdenes REALMENTE pasadas a pagado: un reintento no suma ninguna.
+    assert.equal(await OrderPayment.markPaidByIds([ORDER_ID], 5000, 1), 0);
     assert.deepEqual(updates(), []);
   });
 
   test('NEGATIVO: un pago por menos del total no salda la orden (-1, sin UPDATE)', async () => {
     withRows([{ id: ORDER_ID, payment_status: 'pendiente', product_id: 7, quantity: 2 }], 5000);
-    assert.equal(await Order.markPaidByIds([ORDER_ID], 100, 1), -1);
+    assert.equal(await OrderPayment.markPaidByIds([ORDER_ID], 100, 1), -1);
     assert.deepEqual(updates(), []);
   });
 
   test('POSITIVO: orden pendiente con el monto correcto pasa a pagado una sola vez, sin tocar stock', async () => {
     withRows([{ id: ORDER_ID, payment_status: 'pendiente', product_id: 7, quantity: 2 }], 5000);
-    assert.equal(await Order.markPaidByIds([ORDER_ID], 5000, 1), 1);
+    assert.equal(await OrderPayment.markPaidByIds([ORDER_ID], 5000, 1), 1);
     const sent = updates();
     assert.equal(sent.length, 1);
     assert.match(sent[0], /payment_status = 'pagado'/);
