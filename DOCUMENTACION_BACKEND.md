@@ -541,9 +541,11 @@ acota los `GRANT` y **revoca `TRUNCATE`** (que no está sujeto a RLS). El backen
 
 El frontend (`../../FRONT/damiana-bella`, repo propio) y este backend están **alineados**:
 
-- **Auth**: la maneja **Supabase Auth desde el front** (`signInWithPassword`, `signUp`,
-  `verifyOtp`, `resetPasswordForEmail`). No hay endpoints `/api/auth/*` acá y **no hacen falta**:
-  el backend solo verifica el access token que el front adjunta.
+- **Auth**: el front habla con `/api/auth/*` (`login`, `refresh`, `logout`, `resend-confirmation`,
+  `forgot-password`). El backend valida contra Supabase Auth, entrega el access token en el body y
+  guarda el refresh token en una cookie httpOnly; el front lo mantiene solo en memoria y adjunta el
+  access token a cada request (ver §4 y `routes/authRoutes.js`). El registro y la confirmación de
+  email siguen yendo directo a Supabase Auth.
 - **Órdenes, envíos, insights y Cloudinary**: implementados (§5.3 a §5.6) y consumidos por
   `src/services/orderService.ts`, `shippingService`, `insightsService` y `productService`.
 - **Transferencias**: el front **no** inserta en `ventas` directo por Supabase (lo bloqueaba RLS);

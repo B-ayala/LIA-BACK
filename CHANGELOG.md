@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Removed
+- `User.findByEmail`: método sin llamadores (la búsqueda por email vive en Supabase Auth).
+
+### Fixed
+- `DOCUMENTACION_BACKEND.md` §11 decía que no existían endpoints `/api/auth/*`; ahora describe el contrato real.
+
 ### Added
 - Scripts SQL (aplicados el 2026-10-24) de la auditoría de rendimiento: `2026-10-24_trigram_search_indexes.sql` (índices `pg_trgm` para las búsquedas ILIKE de productos y ventas), `2026-10-24_audit_log_index_and_retention.sql` (índices de `audit_log`, `old_data`/`new_data` solo con columnas vigiladas en UPDATE y función `purge_audit_log(retention)` sin agendar) y `2026-10-24_rls_initplan_and_duplicate_checks.sql` (policies con `(SELECT auth.uid())` y baja del CHECK redundante `ventas_payment_status_domain`).
 - Productos: campo `cardOptions` (columna `productos.card_options`, jsonb) con sellos propios de la card por producto; `null` usa las opciones globales y `[]` no muestra sellos. Requiere correr `db/migrations/2026-10-23_add_card_options_to_productos.sql`.

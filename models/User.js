@@ -1,5 +1,6 @@
 const { pool } = require('../config/database');
 const { setTransactionActor } = require('../utils/transaction');
+const { isValidUserName, INVALID_USER_NAME_MESSAGE } = require('../utils/userValidation');
 
 class User {
   /**
@@ -23,29 +24,6 @@ class User {
       return result.rows[0] || null;
     } catch (error) {
       throw new Error(`Error al buscar usuario por ID: ${error.message}`);
-    }
-  }
-
-  /**
-   * Encontrar usuario por email (en auth.users de Supabase)
-   */
-  static async findByEmail(email) {
-    try {
-      const query = `
-        SELECT
-          p.id,
-          p.name,
-          p.role,
-          p.created_at,
-          u.email
-        FROM public.profiles p
-        LEFT JOIN auth.users u ON p.id = u.id
-        WHERE LOWER(u.email) = LOWER($1)
-      `;
-      const result = await pool.query(query, [email]);
-      return result.rows[0] || null;
-    } catch (error) {
-      throw new Error(`Error al buscar usuario por email: ${error.message}`);
     }
   }
 
@@ -123,8 +101,8 @@ class User {
       let paramCount = 1;
 
       if (name !== undefined) {
-        if (name.length > 100) {
-          throw new Error('El nombre no puede tener más de 100 caracteres');
+        if (!isValidUserName(name)) {
+          throw new Error(INVALID_USER_NAME_MESSAGE);
         }
         updates.push(`name = $${paramCount}`);
         values.push(name.trim());
