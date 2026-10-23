@@ -108,8 +108,9 @@ El descuento de stock lo hace el **trigger `trg_decrement_stock`** (AFTER INSERT
 `ventas`), que existe en la base de datos. El backend NO descuenta al crear órdenes:
 - **Crear orden (INSERT en `ventas`)** → el trigger descuenta stock.
 - **Antes de insertar**, el backend valida disponibilidad con la fila del producto
-  bloqueada (`SELECT stock … FOR UPDATE`); si no alcanza, 409 y rollback (evita
-  la sobreventa que el trigger permitiría con su `GREATEST(stock,0)`).
+  bloqueada (`SELECT stock … FOR UPDATE`, con `lock_timeout` de 3 s: vencido, 503
+  `ORDER_BUSY`); si no alcanza, 409 y rollback. Segunda barrera: el trigger ya no
+  clampea a 0, así que el CHECK `stock >= 0` aborta un INSERT que sobrevendería.
 - **Cancelar / expirar** → el backend restaura el stock.
 - **Pago acreditado después de expirar** → el backend vuelve a descontar.
 

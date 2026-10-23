@@ -82,15 +82,21 @@ const initDatabase = async () => {
     console.log('\n⚙️ Aplicando función y trigger handle_new_user...');
     await client.query(`
       CREATE OR REPLACE FUNCTION public.handle_new_user()
-      RETURNS trigger AS $$
+      RETURNS trigger
+      LANGUAGE plpgsql
+      SECURITY DEFINER
+      SET search_path = public, pg_temp
+      AS $$
       BEGIN
         INSERT INTO public.profiles (id, name, role)
-        VALUES (NEW.id, NULLIF(NEW.raw_user_meta_data->>'name', ''), 'user')
+        VALUES (NEW.id, left(NULLIF(NEW.raw_user_meta_data->>'name', ''), 100), 'user')
         ON CONFLICT (id) DO NOTHING;
         RETURN NEW;
       END;
-      $$ LANGUAGE plpgsql SECURITY DEFINER;
+      $$;
     `);
+    // Solo el trigger la invoca: sin esto, cualquier rol podría llamarla por RPC.
+    await client.query('REVOKE EXECUTE ON FUNCTION public.handle_new_user() FROM PUBLIC, anon, authenticated');
     console.log('✓ Función handle_new_user aplicada');
 
     await client.query('DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users');

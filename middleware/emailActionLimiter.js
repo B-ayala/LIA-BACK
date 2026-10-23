@@ -3,14 +3,22 @@
 // si Supabase respondió éxito o error: así no se puede eludir el límite
 // reintentando ante cualquier respuesta.
 //
-// ⚠️ Estado en memoria del proceso, igual que loginBruteforce.js, rateLimit.js y
-// signupTracker.js: correcto con una sola instancia (Railway hoy); con más de
-// una instancia hay que mover el store a algo compartido (Redis).
+// ⚠️ Estado en memoria del proceso, igual que loginBruteforce.js y rateLimit.js:
+// correcto con una sola instancia; con más de una instancia hay que mover el
+// store a algo compartido (Redis).
 
-const store = new Map(); // `${action}:${email}` -> { count, windowStart }
+const { createBoundedStore } = require('../utils/boundedStore');
 
 const WINDOW_MS = 24 * 60 * 60 * 1000;
 const MAX_ATTEMPTS = 3;
+const MAX_TRACKED_KEYS = 10000;
+const PURGE_INTERVAL_MS = 10 * 60 * 1000;
+
+const store = createBoundedStore({
+  maxEntries: MAX_TRACKED_KEYS,
+  isExpired: (record) => Date.now() - record.windowStart > WINDOW_MS,
+  purgeIntervalMs: PURGE_INTERVAL_MS,
+}); // `${action}:${email}` -> { count, windowStart }
 
 const keyOf = (action, email) => `${action}:${email.toLowerCase().trim()}`;
 

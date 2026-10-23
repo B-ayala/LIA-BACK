@@ -7,6 +7,9 @@ const { resolveOriginalPrice } = require('../utils/productUpdateQuery');
 
 const MAX_PAGE_SIZE = 100;
 const DEFAULT_PAGE_SIZE = 50;
+// Tope de `offset`: la clave de caché incluye el offset, así que uno sin cota
+// permite llenar la caché con páginas vacías y expulsar las páginas reales.
+const MAX_PAGE_OFFSET = 10000;
 
 // Postgres rechaza un timestamp con forma válida pero fecha imposible (ej. mes 13).
 const INVALID_DATETIME_CODES = new Set(['22007', '22008']);
@@ -74,6 +77,7 @@ const toInsertValues = (body) => {
     body.status || 'active',
     images ? JSON.stringify(images) : null,
     resolveOriginalPrice(body.originalPrice, body.price),
+    body.cardOptions ? JSON.stringify(body.cardOptions) : null,
   ];
 };
 
@@ -92,7 +96,7 @@ const createProduct = async (req, res) => {
 const getProducts = async (req, res) => {
   try {
     const limit = boundedInt(req.query.limit, DEFAULT_PAGE_SIZE, 1, MAX_PAGE_SIZE);
-    const offset = boundedInt(req.query.offset, 0, 0, Number.MAX_SAFE_INTEGER);
+    const offset = boundedInt(req.query.offset, 0, 0, MAX_PAGE_OFFSET);
     const includeInactive = canSeeInactive(req);
     setAudienceHeaders(res, includeInactive);
 
@@ -117,14 +121,22 @@ const getProductById = async (req, res) => {
     const includeInactive = canSeeInactive(req);
     setAudienceHeaders(res, includeInactive);
 
-    // `null` ("no existe") también se cachea: un scraper de ids inexistentes no golpea la BD.
+    // "No existe" se recuerda en una caché aparte y chica: un scraper de ids inexistentes
+    // no golpea la BD, pero tampoco expulsa los productos reales de la caché del catálogo.
     // Un producto inactivo es "no existe" para el público, no solo "oculto".
+    const cacheKey = `detail:${audienceOf(includeInactive)}:${id}`;
+    if (caches.productMisses.get(cacheKey)) return sendError(res, 404, 'PRODUCT_NOT_FOUND', PRODUCT_NOT_FOUND_MESSAGE);
+
     const product = await caches.products.getOrSet(
-      `detail:${audienceOf(includeInactive)}:${id}`,
+      cacheKey,
       TTL.products,
-      () => Product.findById(id, includeInactive)
+      () => Product.findById(id, includeInactive),
+      { isCacheable: (value) => value !== null }
     );
-    if (!product) return sendError(res, 404, 'PRODUCT_NOT_FOUND', PRODUCT_NOT_FOUND_MESSAGE);
+    if (!product) {
+      caches.productMisses.set(cacheKey, true, TTL.products);
+      return sendError(res, 404, 'PRODUCT_NOT_FOUND', PRODUCT_NOT_FOUND_MESSAGE);
+    }
     return res.json({ success: true, data: product });
   } catch (error) {
     return serverError(res, 'detail', error);
@@ -159,11 +171,11 @@ const updateProduct = async (req, res) => {
   }
 };
 
-/** No borrar el asset si otro producto usa el mismo `public_id` (Cloudinary borra por public_id). */
-const removeProductImage = async ({ publicId, imageShared }) => {
+/** No borrar el asset si otro producto, el carrusel o el contenido del sitio lo usan (Cloudinary borra por public_id). */
+const removeProductImage = async ({ publicId, imageInUse }) => {
   if (!publicId) return;
-  if (imageShared) {
-    logger.warn('cloudinary_asset_shared', { publicId });
+  if (imageInUse) {
+    logger.warn('cloudinary_asset_in_use', { publicId });
     return;
   }
   try {

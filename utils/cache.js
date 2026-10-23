@@ -84,9 +84,10 @@ class TtlCache {
 
   /**
    * Devuelve el valor cacheado o ejecuta `loader` una sola vez para todas las
-   * llamadas concurrentes con la misma clave.
+   * llamadas concurrentes con la misma clave. `isCacheable` permite no guardar
+   * ciertos resultados (ej. `null`) sin perder el single-flight.
    */
-  async getOrSet(key, ttlMs, loader) {
+  async getOrSet(key, ttlMs, loader, { isCacheable = () => true } = {}) {
     const cached = this.get(key);
     if (cached !== undefined) {
       this.metrics.hits += 1;
@@ -102,7 +103,7 @@ class TtlCache {
     this.metrics.misses += 1;
     const promise = (async () => loader())()
       .then((value) => {
-        this.set(key, value, ttlMs);
+        if (isCacheable(value)) this.set(key, value, ttlMs);
         return value;
       })
       .finally(() => {
@@ -149,6 +150,9 @@ const caches = {
   insights: new TtlCache({ name: 'insights', maxEntries: 50 }),
   auth: new TtlCache({ name: 'auth', maxEntries: 1000 }),
   orders: new TtlCache({ name: 'orders', maxEntries: 200 }),
+  // Ids de producto inexistentes: separados del catálogo para que un scraper que
+  // pida ids al azar no expulse las claves calientes (FIFO) de `products`.
+  productMisses: new TtlCache({ name: 'productMisses', maxEntries: 100 }),
   idempotency: new TtlCache({ name: 'idempotency', maxEntries: 500 }),
 };
 
@@ -165,6 +169,9 @@ const cacheStats = () => Object.values(caches).map((cache) => cache.stats());
  * de stock (alta/edición/baja, creación de órdenes, cancelaciones, sweep de
  * expiración) para que el stock publicado no quede viejo más de lo necesario.
  */
-const invalidateProducts = () => caches.products.clear();
+const invalidateProducts = () => {
+  caches.products.clear();
+  caches.productMisses.clear();
+};
 
 module.exports = { TtlCache, caches, TTL, cacheStats, invalidateProducts };

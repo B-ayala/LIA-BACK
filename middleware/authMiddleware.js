@@ -58,6 +58,36 @@ const verifySupabaseToken = (token) =>
     request.end();
   });
 
+// Un access token real mide ~1 kB; arriba de esto es basura o un intento de abuso.
+const MAX_TOKEN_LENGTH = 4096;
+// Tolerancia de reloj entre este servidor y Supabase antes de dar un token por vencido.
+const EXPIRY_CLOCK_SKEW_SECONDS = 30;
+
+/** `exp` (segundos epoch) de un JWT, sin verificar la firma; null si no se puede leer. */
+const tokenExpiry = (token) => {
+  const segments = String(token).split('.');
+  if (segments.length !== 3) return null;
+  try {
+    const payload = JSON.parse(Buffer.from(segments[1], 'base64url').toString('utf8'));
+    return typeof payload?.exp === 'number' ? payload.exp : null;
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Descarta sin consultar a Supabase lo que no puede ser un token válido: demasiado
+ * largo, o un JWT cuyo `exp` ya pasó. Cada token inválido cuesta un round trip HTTPS
+ * y un slot del bulkhead (y no se cachea a propósito), así que un cliente que insiste
+ * con un token vencido, o un script con tokens basura, no debe generar tráfico hacia Auth.
+ * No verifica firma: un token bien formado y vigente pero falso igual se consulta.
+ */
+const isClearlyUnusableToken = (token) => {
+  if (token.length > MAX_TOKEN_LENGTH) return true;
+  const expiry = tokenExpiry(token);
+  return expiry !== null && expiry < Math.floor(Date.now() / 1000) - EXPIRY_CLOCK_SKEW_SECONDS;
+};
+
 /**
  * Resuelve el usuario de la request: verifica el token contra Supabase y lee su
  * rol de `profiles`.
@@ -95,6 +125,8 @@ const resolveRequestUser = async (token) => {
  * `CACHE_TTL_AUTH_SECONDS` (30 s por defecto, `0` desactiva la caché).
  */
 const resolveRequestUserCached = async (token) => {
+  // Sin llamar a Supabase: un token claramente inservible no puede ser válido.
+  if (isClearlyUnusableToken(token)) return null;
   if (!(TTL.auth > 0)) return resolveRequestUser(token);
 
   const key = tokenCacheKey(token);
@@ -258,5 +290,6 @@ module.exports = {
   authMiddleware,
   optionalAuth,
   adminMiddleware,
-  tokenAssuranceLevel
+  tokenAssuranceLevel,
+  isClearlyUnusableToken
 };

@@ -37,6 +37,12 @@ const recordPreferenceId = async (orderIds, preferenceId) => {
   }
 };
 
+const mpUnavailableResult = () => failureResult({
+  status: HTTP_BAD_GATEWAY,
+  code: 'MP_UNAVAILABLE',
+  message: 'No se pudo conectar con Mercado Pago. Intentá de nuevo o elegí transferencia.',
+});
+
 const logPreferenceFailure = (error, orderIds) => {
   if (error.code === 'MP_TIMEOUT') {
     logger.warn('mp_create_preference_timeout', { orderIds });
@@ -53,6 +59,13 @@ const logPreferenceFailure = (error, orderIds) => {
  * round trip externo y bastarían unas pocas compras simultáneas para frenar la API.
  */
 const buildMpCheckout = async (input) => {
+  // Circuito abierto (MP caído): se corta ANTES de reservar, así no se toca stock
+  // ni se ocupa una conexión para compensar enseguida. La transferencia sigue disponible.
+  if (!mercadopago.isAvailable()) {
+    logger.warn('mp_checkout_rejected_circuit_open', { retryAfterSeconds: mercadopago.retryAfterSeconds() });
+    return mpUnavailableResult();
+  }
+
   const reservation = await reserveOrders({ ...input, paymentMethod: 'mp' });
   if (!reservation.ok) return failureResult(reservation);
 
@@ -75,11 +88,7 @@ const buildMpCheckout = async (input) => {
   } catch (error) {
     logPreferenceFailure(error, reservation.orderIds);
     await releaseOrders(reservation.orderIds);
-    return failureResult({
-      status: HTTP_BAD_GATEWAY,
-      code: 'MP_UNAVAILABLE',
-      message: 'No se pudo conectar con Mercado Pago. Intentá de nuevo o elegí transferencia.',
-    });
+    return mpUnavailableResult();
   }
 };
 

@@ -2,14 +2,32 @@
 
 ## [Unreleased]
 
+### Added
+- Productos: campo `cardOptions` (columna `productos.card_options`, jsonb) con sellos propios de la card por producto; `null` usa las opciones globales y `[]` no muestra sellos. Requiere correr `db/migrations/2026-10-23_add_card_options_to_productos.sql`.
+- Observabilidad: toda respuesta lleva `X-Request-Id` (también en cada línea de log de esa request); `GET /health` (con token) expone p50/p95/p99 por ruta, el estado de cada carril del bulkhead y del circuito de Mercado Pago; se loguean las requests lentas (`SLOW_REQUEST_MS`) y las 5xx.
+- `GET /ready`: readiness real (`SELECT 1` con plazo de 2 s, memorizado 3 s) para un monitor externo; `/health` sigue siendo liveness.
+- Mercado Pago: circuit breaker (5 caídas seguidas abren 30 s). Con el circuito abierto `mp-preference` responde `502 MP_UNAVAILABLE` antes de reservar stock; las lecturas a MP se reintentan una vez con backoff y jitter ante fallas rápidas.
+- `proxy_diagnostic`: al arrancar se loguean (con la IP enmascarada) los saltos de `X-Forwarded-For` para verificar que `trust proxy = 1` es correcto detrás de la plataforma.
+- `qa/k6/`: scripts de carga (catálogo con perfiles smoke / load / stress / spike / soak, y carrera por la última unidad). No ejecutados todavía.
+
 ### Security
+- Auth (ABU-001): `forgot-password` y `resend-confirmation` validaban el email con un regex de backtracking cuadrático y sin tope de largo: un solo POST sin autenticar con ~250 kB bloqueaba el event loop cerca de un minuto (toda la tienda, webhook incluido). Ahora `utils/emailValidation.js` acota a 254 caracteres y usa un patrón lineal; `login` también rechaza emails de más de 254 (400).
+- Auth: `/api/auth/*` parsea el body con tope de 8 kB (antes 256 kB, igual que el resto de la API); un body mayor responde 413.
+- Auth (A1): todas las llamadas del backend a Supabase Auth (login, refresh, logout, reenvío, recuperación) tienen timeout de 5 s. Si Auth no responde, la API contesta 503 `AUTH_UNAVAILABLE` con `Retry-After: 2` (el refresh no borra la cookie) en vez de retener un slot del bulkhead hasta saturar toda la API.
+- Cloudinary (A3): todas las llamadas (borrado de imágenes, listado, carpetas, uso) comparten `utils/cloudinaryHttp.js`, con plazo total de 8 s y tope de 5 MB de respuesta (antes sin timeout y acumulando la respuesta entera en memoria). Un fallo responde 502 `CLOUDINARY_ERROR`.
+- Rate limit en memoria (ABU-002): `loginBruteforce` y `emailActionLimiter` usan `utils/boundedStore.js` (tope de entradas + purga periódica). `emailActionLimiter` nunca purgaba y crecía con cada email distinto.
+- Bulkheads por carril (A2): lecturas, auth, checkout, admin y webhook de Mercado Pago tienen cada uno su cupo y su cola; el webhook ya no compite con el catálogo. Variables `BULKHEAD_<CARRIL>_MAX` / `_QUEUE`.
+- Tokens (ABU-006): un access token de más de 4096 caracteres o un JWT ya vencido se descarta sin consultar a Supabase Auth.
+- Catálogo (ABU-007): `offset` acotado a 10000 y los ids inexistentes se recuerdan en una caché aparte, para que un scraper no expulse las páginas reales de la caché.
+- Proceso (M10): `uncaughtException` se loguea y cierra el proceso de forma ordenada (código 1); `unhandledRejection` se cuenta en las métricas.
+- Timeout global (B1): `middleware/requestDeadline.js` responde 503 `REQUEST_TIMEOUT` si un handler no contesta en 25 s. No aplica a `/api/orders` (un 503 mientras la reserva o el pago terminan en segundo plano confundiría al cliente; ahí rigen los timeouts de DB y Mercado Pago).
 - Checkout (SEC-N01): tope de **unidades por línea** (`MAX_QUANTITY_PER_LINE`, default 20; 400) y de **unidades pendientes por usuario** (`MAX_PENDING_UNITS_PER_USER`, default 60; 429 `TOO_MANY_PENDING_ORDERS`). El tope por líneas solo permitía reservar el stock completo de 30 productos con una cuenta.
 - Rate limit por usuario (SEC-N02): `POST /api/orders/transfer|mp-preference` (8/min) y `mp-confirm|mp-cancel|/:id/cancel` (20/min) cuentan por cuenta además de por IP (el límite por IP se evaluaba antes de autenticar).
 - Mercado Pago (SEC-N03): un pago `approved` con devolución parcial (`transaction_amount_refunded` > 0) se marca `review_reason = refunded` para el admin; antes solo se detectaban `refunded`/`charged_back` totales.
 - Logs (SEC-N04): rate limit, load shedding y errores no guardan la query string de la URL (`/api/orders/user?email=...` dejaba el email del cliente en los logs de la plataforma).
 - `GET /health` (SEC-N05): en producción solo devuelve `{ status, uptimeSeconds }`; el detalle (pool, bulkhead, cachés) exige `HEALTH_DETAIL_TOKEN` + header `x-health-token`. En desarrollo sigue completo.
 - Admin (SEC-N06): `adminMiddleware` ya no devuelve `error.message` al cliente; `ADMIN_REQUIRE_MFA=true` (opt-in, apagado por defecto) exige sesión `aal2` en las rutas admin. No activar hasta tener el enrolamiento TOTP en el panel.
-- Auditoría (SEC-N07): las escrituras admin del backend (productos, perfiles, transferencias, nudge) fijan `app.actor` en su transacción (`utils/transaction.js`). Falta aplicar el script SQL propuesto `db/migrations/2026-10-16_audit_actor_PROPOSED.sql` para que el trigger de `audit_log` lo lea; mientras tanto `actor` sigue en NULL y no cambia nada más.
+- Auditoría (SEC-N07): las escrituras admin del backend (productos, perfiles, transferencias, nudge) fijan `app.actor` en su transacción (`utils/transaction.js`). El script SQL `db/migrations/2026-10-16_audit_actor.sql` (ya aplicado en Supabase) hace que el trigger de `audit_log` lo lea; `actor` se completa una vez desplegado este backend.
 - Sweep (SEC-N08): el lote de vencidas excluye las compras consultadas hace menos de 5 min; las retenidas ya no dejan sin evaluar a las más nuevas.
 - Checkout: un producto inactivo ya no se puede comprar llamando a la API con su id (409 `PRODUCT_UNAVAILABLE`); antes solo se ocultaba del catálogo.
 - Checkout: tope de líneas pendientes de pago por usuario (`MAX_PENDING_LINES_PER_USER`, default 30; 429 `TOO_MANY_PENDING_ORDERS`) para que una cuenta no retenga el stock del catálogo.
@@ -23,7 +41,15 @@
 - Auth: `POST /api/auth/login|refresh|logout` rechazan con 403 un `Origin` fuera de la allowlist de CORS (defensa CSRF de la cookie del refresh token, que es `SameSite=None`).
 - Auth: login fallido registra `auth_login_failed_credentials` (código de Supabase, sin PII).
 
+### Removed
+- Endpoints públicos sin consumidor en el front: `POST /api/users/login` (duplicaba a `POST /api/auth/login`), `GET /api/users/signup-status/:email` y `POST /api/users/signup-ratelimit` (cualquiera podía escribir emails arbitrarios en un Map sin purga). Responden 404. `middleware/signupTracker.js` eliminado.
+
 ### Changed
+- Stock (H-07): script SQL `db/migrations/2026-10-23_stock_trigger_fail_loud.sql` (aplicado el 2026-10-23) deja versionado `decrement_stock_on_sale()` y quita el `GREATEST(…, 0)`: una venta que sobrevendería falla con el CHECK `stock >= 0` en vez de pasar en silencio.
+- Checkout (H-15): la reserva de stock espera como máximo `RESERVE_LOCK_TIMEOUT_MS` (3000) por el lock del producto; vencido responde `503 ORDER_BUSY` en vez de hacer cola hasta el `statement_timeout`.
+- Logs: un 503 de degradación controlada (carril saturado, Auth o MP caídos, plazo vencido) ya no se loguea además como `request_failed` de nivel error; cada causa se loguea donde ocurre y el 503 sigue contando en las métricas.
+- Base de datos: los logs de conexión usan el logger estructurado y ya no incluyen host ni usuario; los reintentos de arranque pasan de 3 a 5 con backoff exponencial y jitter (2 s, 4 s, 8 s, 10 s).
+- `GET /health`: `concurrency` pasa de un único objeto a un objeto por carril (`concurrency.read`, `.auth`, `.checkout`, `.admin`, `.webhook`).
 - Auth: `login`, `forgot-password` y `resend-confirmation` aceptan `captchaToken` y lo reenvían a Supabase (`gotrue_meta_security`). El login responde `EMAIL_NOT_CONFIRMED` (401) y `CAPTCHA_FAILED` (400); ninguno de los dos cuenta como intento fallido de contraseña.
 - Productos: `POST`/`PUT /api/products` aceptan y persisten `originalPrice` (columna `original_price`); `price` sigue siendo el precio final cobrado y un original que no supere al precio se descarta. `PUT` con `originalPrice: null` lo borra. Script SQL `2026-10-07_add_original_price_to_productos.sql` (idempotente); `init-db` también crea la columna.
 - Productos: `GET /api/products` y `/:id` solo devuelven productos activos al público; un admin con token válido ve también los inactivos (caché separada por audiencia, `Vary: Authorization`).
@@ -47,6 +73,7 @@
 - `orderController.js` (943 líneas) dividido en controllers de checkout, cancelación y transferencias + `services/` (checkout, reserva, cancelación MP, transferencias, sweep, conciliación); `models/Order.js` dividido con `models/OrderPayment.js`; `productController` usa `models/Product.js`.
 
 ### Fixed
+- **Borrar un producto ahora borra su imagen en Cloudinary** (H-CLD-DESTROY): `utils/cloudinaryDestroy.js` llamaba a un endpoint inexistente (404) y el asset quedaba huérfano. Ahora usa `DELETE /resources/image/upload` y exige que Cloudinary responda `deleted`. No se borra si otro producto, `carousel_images` o `site_content` referencian el mismo `public_id`.
 - **Conexiones del pool**: `/:id/cancel` ya no retiene una conexión mientras consulta a MP; ningún handler de órdenes hace `pool.connect()` fuera de try/catch y un ROLLBACK fallido descarta la conexión rota (`utils/transaction.js`).
 - **Deadlocks**: la reserva bloquea productos en orden de id; cancelación, expiración (CTE con `ORDER BY id FOR UPDATE`) y pago bloquean ventas por id y productos en orden ascendente.
 - Un `settle` con monto distinto, monto no numérico o que no marcó nada ya no cuenta como pagado en el sweep.

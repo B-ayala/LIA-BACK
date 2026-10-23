@@ -5,6 +5,8 @@
  * En desarrollo se imprime legible; en producción, JSON puro.
  */
 
+const { currentRequestId } = require('./requestContext');
+
 const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
 
 const currentLevel = () => LEVELS[process.env.LOG_LEVEL] || LEVELS.info;
@@ -14,10 +16,11 @@ const isProduction = () => process.env.NODE_ENV === 'production';
 const write = (level, message, context) => {
   if (LEVELS[level] < currentLevel()) return;
 
-  const entry = { level, time: new Date().toISOString(), message, ...context };
+  const requestId = currentRequestId();
+  const entry = { level, time: new Date().toISOString(), message, ...(requestId ? { requestId } : {}), ...context };
   const line = isProduction()
     ? JSON.stringify(entry)
-    : `[${level}] ${message}${context && Object.keys(context).length ? ` ${JSON.stringify(context)}` : ''}`;
+    : `[${level}] ${message}${requestId ? ` (${requestId})` : ''}${context && Object.keys(context).length ? ` ${JSON.stringify(context)}` : ''}`;
 
   if (level === 'error') process.stderr.write(`${line}\n`);
   else process.stdout.write(`${line}\n`);

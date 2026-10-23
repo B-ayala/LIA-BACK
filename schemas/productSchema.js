@@ -13,6 +13,14 @@ const { z } = require('zod');
 const MAX_TEXT = 500;
 const MAX_LONG_TEXT = 5000;
 const MAX_ARRAY_ITEMS = 50;
+const MAX_CARD_OPTIONS = 10;
+const MAX_CARD_OPTION_TEXT = 40;
+
+const cardOptionSchema = z.object({
+  label: z.string().trim().min(1).max(MAX_CARD_OPTION_TEXT),
+  icon: z.string().trim().min(1).max(MAX_CARD_OPTION_TEXT),
+  isActive: z.boolean(),
+});
 
 const productBaseSchema = z.object({
   name: z.string().trim().min(1, 'El nombre es requerido').max(200),
@@ -29,6 +37,8 @@ const productBaseSchema = z.object({
   condition: z.enum(['new', 'used']).optional(),
   freeShipping: z.boolean().optional(),
   hoverImageEnabled: z.boolean().optional(),
+  // null = usa las opciones globales; [] = sin sellos.
+  cardOptions: z.array(cardOptionSchema).max(MAX_CARD_OPTIONS).nullable().optional(),
   variants: z.array(z.any()).max(MAX_ARRAY_ITEMS).optional(),
   specifications: z.array(z.any()).max(MAX_ARRAY_ITEMS).optional(),
   features: z.array(z.any()).max(MAX_ARRAY_ITEMS).optional(),

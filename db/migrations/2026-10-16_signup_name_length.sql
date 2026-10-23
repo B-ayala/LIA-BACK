@@ -1,5 +1,5 @@
 -- ============================================================================
--- PROPUESTO (NO APLICADO) — Acotar el nombre que llega en el alta de usuarios (SEC-N10)
+-- APLICADO 2026-10-16 — Acotar el nombre que llega en el alta de usuarios (SEC-N10)
 --
 -- CONTEXTO
 --  `handle_new_user` copia `raw_user_meta_data->>'name'` a `profiles.name` sin límite.

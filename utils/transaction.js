@@ -43,12 +43,17 @@ const setTransactionActor = async (client, actor) => {
   await client.query("SELECT set_config('app.actor', $1, true)", [String(actor).toLowerCase()]);
 };
 
-const createTransactionRunner = (pool) => async (context, work, { actor = null } = {}) => {
+/** Plazo máximo esperando un lock de fila; vencido, Postgres aborta con 55P03 en vez de hacer cola. */
+const setLockTimeout = (client, lockTimeoutMs) =>
+  client.query("SELECT set_config('lock_timeout', $1, true)", [`${Math.trunc(lockTimeoutMs)}ms`]);
+
+const createTransactionRunner = (pool) => async (context, work, { actor = null, lockTimeoutMs = null } = {}) => {
   const client = await pool.connect();
   let brokenConnection = null;
   try {
     await client.query('BEGIN');
     await setTransactionActor(client, actor);
+    if (lockTimeoutMs) await setLockTimeout(client, lockTimeoutMs);
     const result = await work(client);
     if (isRollback(result)) {
       brokenConnection = await rollbackSafely(client, context);

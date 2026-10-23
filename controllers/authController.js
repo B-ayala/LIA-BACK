@@ -2,6 +2,8 @@ const User = require('../models/User');
 const { checkLock, recordFailure, recordSuccess } = require('../middleware/loginBruteforce');
 const { checkLimit, recordAttempt } = require('../middleware/emailActionLimiter');
 const logger = require('../utils/logger');
+const { fetchWithTimeout, isTimeoutError } = require('../utils/fetchWithTimeout');
+const { isValidEmail, MAX_EMAIL_LENGTH } = require('../utils/emailValidation');
 
 /**
  * Endpoints de sesión (login/refresh/logout) separados de `userController`
@@ -44,7 +46,7 @@ const clearRefreshCookie = (res) =>
   res.clearCookie(REFRESH_COOKIE_NAME, { path: REFRESH_COOKIE_PATH });
 
 const requestSupabaseToken = async (grantType, body) => {
-  const response = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=${grantType}`, {
+  const response = await fetchWithTimeout(`${SUPABASE_URL}/auth/v1/token?grant_type=${grantType}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', apikey: SUPABASE_ANON_KEY },
     body: JSON.stringify(body),
@@ -61,7 +63,16 @@ const buildUserPayload = (profile) => ({
 });
 
 const serviceUnavailable = (res) =>
-  res.status(503).json({ success: false, message: 'Servicio de autenticación no disponible' });
+  res.status(503).json({ success: false, code: 'AUTH_UNAVAILABLE', message: 'Servicio de autenticación no disponible' });
+
+// Mismo 503 que `authMiddleware` ante una falla de Auth: el front lo trata como
+// transitorio (no cierra la sesión) y `Retry-After` indica cuándo reintentar.
+const AUTH_RETRY_AFTER_SECONDS = 2;
+const respondAuthTimeout = (res, logEvent) => {
+  logger.warn(logEvent);
+  res.setHeader('Retry-After', AUTH_RETRY_AFTER_SECONDS);
+  return serviceUnavailable(res);
+};
 
 const invalidCredentials = (res) =>
   res.status(401).json({ success: false, message: 'Credenciales inválidas' });
@@ -100,8 +111,6 @@ const captchaMeta = (captchaToken) =>
 const getFrontendOrigin = () =>
   (process.env.FRONTEND_URL || 'http://localhost:5173').split(',')[0].trim();
 
-const isValidEmail = (email) => typeof email === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
-
 const maxAttemptsResponse = (res, retryAfterSeconds) => {
   res.setHeader('Retry-After', retryAfterSeconds);
   return res.status(429).json({
@@ -121,8 +130,9 @@ const maxAttemptsResponse = (res, retryAfterSeconds) => {
 exports.login = async (req, res) => {
   try {
     const { email, password, captchaToken } = req.body;
-    // Un email no-string (objeto/array) rompería email.toLowerCase() en el tracker de fuerza bruta.
-    if (typeof email !== 'string' || typeof password !== 'string' || !email || !password) {
+    // Un email no-string (objeto/array) rompería email.toLowerCase() en el tracker de fuerza bruta,
+    // y uno sin tope de largo se guardaría entero como clave de ese tracker.
+    if (typeof email !== 'string' || typeof password !== 'string' || !email || !password || email.length > MAX_EMAIL_LENGTH) {
       return res.status(400).json({ success: false, message: 'Email y contraseña son requeridos' });
     }
 
@@ -169,6 +179,7 @@ exports.login = async (req, res) => {
       },
     });
   } catch (error) {
+    if (isTimeoutError(error)) return respondAuthTimeout(res, 'auth_login_timeout');
     logger.error('auth_login_failed', { error: error.message });
     res.status(500).json({ success: false, message: 'No se pudo validar las credenciales' });
   }
@@ -212,13 +223,14 @@ exports.refresh = async (req, res) => {
       },
     });
   } catch (error) {
+    if (isTimeoutError(error)) return respondAuthTimeout(res, 'auth_refresh_timeout');
     logger.error('auth_refresh_failed', { error: error.message });
     res.status(500).json({ success: false, message: 'No se pudo renovar la sesión' });
   }
 };
 
 const supabaseLogout = (accessToken) =>
-  fetch(`${SUPABASE_URL}/auth/v1/logout?scope=global`, {
+  fetchWithTimeout(`${SUPABASE_URL}/auth/v1/logout?scope=global`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${accessToken}`, apikey: SUPABASE_ANON_KEY },
   });
@@ -281,7 +293,7 @@ exports.resendConfirmation = async (req, res) => {
     recordAttempt('resend_confirmation', email);
 
     const redirectTo = `${getFrontendOrigin()}/auth/confirm`;
-    const response = await fetch(
+    const response = await fetchWithTimeout(
       `${SUPABASE_URL}/auth/v1/resend?redirect_to=${encodeURIComponent(redirectTo)}`,
       {
         method: 'POST',
@@ -301,6 +313,7 @@ exports.resendConfirmation = async (req, res) => {
       message: 'Si la cuenta existe y está pendiente, te reenviamos el email de confirmación.',
     });
   } catch (error) {
+    if (isTimeoutError(error)) return respondAuthTimeout(res, 'auth_resend_confirmation_timeout');
     logger.error('auth_resend_confirmation_failed', { error: error.message });
     res.status(500).json({ success: false, message: 'No se pudo reenviar el email' });
   }
@@ -326,7 +339,7 @@ exports.forgotPassword = async (req, res) => {
     recordAttempt('forgot_password', email);
 
     const redirectTo = `${getFrontendOrigin()}/auth/reset-password`;
-    const response = await fetch(
+    const response = await fetchWithTimeout(
       `${SUPABASE_URL}/auth/v1/recover?redirect_to=${encodeURIComponent(redirectTo)}`,
       {
         method: 'POST',
@@ -344,6 +357,7 @@ exports.forgotPassword = async (req, res) => {
       message: 'Si la cuenta existe, te enviamos un email para restablecer la contraseña.',
     });
   } catch (error) {
+    if (isTimeoutError(error)) return respondAuthTimeout(res, 'auth_forgot_password_timeout');
     logger.error('auth_forgot_password_failed', { error: error.message });
     res.status(500).json({ success: false, message: 'No se pudo enviar el email' });
   }

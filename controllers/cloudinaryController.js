@@ -1,6 +1,6 @@
 const crypto = require('crypto');
-const https = require('https');
 const logger = require('../utils/logger');
+const { cloudinaryRequest, getApiSecret } = require('../utils/cloudinaryHttp');
 
 /**
  * Responde un error de servidor sin exponer internals (respuesta cruda de
@@ -21,14 +21,6 @@ const serverError = (res, action, error) => {
  * namespace de carpetas (ej. `productos/../../otra-cuenta`).
  */
 const FOLDER_SEGMENT_RE = /^[A-Za-z0-9 _-]+$/;
-
-/**
- * CLOUDINARY_API_SECRET tal como llega de la env var, saneado. Copiar/pegar el
- * secret en el panel de Railway puede sumar comillas o un salto de línea al
- * final sin que se note — eso invalida cualquier firma SHA1 calculada con él.
- */
-const getApiSecret = () =>
-  (process.env.CLOUDINARY_API_SECRET || '').trim().replace(/^['"]|['"]$/g, '');
 
 /** @returns {string[]|null} segmentos saneados, o null si el path es inválido. */
 const sanitizeFolderPath = (rawPath) => {
@@ -86,44 +78,11 @@ const deleteImage = async (req, res) => {
       });
     }
 
-    // Create auth string for Cloudinary API
-    const apiSecret = getApiSecret();
-    const auth = Buffer.from(
-      `${process.env.CLOUDINARY_API_KEY}:${apiSecret}`
-    ).toString('base64');
-
-    const options = {
-      hostname: 'api.cloudinary.com',
-      path: `/v1_1/${process.env.CLOUDINARY_CLOUD_NAME}/resources/image/upload?public_ids%5B%5D=${encodeURIComponent(publicId)}`,
-      method: 'DELETE',
-      headers: {
-        'Authorization': `Basic ${auth}`,
-      },
-    };
-
-    const request = https.request(options, (response) => {
-      let data = '';
-
-      response.on('data', (chunk) => {
-        data += chunk;
-      });
-
-      response.on('end', () => {
-        try {
-          const result = JSON.parse(data);
-          res.json({
-            success: true,
-            data: result,
-          });
-        } catch (parseError) {
-          serverError(res, 'delete_image_parse', parseError);
-        }
-      });
-    });
-
-    request.on('error', (error) => serverError(res, 'delete_image', error));
-
-    request.end();
+    const result = await cloudinaryRequest(
+      'DELETE',
+      `/v1_1/${process.env.CLOUDINARY_CLOUD_NAME}/resources/image/upload?public_ids%5B%5D=${encodeURIComponent(publicId)}`
+    );
+    res.json({ success: true, data: result });
   } catch (error) {
     serverError(res, 'delete_image', error);
   }
@@ -133,52 +92,20 @@ const getImages = async (req, res) => {
   try {
     const { folder, next_cursor } = req.query;
 
-    const apiSecret = getApiSecret();
-    const auth = Buffer.from(
-      `${process.env.CLOUDINARY_API_KEY}:${apiSecret}`
-    ).toString('base64');
-
     let path = `/v1_1/${process.env.CLOUDINARY_CLOUD_NAME}/resources/image?max_results=100&type=upload`;
     if (folder) path += `&prefix=${encodeURIComponent(folder)}`;
     if (next_cursor) path += `&next_cursor=${encodeURIComponent(next_cursor)}`;
 
-    const options = {
-      hostname: 'api.cloudinary.com',
-      path,
-      method: 'GET',
-      headers: {
-        'Authorization': `Basic ${auth}`,
-      },
-    };
-
-    const request = https.request(options, (response) => {
-      let data = '';
-
-      response.on('data', (chunk) => {
-        data += chunk;
+    const result = await cloudinaryRequest('GET', path);
+    // Cloudinary responde 200 con { error } ante credenciales/permisos inválidos:
+    // propagarlo como error real para que el front muestre estado de error y no crashee.
+    if (result.error || !Array.isArray(result.resources)) {
+      return res.status(502).json({
+        success: false,
+        message: result.error?.message || 'Respuesta inválida de Cloudinary',
       });
-
-      response.on('end', () => {
-        try {
-          const result = JSON.parse(data);
-          // Cloudinary responde 200 con { error } ante credenciales/permisos inválidos:
-          // propagarlo como error real para que el front muestre estado de error y no crashee.
-          if (result.error || !Array.isArray(result.resources)) {
-            return res.status(502).json({
-              success: false,
-              message: result.error?.message || 'Respuesta inválida de Cloudinary',
-            });
-          }
-          res.json({ success: true, data: result });
-        } catch (parseError) {
-          serverError(res, 'get_images_parse', parseError);
-        }
-      });
-    });
-
-    request.on('error', (error) => serverError(res, 'get_images', error));
-
-    request.end();
+    }
+    res.json({ success: true, data: result });
   } catch (error) {
     serverError(res, 'get_images', error);
   }
@@ -197,7 +124,7 @@ const mapUsageResponse = (result) => ({
 const getUsage = async (_req, res) => {
   try {
     const apiPath = `/v1_1/${process.env.CLOUDINARY_CLOUD_NAME}/usage`;
-    const result = await cloudinaryRequest('GET', apiPath, null);
+    const result = await cloudinaryRequest('GET', apiPath);
 
     if (result.error) {
       return res.status(502).json({
@@ -210,38 +137,6 @@ const getUsage = async (_req, res) => {
   } catch (error) {
     serverError(res, 'get_usage', error);
   }
-};
-
-// Helper: make a Cloudinary Admin API request
-const cloudinaryRequest = (method, path, body) => {
-  return new Promise((resolve, reject) => {
-    const apiSecret = getApiSecret();
-    const auth = Buffer.from(`${process.env.CLOUDINARY_API_KEY}:${apiSecret}`).toString('base64');
-
-    const headers = { 'Authorization': `Basic ${auth}` };
-    let postData = null;
-
-    if (body) {
-      postData = JSON.stringify(body);
-      headers['Content-Type'] = 'application/json';
-      headers['Content-Length'] = Buffer.byteLength(postData);
-    }
-
-    const req = https.request(
-      { hostname: 'api.cloudinary.com', path, method, headers },
-      (response) => {
-        let data = '';
-        response.on('data', (chunk) => { data += chunk; });
-        response.on('end', () => {
-          try { resolve(JSON.parse(data)); }
-          catch { reject(new Error('Parse error')); }
-        });
-      }
-    );
-    req.on('error', reject);
-    if (postData) req.write(postData);
-    req.end();
-  });
 };
 
 const getFolders = async (req, res) => {
@@ -257,7 +152,7 @@ const getFolders = async (req, res) => {
       apiPath += `/${segments.map(encodeURIComponent).join('/')}`;
     }
 
-    const result = await cloudinaryRequest('GET', apiPath, null);
+    const result = await cloudinaryRequest('GET', apiPath);
     res.json({ success: true, data: result });
   } catch (error) {
     serverError(res, 'get_folders', error);
@@ -276,7 +171,7 @@ const createFolder = async (req, res) => {
     }
 
     const apiPath = `/v1_1/${process.env.CLOUDINARY_CLOUD_NAME}/folders/${segments.map(encodeURIComponent).join('/')}`;
-    const result = await cloudinaryRequest('POST', apiPath, null);
+    const result = await cloudinaryRequest('POST', apiPath);
     res.json({ success: true, data: result });
   } catch (error) {
     serverError(res, 'create_folder', error);
@@ -295,7 +190,7 @@ const deleteFolder = async (req, res) => {
     }
 
     const apiPath = `/v1_1/${process.env.CLOUDINARY_CLOUD_NAME}/folders/${segments.map(encodeURIComponent).join('/')}`;
-    const result = await cloudinaryRequest('DELETE', apiPath, null);
+    const result = await cloudinaryRequest('DELETE', apiPath);
     res.json({ success: true, data: result });
   } catch (error) {
     serverError(res, 'delete_folder', error);

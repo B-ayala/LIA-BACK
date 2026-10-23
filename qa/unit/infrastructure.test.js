@@ -26,6 +26,12 @@ test('transacción: COMMIT y release normal', async () => {
   assert.deepEqual(log.released, [undefined]);
 });
 
+test('transacción: lockTimeoutMs fija lock_timeout local antes del trabajo', async () => {
+  const { pool, log } = fakePool();
+  await createTransactionRunner(pool)('t', async () => 1, { lockTimeoutMs: 3000 });
+  assert.deepEqual(log.queries, ['BEGIN', "SELECT set_config('lock_timeout', $1, true)", 'COMMIT']);
+});
+
 test('transacción: rollbackWith deshace sin lanzar y devuelve el valor', async () => {
   const { pool, log } = fakePool();
   const result = await createTransactionRunner(pool)('t', async () => rollbackWith({ ok: false }));

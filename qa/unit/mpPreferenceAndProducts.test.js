@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { buildPreferencePayload } = require('../../utils/mpPreference');
 const { buildProductAssignments, buildProductUpdateStatement } = require('../../utils/productUpdateQuery');
+const { createProductSchema, updateProductSchema } = require('../../schemas/productSchema');
 
 const order = {
   buyerName: ' Ana ',
@@ -49,4 +50,34 @@ test('producto: expectedUpdatedAt va en el WHERE del mismo UPDATE (atómico)', (
   const plain = buildProductUpdateStatement('5', [['name', 'X']], undefined);
   assert.match(plain.text, /WHERE id = \$2 RETURNING \*$/);
   assert.deepEqual(plain.values, ['X', '5']);
+});
+
+test('producto: cardOptions array (incluso vacío) y null se persisten como JSON / NULL', () => {
+  const options = [{ label: 'Envío gratis', icon: 'truck', isActive: true }];
+  assert.deepEqual(buildProductAssignments({ cardOptions: options }), [['card_options', JSON.stringify(options)]]);
+  assert.deepEqual(buildProductAssignments({ cardOptions: [] }), [['card_options', '[]']]);
+  const cleared = buildProductAssignments({ cardOptions: null });
+  assert.deepEqual(cleared, [['card_options', null]]);
+  const statement = buildProductUpdateStatement('5', cleared, undefined);
+  assert.match(statement.text, /SET card_options = \$1, updated_at = NOW\(\) WHERE id = \$2/);
+  assert.deepEqual(statement.values, [null, '5']);
+  assert.deepEqual(buildProductAssignments({ name: 'X' }).map(([column]) => column), ['name']);
+});
+
+test('producto: schema Zod valida cardOptions', () => {
+  const base = { name: 'X', price: 10 };
+  const option = { label: 'Envío gratis', icon: 'truck', isActive: true };
+  const parse = (cardOptions) => createProductSchema.safeParse({ ...base, cardOptions }).success;
+  assert.equal(parse([option]), true);
+  assert.equal(parse([]), true);
+  assert.equal(parse(null), true);
+  assert.equal(createProductSchema.safeParse(base).success, true);
+  assert.equal(parse([{ ...option, label: '   ' }]), false);
+  assert.equal(parse([{ ...option, label: 'a'.repeat(41) }]), false);
+  assert.equal(parse([{ ...option, label: 'a'.repeat(40) }]), true);
+  assert.equal(parse([{ ...option, icon: '' }]), false);
+  assert.equal(parse([{ ...option, isActive: 'si' }]), false);
+  assert.equal(parse(Array.from({ length: 11 }, () => option)), false);
+  assert.equal(parse(Array.from({ length: 10 }, () => option)), true);
+  assert.equal(updateProductSchema.safeParse({ cardOptions: null }).success, true);
 });

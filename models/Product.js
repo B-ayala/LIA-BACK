@@ -2,6 +2,24 @@ const { pool } = require('../config/database');
 const { withTransaction, rollbackWith } = require('../utils/transaction');
 const { buildProductAssignments, buildProductUpdateStatement } = require('../utils/productUpdateQuery');
 
+/**
+ * ¿Otra fila referencia este `public_id`? Productos por columna; carrusel y contenido del
+ * sitio guardan URLs (a veces dentro de jsonb, a veces con el id percent-encoded), así que
+ * se busca el id como substring de la fila serializada. Un falso positivo solo deja un
+ * asset huérfano; un falso negativo rompería una imagen publicada.
+ */
+const isImageInUse = async (client, productId, publicId) => {
+  const result = await client.query(
+    `SELECT 1 WHERE EXISTS (SELECT 1 FROM public.productos WHERE id <> $1 AND public_id = $2)
+        OR EXISTS (SELECT 1 FROM public.carousel_images c
+                    WHERE position($2 IN to_jsonb(c)::text) > 0 OR position($3 IN to_jsonb(c)::text) > 0)
+        OR EXISTS (SELECT 1 FROM public.site_content s
+                    WHERE position($2 IN to_jsonb(s)::text) > 0 OR position($3 IN to_jsonb(s)::text) > 0)`,
+    [productId, publicId, encodeURI(publicId)]
+  );
+  return result.rowCount > 0;
+};
+
 /** Acceso a datos de productos (tabla public.productos) para el CRUD de admin y el catálogo. */
 class Product {
   /** `actor`: uuid del admin que crea el producto (queda en audit_log.actor). */
@@ -11,8 +29,8 @@ class Product {
         `INSERT INTO public.productos
          (name, price, stock, category, image_url, public_id, description,
           discount, condition, free_shipping, hover_image_enabled, variants, specifications, features, faqs,
-          warranty, return_policy, size_guide, status, images, original_price)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+          warranty, return_policy, size_guide, status, images, original_price, card_options)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
          RETURNING *`,
         fields
       );
@@ -76,7 +94,7 @@ class Product {
    * reserva concurrente (que también la bloquea) no puede colarse entre el chequeo
    * y el DELETE.
    * @returns {Promise<{status: 'not_found'|'has_pending_orders'} |
-   *   {status: 'deleted', publicId: string|null, imageShared: boolean}>}
+   *   {status: 'deleted', publicId: string|null, imageInUse: boolean}>}
    */
   static async deleteIfNoPendingOrders(id, actor) {
     return withTransaction('delete_product', async (client) => {
@@ -90,11 +108,9 @@ class Product {
       if (pending.rowCount > 0) return rollbackWith({ status: 'has_pending_orders' });
 
       const publicId = product.rows[0].public_id || null;
-      const shared = publicId
-        ? await client.query('SELECT 1 FROM public.productos WHERE id <> $1 AND public_id = $2 LIMIT 1', [id, publicId])
-        : { rowCount: 0 };
+      const imageInUse = publicId ? await isImageInUse(client, id, publicId) : false;
       await client.query('DELETE FROM public.productos WHERE id = $1', [id]);
-      return { status: 'deleted', publicId, imageShared: shared.rowCount > 0 };
+      return { status: 'deleted', publicId, imageInUse };
     }, { actor });
   }
 }

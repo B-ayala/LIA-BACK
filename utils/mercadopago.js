@@ -4,6 +4,7 @@
  */
 
 const crypto = require('crypto');
+const { createCircuitBreaker, CIRCUIT_OPEN_CODE } = require('./circuitBreaker');
 
 const MP_API_BASE = 'https://api.mercadopago.com';
 
@@ -25,7 +26,35 @@ const getWebhookSecret = () =>
 
 const isWebhookSecretConfigured = () => Boolean(getWebhookSecret());
 
-const mpRequest = async (path, options = {}) => {
+const HTTP_TOO_MANY_REQUESTS = 429;
+const HTTP_SERVER_ERROR = 500;
+
+/**
+ * ¿La falla indica que MP no está disponible? Timeouts, cortes de red (sin status),
+ * 5xx y 429. Un 4xx (pago inexistente, request inválida) es un rechazo normal: la
+ * API respondió, no cuenta para abrir el circuito.
+ */
+const isMpOutage = (error) =>
+  error.code === 'MP_TIMEOUT'
+  || !error.status
+  || error.status >= HTTP_SERVER_ERROR
+  || error.status === HTTP_TOO_MANY_REQUESTS;
+
+// Cinco fallos seguidos abren el circuito 30 s: durante ese lapso las operaciones
+// que dependen de MP fallan al instante en vez de esperar 8 s cada una.
+const breaker = createCircuitBreaker({
+  name: 'mercadopago',
+  failureThreshold: 5,
+  openMs: 30 * 1000,
+  isFailure: isMpOutage,
+});
+
+/** ¿Vale la pena intentar una operación con MP ahora? (false = circuito abierto). */
+const isAvailable = () => breaker.isAvailable();
+const retryAfterSeconds = () => breaker.retryAfterSeconds();
+const circuitState = () => breaker.state();
+
+const sendMpRequest = async (path, options = {}) => {
   let response;
   try {
     response = await fetch(`${MP_API_BASE}${path}`, {
@@ -62,6 +91,34 @@ const mpRequest = async (path, options = {}) => {
   return data;
 };
 
+const mpRequest = (path, options) => breaker.execute(() => sendMpRequest(path, options));
+
+const READ_ATTEMPTS = 2;
+const READ_RETRY_BASE_MS = 250;
+const JITTER_RATIO = 0.5;
+
+/**
+ * Solo se reintenta lo que falló RÁPIDO (5xx, 429, corte de red). Un timeout ya
+ * consumió los 8 s: reintentarlo duplicaría la espera del usuario en `mp-confirm`.
+ */
+const isRetriableRead = (error) =>
+  error.code !== 'MP_TIMEOUT' && error.code !== CIRCUIT_OPEN_CODE && isMpOutage(error);
+
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Reintenta una LECTURA (idempotente) con backoff exponencial y jitter. Nunca usar con escrituras. */
+const withReadRetry = async (operation) => {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      if (attempt >= READ_ATTEMPTS || !isRetriableRead(error)) throw error;
+      const backoff = READ_RETRY_BASE_MS * 2 ** (attempt - 1);
+      await wait(Math.round(backoff * (1 + Math.random() * JITTER_RATIO)));
+    }
+  }
+};
+
 /** Crea una preferencia de checkout. Devuelve el objeto preference (incluye init_point). */
 const createPreference = (preference) =>
   mpRequest('/checkout/preferences', {
@@ -71,7 +128,7 @@ const createPreference = (preference) =>
 
 /** Obtiene un pago por id (para verificar estado y external_reference). */
 const getPayment = (paymentId) =>
-  mpRequest(`/v1/payments/${encodeURIComponent(paymentId)}`);
+  withReadRetry(() => mpRequest(`/v1/payments/${encodeURIComponent(paymentId)}`));
 
 // Una compra acumula un pago por intento (tarjeta rechazada, reintento…). Sin
 // paginar, 50 intentos ordenados del más nuevo al más viejo cubren de sobra un
@@ -89,7 +146,7 @@ const searchPaymentsByReference = async (externalReference) => {
     criteria: 'desc',
     limit: String(SEARCH_RESULTS_LIMIT),
   });
-  const data = await mpRequest(`/v1/payments/search?${query.toString()}`);
+  const data = await withReadRetry(() => mpRequest(`/v1/payments/search?${query.toString()}`));
   return Array.isArray(data && data.results) ? data.results : [];
 };
 
@@ -135,6 +192,9 @@ const verifyWebhookSignature = ({ signatureHeader, requestId, dataId }) => {
 
 module.exports = {
   isConfigured,
+  isAvailable,
+  retryAfterSeconds,
+  circuitState,
   isWebhookSecretConfigured,
   createPreference,
   getPayment,

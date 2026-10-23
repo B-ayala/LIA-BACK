@@ -21,7 +21,7 @@ const realFetch = global.fetch;
 global.fetch = async (url, options = {}) => {
   const target = String(url);
   if (!target.startsWith('https://supabase.test')) return realFetch(url, options);
-  const call = { url: target, method: options.method, headers: options.headers || {}, body: options.body ? JSON.parse(options.body) : null };
+  const call = { url: target, method: options.method, headers: options.headers || {}, body: options.body ? JSON.parse(options.body) : null, signal: options.signal };
   supabaseCalls.push(call);
   const { status, json } = supabaseBehavior(call);
   return { ok: status >= 200 && status < 300, status, json: async () => json };
@@ -227,15 +227,12 @@ describe('Recuperación de contraseña y enumeración de usuarios', () => {
 });
 
 describe('Rate limiting y fuerza bruta (prueba 12)', () => {
-  test('NEGATIVO: el login se corta con 429 al superar el límite por IP, y /users/login comparte ese cupo', async () => {
+  test('NEGATIVO: el login se corta con 429 al superar el límite por IP', async () => {
     const statuses = [];
-    for (let i = 0; i < 6; i += 1) {
+    for (let i = 0; i < 12; i += 1) {
       statuses.push((await rawRequest('POST', '/api/auth/login', { headers: { ...TRUSTED, 'X-Forwarded-For': '198.51.100.7' }, body: { email: `a${i}@example.test`, password: 'mala' } })).status);
     }
-    for (let i = 0; i < 6; i += 1) {
-      statuses.push((await rawRequest('POST', '/api/users/login', { headers: { 'X-Forwarded-For': '198.51.100.7' }, body: { email: `b${i}@example.test`, password: 'mala' } })).status);
-    }
-    assert.equal(statuses.filter((s) => s === 429).length, 2, `12 intentos entre ambos endpoints -> 2 bloqueados (obtenido: ${statuses.join(',')})`);
+    assert.equal(statuses.filter((s) => s === 429).length, 2, `12 intentos -> 2 bloqueados (obtenido: ${statuses.join(',')})`);
     assert.equal(statuses.indexOf(429), 10);
   });
 
@@ -243,9 +240,79 @@ describe('Rate limiting y fuerza bruta (prueba 12)', () => {
     const email = 'objetivo@example.test';
     const last = [];
     for (let i = 0; i < 5; i += 1) {
-      const { status } = await rawRequest('POST', '/api/users/login', { headers: { 'X-Forwarded-For': `10.0.0.${i}` }, body: { email, password: 'mala' } });
+      const { status } = await rawRequest('POST', '/api/auth/login', { headers: { ...TRUSTED, 'X-Forwarded-For': `10.0.0.${i}` }, body: { email, password: 'mala' } });
       last.push(status);
     }
     assert.ok(last.includes(429), `esperaba un bloqueo por cuenta, obtuvo ${last.join(',')}`);
+  });
+});
+
+describe('Endpoints públicos retirados', () => {
+  const removed = [
+    ['POST', '/api/users/login', { email: 'a@example.test', password: 'x' }],
+    ['GET', '/api/users/signup-status/a%40example.test', undefined],
+    ['POST', '/api/users/signup-ratelimit', { email: 'a@example.test' }],
+  ];
+  for (const [method, path, body] of removed) {
+    test(`NEGATIVO: ${method} ${path} ya no existe (404) y no llama a Supabase`, async () => {
+      const { status } = await rawRequest(method, path, { body });
+      assert.equal(status, 404);
+      assert.equal(supabaseCalls.length, 0);
+    });
+  }
+});
+
+describe('Validación de email y timeouts hacia Supabase Auth', () => {
+  const hostile = `a@${'.'.repeat(250000)} `;
+
+  test('NEGATIVO (ReDoS): un email hostil de 250k caracteres se rechaza con 400 al instante', async () => {
+    for (const path of ['/api/auth/forgot-password', '/api/auth/resend-confirmation']) {
+      const startedAt = process.hrtime.bigint();
+      const { status } = await rawRequest('POST', path, { headers: { 'X-Forwarded-For': '203.0.113.10' }, body: { email: hostile } });
+      const elapsedMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
+      assert.equal(status, 400);
+      assert.ok(elapsedMs < 500, `${path} tardó ${elapsedMs.toFixed(0)} ms`);
+    }
+    assert.equal(supabaseCalls.length, 0);
+  });
+
+  test('NEGATIVO: login con un email de más de 254 caracteres -> 400 sin llamar a Supabase', async () => {
+    const { status } = await rawRequest('POST', '/api/auth/login', {
+      headers: { ...TRUSTED, 'X-Forwarded-For': '203.0.113.11' },
+      body: { email: `${'a'.repeat(300)}@example.test`, password: 'x' },
+    });
+    assert.equal(status, 400);
+    assert.equal(supabaseCalls.length, 0);
+  });
+
+  test('POSITIVO: todas las llamadas a Supabase Auth llevan un plazo (signal)', async () => {
+    await rawRequest('POST', '/api/auth/login', { headers: { ...TRUSTED, 'X-Forwarded-For': '203.0.113.12' }, body: { email: 'user@example.test', password: 'correcta' } });
+    await rawRequest('POST', '/api/auth/forgot-password', { headers: { 'X-Forwarded-For': '203.0.113.12' }, body: { email: 'timeout-signal@example.test' } });
+    await rawRequest('POST', '/api/auth/resend-confirmation', { headers: { 'X-Forwarded-For': '203.0.113.12' }, body: { email: 'timeout-signal@example.test' } });
+    await rawRequest('POST', '/api/auth/logout', { headers: { ...TRUSTED, 'X-Forwarded-For': '203.0.113.12', Authorization: 'Bearer access-new' } });
+    assert.equal(supabaseCalls.length, 4);
+    for (const call of supabaseCalls) assert.ok(call.signal, `${call.url} sin signal`);
+  });
+
+  const timeoutCases = [
+    ['/api/auth/login', { email: 'timeout-login@example.test', password: 'correcta' }, TRUSTED],
+    ['/api/auth/refresh', {}, { ...TRUSTED, Cookie: 'sb_refresh_token=refresh-vigente' }],
+    ['/api/auth/forgot-password', { email: 'timeout-forgot@example.test' }, {}],
+    ['/api/auth/resend-confirmation', { email: 'timeout-resend@example.test' }, {}],
+  ];
+  for (const [path, body, headers] of timeoutCases) {
+    test(`NEGATIVO: ${path} con Supabase Auth colgado -> 503 AUTH_UNAVAILABLE con Retry-After`, async () => {
+      supabaseBehavior = () => { throw Object.assign(new Error('timeout'), { name: 'TimeoutError' }); };
+      const response = await rawRequest('POST', path, { headers: { ...headers, 'X-Forwarded-For': '203.0.113.20' }, body });
+      assert.equal(response.status, 503);
+      assert.equal(response.body.code, 'AUTH_UNAVAILABLE');
+      assert.ok(response.headers['retry-after']);
+    });
+  }
+
+  test('NEGATIVO: un timeout en refresh NO borra la cookie (la sesión sigue siendo válida)', async () => {
+    supabaseBehavior = () => { throw Object.assign(new Error('timeout'), { name: 'TimeoutError' }); };
+    const { headers } = await rawRequest('POST', '/api/auth/refresh', { headers: { ...TRUSTED, 'X-Forwarded-For': '203.0.113.21', Cookie: 'sb_refresh_token=refresh-vigente' } });
+    assert.equal(headers['set-cookie'], undefined);
   });
 });

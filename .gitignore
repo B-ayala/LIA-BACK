@@ -65,4 +65,13 @@ QUICKSTART.md
 VERIFICATION_CHECKLIST.md
 docs/SUPABASE_AUTH.md
 .vercel
-.env*
+
+# Claves y certificados (p. ej. el PEM de DB_SSL_CA va por variable de entorno, no por archivo)
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Reportes de Playwright
+playwright-report/
+test-results/

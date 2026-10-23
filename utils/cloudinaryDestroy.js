@@ -3,41 +3,18 @@
  * Rechaza si Cloudinary no confirma el borrado.
  */
 
-const https = require('https');
+const { cloudinaryRequest } = require('./cloudinaryHttp');
 
-const destroyCloudinaryImage = (publicId) => {
-  const auth = Buffer.from(
-    `${process.env.CLOUDINARY_API_KEY}:${process.env.CLOUDINARY_API_SECRET}`
-  ).toString('base64');
-  const postData = `public_ids%5B%5D=${encodeURIComponent(publicId)}`;
+const DELETED_STATUS = 'deleted';
 
-  return new Promise((resolve, reject) => {
-    const request = https.request({
-      hostname: 'api.cloudinary.com',
-      path: `/v1_1/${process.env.CLOUDINARY_CLOUD_NAME}/resources/image/destroy`,
-      method: 'POST',
-      headers: {
-        Authorization: `Basic ${auth}`,
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Content-Length': Buffer.byteLength(postData),
-      },
-    }, (response) => {
-      let data = '';
-      response.on('data', (chunk) => { data += chunk; });
-      response.on('end', () => {
-        try {
-          const result = JSON.parse(data);
-          if (result.deleted && result.deleted[publicId]) resolve(result);
-          else reject(new Error('Imagen no encontrada en Cloudinary'));
-        } catch (error) {
-          reject(error);
-        }
-      });
-    });
-    request.on('error', reject);
-    request.write(postData);
-    request.end();
-  });
+const destroyCloudinaryImage = async (publicId) => {
+  const result = await cloudinaryRequest(
+    'DELETE',
+    `/v1_1/${process.env.CLOUDINARY_CLOUD_NAME}/resources/image/upload?public_ids%5B%5D=${encodeURIComponent(publicId)}`
+  );
+  // `not_found` también es truthy: exigir el valor exacto para no dar por borrado un asset que no existe.
+  if (result.deleted?.[publicId] !== DELETED_STATUS) throw new Error('Cloudinary no confirmó el borrado de la imagen');
+  return result;
 };
 
 module.exports = { destroyCloudinaryImage };

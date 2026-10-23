@@ -11,6 +11,11 @@
  * resto espera en una cola acotada, y si la cola se llena se responde **503 con
  * Retry-After** de inmediato (load shedding). Degradar rápido y de forma
  * predecible es preferible a colapsar.
+ *
+ * Hay un bulkhead por *carril* (lecturas, auth, checkout, admin, webhook de
+ * Mercado Pago) y no uno solo: con uno global, una dependencia lenta (MP,
+ * Cloudinary, Supabase Auth) consumía los mismos slots que el catálogo y un pico
+ * de lecturas demoraba la confirmación de pagos. Cada carril degrada por su cuenta.
  */
 
 const logger = require('../utils/logger');
@@ -89,26 +94,66 @@ class Bulkhead {
 }
 
 /**
- * Bulkhead global de la API.
+ * Carriles y sus topes por defecto. La suma supera el pool de la base a propósito:
+ * no todo handler toca la base todo el tiempo (el catálogo sale casi siempre de la
+ * caché), pero admitir mucho más solo traslada la espera al pool, que responde con
+ * un error feo (`EMAXCONNSESSION` / connection timeout) en vez de un 503 limpio con
+ * `Retry-After`. Se ajustan con las pruebas de carga.
  *
- * El default se deriva del pool de PostgreSQL (2× `DB_POOL_MAX`) para que los
- * dos números no se desincronicen: no todo handler usa la base todo el tiempo,
- * pero admitir mucho más que eso sólo traslada la espera al pool, que responde
- * con un error feo (`EMAXCONNSESSION` / connection timeout) en vez de un 503
- * limpio con `Retry-After`.
+ * `MAX_CONCURRENT_REQUESTS`, `MAX_QUEUED_REQUESTS` y `QUEUE_TIMEOUT_MS` siguen
+ * siendo los defaults del carril de lecturas (compatibilidad con el bulkhead único).
  */
 const dbPoolMax = parseIntEnv('DB_POOL_MAX', 12);
 
-const bulkhead = new Bulkhead({
-  name: 'api',
-  maxConcurrent: parseIntEnv('MAX_CONCURRENT_REQUESTS', dbPoolMax * 2),
-  maxQueue: parseIntEnv('MAX_QUEUED_REQUESTS', 200),
-  queueTimeoutMs: parseIntEnv('QUEUE_TIMEOUT_MS', 8000),
-});
+const LANE_DEFAULTS = {
+  read: { maxConcurrent: dbPoolMax, maxQueue: 200 },
+  auth: { maxConcurrent: 6, maxQueue: 50 },
+  checkout: { maxConcurrent: 6, maxQueue: 50 },
+  admin: { maxConcurrent: 4, maxQueue: 20 },
+  // Reservado: lo llama Mercado Pago y no debe competir con el tráfico público.
+  webhook: { maxConcurrent: 4, maxQueue: 50 },
+};
+const DEFAULT_QUEUE_TIMEOUT_MS = 8000;
+
+const buildLane = (lane) => {
+  const defaults = LANE_DEFAULTS[lane];
+  const prefix = `BULKHEAD_${lane.toUpperCase()}`;
+  const isRead = lane === 'read';
+  return new Bulkhead({
+    name: lane,
+    maxConcurrent: parseIntEnv(`${prefix}_MAX`, isRead ? parseIntEnv('MAX_CONCURRENT_REQUESTS', defaults.maxConcurrent) : defaults.maxConcurrent),
+    maxQueue: parseIntEnv(`${prefix}_QUEUE`, isRead ? parseIntEnv('MAX_QUEUED_REQUESTS', defaults.maxQueue) : defaults.maxQueue),
+    queueTimeoutMs: parseIntEnv('QUEUE_TIMEOUT_MS', DEFAULT_QUEUE_TIMEOUT_MS),
+  });
+};
+
+const lanes = Object.fromEntries(Object.keys(LANE_DEFAULTS).map((lane) => [lane, buildLane(lane)]));
+
+const ADMIN_PREFIXES = ['/admin', '/users', '/cloudinary'];
+
+/**
+ * Carril de una request. `path` es relativo al mount `/api` (ej. `/orders/mp-webhook`).
+ * Las lecturas de "mis compras" (GET /orders) van al carril público: no deben
+ * competir con el checkout. Confirmar y cancelar pagos sí van a checkout porque
+ * consultan a Mercado Pago, igual que crear la compra.
+ */
+const laneFor = (method, path) => {
+  if (path.startsWith('/orders/mp-webhook')) return 'webhook';
+  if (path.startsWith('/orders')) {
+    if (method === 'GET') return 'read';
+    return method === 'PATCH' ? 'admin' : 'checkout';
+  }
+  if (path.startsWith('/auth')) return 'auth';
+  if (ADMIN_PREFIXES.some((prefix) => path.startsWith(prefix))) return 'admin';
+  return 'read';
+};
 
 const RETRY_AFTER_SECONDS = 2;
 
 const concurrencyLimit = (req, res, next) => {
+  const laneName = laneFor(req.method, req.path);
+  const bulkhead = lanes[laneName];
+
   // Si el cliente se va mientras la request espera en la cola, el slot que le
   // toque no debe quedar tomado: en ese momento todavía no hay listeners de
   // liberación puestos, y sin esta marca el `close` ya ocurrido no se vuelve a
@@ -132,6 +177,7 @@ const concurrencyLimit = (req, res, next) => {
 
       if (!release) {
         logger.warn('request_shed', {
+          lane: laneName,
           method: req.method,
           path: pathWithoutQuery(req),
           active: bulkhead.active,
@@ -161,6 +207,7 @@ const concurrencyLimit = (req, res, next) => {
     .catch(next);
 };
 
-const concurrencyStats = () => bulkhead.stats();
+/** Estadísticas por carril: `{ read: {...}, auth: {...}, ... }`. */
+const concurrencyStats = () => Object.fromEntries(Object.entries(lanes).map(([name, lane]) => [name, lane.stats()]));
 
-module.exports = { concurrencyLimit, concurrencyStats, Bulkhead };
+module.exports = { concurrencyLimit, concurrencyStats, Bulkhead, laneFor, lanes };

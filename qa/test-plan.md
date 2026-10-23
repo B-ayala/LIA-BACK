@@ -183,6 +183,7 @@ Esperado: 401 "Credenciales inválidas" (antes devolvía 500 por método inexist
   y de haber funcionado, devolvía éxito con cualquier contraseña).
 Resultado: OK (2026-07-01, PowerShell): POST con password incorrecta → 401
   {"success":false,"message":"Credenciales inválidas"} ✅
+  Nota 2026-10-21: `/api/users/login` fue retirado; el caso se repite sobre `/api/auth/login` (mismo contador y mismo bloqueo por cuenta).
 
 ID: TC-131
 Caso: GET /api/users/auth/:userId ya no crashea
@@ -492,7 +493,7 @@ Resultado: OK (2026-07-01, Playwright UI): select→"Cancelado" → dialog "¿Ca
   payment_status='cancelado'; contadores: Pendientes 1→0 ✅; stock zapatos: 8→9 restaurado ✅.
 ```
 
-ID: TC-101
+ID: TC-346
 Caso: MP sin token configurado — fallback a transferencia
 Tipo: failure
 Pre-condición: MP_ACCESS_TOKEN vacío en .env del backend; backend reiniciado
@@ -613,6 +614,7 @@ Pasos:
   1. 14 POST /api/users/login seguidos con credenciales inválidas
 Esperado: los primeros 10 pasan (401), el resto 429 con `Retry-After` y `X-RateLimit-*`
 Resultado: OK (2026-08-08 — 4 bloqueados con 429, headers presentes)
+  Nota 2026-10-21: `/api/users/login` fue retirado; el caso se repite sobre `/api/auth/login` (mismo contador y mismo bloqueo por cuenta).
 
 ID: TC-187
 Caso: Recuperación tras el Retry-After del rate limit
@@ -623,6 +625,7 @@ Pasos:
   3. Reintentar
 Esperado: vuelve a responder 401 (no 429)
 Resultado: OK (2026-08-08 — verificado al reejecutar la suite tras la ventana)
+  Nota 2026-10-21: `/api/users/login` fue retirado; el caso se repite sobre `/api/auth/login` (mismo contador y mismo bloqueo por cuenta).
 
 ID: TC-188
 Caso: Saturación — 800 requests concurrentes todas cache-miss
@@ -832,6 +835,7 @@ Pasos:
 Esperado: los primeros 4 devuelven 401; el 5° devuelve 429 `ACCOUNT_LOCKED` con
   header `Retry-After`; tras esperar, el login vuelve a evaluarse normalmente
 Resultado: ok — verificado 2026-08-10 (curl manual, ver CHANGELOG)
+  Nota 2026-10-21: `/api/users/login` fue retirado; el caso se repite sobre `/api/auth/login` (mismo contador y mismo bloqueo por cuenta).
 
 ID: TC-208
 Caso: Login exitoso limpia el contador de fuerza bruta
@@ -1365,15 +1369,9 @@ Esperado: paso 1 -> 400 "No se pudo identificar el producto ..."; paso 2 -> 409 
   suficiente de ..."; en ambos no se persiste nada y los locks se liberan
 Resultado: no probado
 
-ID: TC-325
-Caso: POST /api/users/login con tipos inválidos en el body
-Tipo: edge
-Pasos:
-  1. POST /api/users/login con `{"email": {"a":1}, "password": "x"}`
-  2. Idem con `{"email": ["a@b.com"], "password": "x"}`, `{"email": "a@b.com", "password": 123}`,
-     email de 255+ caracteres, y strings solo con espacios
-Esperado: 400 "Email y contraseña son requeridos" en todos (nunca 500)
-Resultado: no probado
+ID: TC-325 — DEPRECATED (2026-10-21)
+Motivo: `POST /api/users/login` fue retirado (404, ver TC-349). Lo mismo se cubre en TC-326
+  sobre `POST /api/auth/login`, que ahora también rechaza emails de más de 254 caracteres (TC-351).
 
 ID: TC-326
 Caso: POST /api/auth/login con tipos inválidos en el body
@@ -1448,7 +1446,7 @@ Pasos:
   1. POST /api/orders/not-a-uuid/cancel con token válido
   2. PATCH /api/orders/123/confirm-transfer con token de admin
   3. POST /api/orders/nudge con `orderIds: ["x", "<uuid válido ajeno>"]`
-Esperado: pasos 1 y 2 -> 404 "Orden no encontrada" (sin error de cast de Postgres); paso 3
+Esperado: pasos 1 y 2 -> 400 `INVALID_ORDER_ID` (validado en el borde, sin llegar a la base ni error de cast de Postgres); paso 3
   -> 200 con `applied` solo sobre lo que corresponde
 Resultado: no probado
 
@@ -1562,7 +1560,7 @@ Resultado: lógica OK 2026-10-16 con dobles (SEC-N06). No probado con Supabase r
 ID: TC-343
 Caso: audit_log atribuye al admin los cambios hechos por la API
 Tipo: security
-Pre-condición: script 2026-10-16_audit_actor_PROPOSED.sql aplicado (hoy pendiente de aprobación)
+Pre-condición: script 2026-10-16_audit_actor.sql aplicado (2026-10-16)
 Pasos:
   1. Desde el panel (PUT /api/products/:id) cambiar el precio del producto de prueba
   2. SELECT at, actor, table_name FROM public.audit_log ORDER BY id DESC LIMIT 3
@@ -1627,7 +1625,7 @@ Esperado: ambas responden bien (la 2ª por memoria, misma orden); en los logs ap
   `idempotency_write_failed` / `idempotency_read_failed` (código 42P01); el pago no se corta
 Resultado: no probado — con el modelo simulado sí (2026-10-08)
 
-ID: TC-240
+ID: TC-347
 Caso: Misma key con otro nombre o email de comprador
 Tipo: edge
 Pasos:
@@ -1636,7 +1634,7 @@ Pasos:
 Esperado: 422 IDEMPOTENCY_KEY_REUSED (la huella del backend incluye al comprador)
 Resultado: no probado
 
-ID: TC-241
+ID: TC-348
 Caso: La tabla no es accesible desde el navegador
 Tipo: security
 Pre-condición: migración aplicada
@@ -1764,6 +1762,10 @@ Resultado: no probado
 | Idempotencia entre usuarios | — | — | — | TC-337 | — |
 | Devoluciones parciales y auditoría con actor | — | TC-338 | — | TC-343 | — |
 | Hardening (logs, /health, MFA opt-in, RLS por rol) | — | TC-344 | — | TC-339/341/342/345 | TC-340 |
+| Abuso de solicitudes (ReDoS, timeouts de Auth/Cloudinary, stores acotados, endpoints retirados) | TC-352 | TC-351/353 | TC-350/354/355 | TC-349/351 | — |
+| Observabilidad (request-id, latencias, /ready, proceso) | TC-357/358 | TC-357 | TC-358/364 | — | — |
+| Resiliencia (carriles, circuito de MP, lecturas con reintento) | TC-361 | TC-362 | TC-359/360/363 | — | TC-359 |
+| Endurecimiento de catálogo y tokens | TC-366 | TC-365 | — | TC-365/366 | — |
 
 ## Cross-browser / device
 Probado en Chrome desktop (Playwright). Pendiente: Safari iOS, Chrome Android
@@ -1858,3 +1860,57 @@ ID: TC-278 — Caso: ids de producto y fecha inválidos. Tipo: security. Pasos: 
 ID: TC-279 — Caso: transferencia con comprobante avisado aparece en "Mis compras" como pendiente. Tipo: happy. Pasos: checkout por transferencia → nudge "Sí, ya envié el comprobante" → abrir Mis compras. Esperado: la compra se lista con "Verificando tu comprobante" y sin seguimiento de despacho. Resultado: no probado.
 ID: TC-280 — Caso: el admin resuelve la transferencia avisada. Tipo: happy. Pasos: con la compra de TC-279, el admin la confirma / (otra) la cancela; el usuario reabre Mis compras o espera el refresco de 20 s. Esperado: confirmada → "Pagado" + seguimiento de despacho; cancelada → "Pedido cancelado". Resultado: no probado.
 ID: TC-281 — Caso: transferencia sin comprobante avisado no se lista. Tipo: edge. Pasos: nudge "Todavía no lo envié" o cerrar el modal sin responder; abrir Mis compras. Esperado: la compra NO aparece (origin distinto de `wa_confirmado`, sigue `pendiente`). Resultado: no probado.
+
+ID: TC-349 — Caso: endpoints públicos retirados. Tipo: security. Pasos: `POST /api/users/login`, `GET /api/users/signup-status/a%40b.co`, `POST /api/users/signup-ratelimit`. Esperado: 404 en los tres y ninguna llamada a Supabase. Resultado: ok (2026-10-21, `test/http-security.test.js`, automatizado).
+ID: TC-350 — Caso: Supabase Auth colgado en login / refresh / forgot-password / resend-confirmation. Tipo: failure. Pasos: simular timeout de Supabase Auth (el doble de `fetch` lanza `TimeoutError`). Esperado: 503 `AUTH_UNAVAILABLE` con `Retry-After`; en refresh la cookie NO se borra; toda llamada a Supabase lleva `signal`. Resultado: ok (2026-10-21, `test/http-security.test.js`, automatizado). Pendiente: probar en staging con latencia real.
+ID: TC-351 — Caso: ReDoS en el email. Tipo: security/edge. Pasos: `POST /api/auth/forgot-password` y `/resend-confirmation` con `a@` + 250.000 puntos; `POST /api/auth/login` con email de 300 caracteres; emails de exactamente 254 y 255 caracteres. Esperado: 400 en < 500 ms (nunca bloquea el event loop); 254 válido, 255 inválido. Resultado: ok (2026-10-21, `test/http-security.test.js` y `qa/unit/abuseProtection.test.js`, automatizado).
+ID: TC-352 — Caso: happy path de recuperación de contraseña y login tras el cambio de validación. Tipo: happy. Pasos: pedir recuperación con un email normal (`nombre+tag@dominio.com.ar`); iniciar sesión con credenciales correctas. Esperado: 200 uniforme en recuperación; login 200 con cookie httpOnly. Resultado: ok en automatizado (2026-10-21); prueba manual en el front: no probado.
+ID: TC-353 — Caso: body mayor al tope en `/api/auth/*`. Tipo: edge. Pasos: `POST /api/auth/login` con un body de 20 kB; el mismo body en otra ruta de la API. Esperado: 413 `PAYLOAD_TOO_LARGE` en auth; el resto de la API sigue aceptando hasta 256 kB. Resultado: ok sobre Express aislado (2026-10-21, 413 / 200); no probado contra `server.js` levantado.
+ID: TC-354 — Caso: Cloudinary lento o con respuesta enorme. Tipo: failure. Pasos: borrar imagen / listar carpetas con Cloudinary sin responder > 8 s, o respondiendo > 5 MB. Esperado: 502 `CLOUDINARY_ERROR` sin colgar el slot; la request lleva `AbortSignal`. Resultado: ok en unit (2026-10-21, `qa/unit/abuseProtection.test.js`, con doble de `https`); no probado contra Cloudinary real. Verificar manualmente que el gestor de imágenes del admin sigue listando, creando y borrando carpetas e imágenes.
+ID: TC-355 — Caso: stores de seguridad en memoria acotados. Tipo: security. Pasos: superar el tope de entradas (10.000) en `loginBruteforce` / `emailActionLimiter`; esperar la purga. Esperado: el tamaño no supera el tope y las entradas vencidas se purgan. Resultado: ok en unit (2026-10-21, `boundedStore`); no probado con 10.000 emails reales.
+ID: TC-356 — Caso: timeout global por request. Tipo: failure. Pasos: handler que no responde en 25 s bajo `/api/products`, `/api/auth`, etc. Esperado: 503 `REQUEST_TIMEOUT` con `Retry-After`; `/api/orders` no lo aplica. Resultado: ok en unit con plazo corto (2026-10-21); no probado a 25 s reales.
+
+ID: TC-357 — Caso: id de correlación y métricas por ruta. Tipo: happy/edge. Pasos: cualquier request a la API (con y sin `X-Request-Id` entrante; probar uno con saltos de línea); leer `GET /health` con `x-health-token`. Esperado: la respuesta trae `X-Request-Id` (se respeta solo un id de 8-64 caracteres seguros); `requests.routes` lista `METHOD /ruta/:param` con p50/p95/p99 y conteos por clase; `/health` y `/ready` no se miden; las rutas inexistentes se agrupan en `unmatched`. Resultado: ok en unit y con `server.js` real y base simulada (2026-10-21); no probado contra la base real.
+ID: TC-358 — Caso: readiness. Tipo: happy/failure. Pasos: `GET /ready` con la base sana; con la base caída o el pool agotado; ráfaga de 50 requests a `/ready`. Esperado: `200 READY`; `503 NOT_READY` en menos de ~2 s; la ráfaga no genera un `SELECT 1` por request (resultado memorizado 3 s); sin token solo se ve `status`. Resultado: ok en unit y smoke con base simulada (2026-10-21); no probado con la base caída real.
+ID: TC-359 — Caso: aislamiento de carriles del bulkhead. Tipo: failure/concurrencia. Pasos: saturar el carril de checkout (slots + cola) mientras se pide el catálogo y se envía un webhook de MP. Esperado: el checkout excedente recibe `503 SERVER_BUSY` con `Retry-After`; el catálogo y el webhook responden 200. Resultado: ok en `qa/unit/lanesHttp.test.js` con topes chicos (2026-10-21); no probado con los topes reales bajo carga (ver `qa/k6/`).
+ID: TC-360 — Caso: Mercado Pago caído (circuit breaker). Tipo: failure. Pasos: 5 fallas seguidas de MP (timeout, 503 o corte de red); luego `POST /api/orders/mp-preference`; esperar 30 s y repetir con MP sano. Esperado: con el circuito abierto `502 MP_UNAVAILABLE` sin crear ventas ni tocar stock (verificar en `ventas`/`productos`); la transferencia sigue funcionando; pasados 30 s una sola request de prueba decide si se cierra; `GET /health` muestra `mercadopago.circuit`. Resultado: ok en `qa/unit/mpCircuit.test.js` y `resilience.test.js` con MP simulado (2026-10-21); no probado contra el sandbox de MP.
+ID: TC-361 — Caso: lecturas a MP con reintento. Tipo: edge. Pasos: `mp-confirm` y webhook con MP respondiendo 503 una vez y luego 200; con 404; con timeout. Esperado: el 503 aislado se reintenta una vez y el pago se salda; el 404 no se reintenta ni abre el circuito; el timeout no se reintenta (`502 PAYMENT_VERIFICATION_FAILED`); crear la preferencia nunca se reintenta. Resultado: ok en unit (2026-10-21); no probado contra el sandbox de MP.
+ID: TC-362 — Caso: sweep con el circuito abierto. Tipo: failure. Pasos: compra MP vencida y pendiente mientras el circuito de MP está abierto. Esperado: la consulta se trata como `unknown` y NO se libera el stock; se reevalúa cuando MP responde. Resultado: no probado (el sweep ya trataba el error de MP como `unknown`; falta verificar que `CIRCUIT_OPEN` siga ese camino).
+ID: TC-363 — Caso: caída del proceso. Tipo: failure. Pasos: provocar una excepción síncrona sin capturar en staging. Esperado: log `uncaught_exception` y cierre ordenado con código 1 (la plataforma reinicia); `unhandledRejection` solo se cuenta y se loguea. Resultado: no probado.
+ID: TC-364 — Caso: arranque con la base caída o con el pooler lleno durante un deploy. Tipo: failure. Pasos: arrancar el servicio con la base inaccesible; luego durante un deploy con solape de instancias. Esperado: 5 intentos con espera creciente (2, 4, 8, 10 s con jitter) y logs `db_connect_failed` sin host ni usuario; el proceso sale con código 1 solo si se agotan. Resultado: ok solo el cálculo de la espera (unit, 2026-10-21); no probado contra la base real.
+ID: TC-365 — Caso: abuso del catálogo. Tipo: security/edge. Pasos: `GET /api/products?offset=999999999999`; 1000 ids inexistentes distintos; mismo id inexistente dos veces. Esperado: el offset se acota a 10000; los ids inexistentes se recuerdan aparte (la segunda consulta no llega a la base) y no expulsan la caché del catálogo. Resultado: ok en `qa/unit/catalogAbuse.test.js` (2026-10-21).
+ID: TC-366 — Caso: tokens inservibles y token válido. Tipo: security/happy. Pasos: request autenticada con un token de más de 4096 caracteres; con un JWT vencido; con un token vigente. Esperado: los dos primeros dan 401 (o siguen como anónimos en rutas con `optionalAuth`) sin ninguna llamada a Supabase Auth; el vigente se verifica normalmente. Resultado: ok en unit para la detección (2026-10-21); no probado el flujo completo con Supabase real. Limitación: un JWT vigente pero falso igual se consulta (la defensa de fondo es el rate limit).
+ID: TC-367 — Caso: scripts de carga. Tipo: performance. Pasos: ejecutar `qa/k6/` en staging (smoke → load → stress → spike → soak; `last-unit.js`). Esperado: métricas objetivo del informe (p95 < 300 ms en lecturas, 0 sobreventa, sin 5xx fuera de 503 controlados). Resultado: no probado (no hay staging; scripts con la sintaxis verificada, no ejecutados).
+
+Pasada manual 2026-10-22 (servidor real `server.js` por HTTP, con la BASE simulada; Supabase Auth, Cloudinary y Mercado Pago reales). La base real NO se pudo usar: el `DB_PASSWORD` del `.env` local es rechazado por Supabase (`28P01`).
+ID: TC-349 — Resultado manual: ok. `POST /api/users/login`, `GET /api/users/signup-status/:email` y `POST /api/users/signup-ratelimit` responden 404; `GET /api/users` sin token sigue en 401.
+ID: TC-350 — Resultado manual: ok. Con Supabase Auth colgado, login, refresh, forgot-password y resend-confirmation responden 503 `AUTH_UNAVAILABLE` con `Retry-After: 2` a los 5,0 s; el refresh no borra la cookie; el catálogo responde en 4 ms durante el cuelgue.
+ID: TC-351 — Resultado manual: ok. Email de 7 kB -> 400 (forgot-password y resend); 250 kB en `/api/auth/*` -> 413 en 7 ms; email de 255 caracteres -> 400; el mismo body de 250 kB en otra ruta (límite 256 kB) llega a auth y responde 401.
+ID: TC-352 — Resultado manual: ok el login real de punta a punta (200, cookie `HttpOnly`, refresh token ausente del body, refresh 200, logout 200 con cookie vencida, refresh posterior 401, contraseña incorrecta 401 genérico, token alterado 401, token de usuario común en ruta admin 403). Pendiente: probarlo desde el front y con la base real.
+ID: TC-354 — Resultado manual: ok contra Cloudinary REAL con el cliente nuevo (solo lecturas y un borrado de id inexistente): `/config` 200, `/usage` 200, `/folders` 200, `/images` 200 (65 recursos), `/folders?path=../x` 400, `/sign` 200 (SHA1 de 40 hex), `/delete` de un id inexistente 200 `not_found`, sin token 401. Pendiente: crear/borrar carpeta e imagen reales desde el admin.
+ID: TC-357 — Resultado manual: ok. `X-Request-Id` generado, respetado si es seguro (`mi-prueba-12345`) y reemplazado si trae espacios o caracteres raros; `/health` muestra p50/p95/p99 por ruta y los 5 carriles.
+ID: TC-358 — Resultado manual: ok `/ready` con la base simulada sana (200 `READY`). No probado con la base caída.
+ID: TC-361 — Resultado manual: parcial. Un 4xx REAL de Mercado Pago (`mp-confirm` con un pago inexistente) no se reintenta (0,75 s) y el circuito sigue `closed`. Limitación: el `MP_ACCESS_TOKEN` del `.env` local no autentica contra MP ("Must provide your access_token"), así que no se probó una lectura exitosa ni un 5xx real.
+ID: TC-360 — Resultado manual: no probado (requiere editar `hosts` del sistema para cortar `api.mercadopago.com`).
+ID: TC-365 — Resultado manual: ok. `offset=999999999999` devuelve `offset: 10000`; un id inexistente consultado dos veces queda en `productMisses` (size 1) sin ensuciar `products`.
+ID: TC-366 — Resultado manual: ok con Supabase Auth colgado. JWT vencido -> 401 en 10 ms y token de 5000 caracteres -> 401 en 2 ms, ambos sin llamar a Auth; un JWT vigente (falso) sí intenta la verificación (503 por no poder conectar).
+Hallazgo de la pasada (corregido): todo 503 de degradación controlada se logueaba además como `request_failed` en nivel error, duplicando líneas bajo un pico y ensuciando las alertas. Ahora el observer no lo loguea como error (cada causa ya se loguea donde ocurre) y sigue contando en las métricas.
+Diagnóstico de proxy (A6): ok. `proxy_diagnostic` se loguea una sola vez por request con `X-Forwarded-For`, con `forwardedForHops: 2`, la IP enmascarada (`10.0.x.x`) y `reqIpIsRightmostHop: true`.
+
+Pasada manual 2026-10-23 (backend `server.js` REAL contra la base real; barrido de órdenes vencidas desactivado en el proceso de prueba; Mercado Pago NO utilizable: el `MP_ACCESS_TOKEN` local no autentica).
+ID: TC-352 — Resultado manual (base real): ok. Login de usuario común, de admin y de una cuenta habilitada para comprar (rol real leído de la base); `/api/users`, `/api/cloudinary/usage` y `/api/admin/insights/*` -> 403 para usuario común y 200 para admin; "Mis compras" propias 200, de otro email 403, sin token 401.
+ID: TC-358 — Resultado manual (base real): ok. `/ready` 200 con la base real (172 ms).
+ID: TC-365 — Resultado manual (base real): ok. `offset=999999999999` devuelve `offset: 10000` (total 20); un id inexistente tarda 175 ms la primera vez y 2 ms la segunda; id no numérico 400.
+ID: TC-359 — Resultado manual: parcial. Con la base real, cada carril cuenta su propio tráfico en `/health` (read, auth, checkout, admin, webhook) sin rechazos. No se saturó ningún carril con carga real.
+ID: TC-368 — Caso: ciclo de checkout por transferencia con la base real y limpieza. Tipo: happy/security/concurrencia. Pasos: reservar 1 unidad del producto 15 con la cuenta habilitada; repetir con la misma `Idempotency-Key`; repetir la key con otro carrito; revisar "Mis compras"; cancelar-transferencia como usuario común y como admin; repetir la cancelación. Esperado: 201 y stock -1; replay 201 con las mismas órdenes y sin descontar de nuevo; 422 `IDEMPOTENCY_KEY_REUSED`; la compra sin comprobante no aparece; 403 / 200 / 409; stock restaurado. Resultado: ok (2026-10-23), stock final = stock inicial. Nota: con el modo de compra restringida activo, las cuentas sin habilitar reciben 403 `PURCHASES_DISABLED` (también verificado).
+ID: TC-369 — Caso: doble envío simultáneo sin `Idempotency-Key`. Tipo: concurrencia. Esperado: una sola orden (single-flight por carrito). Resultado: ok en 1 de 2 corridas (misma `order_id` en ambas respuestas); en la otra se crearon 2 órdenes, probablemente porque las requests no se solaparon en el servidor (no se midió el solapamiento). Pendiente: repetir con una barrera que garantice el solape. El single-flight no fue modificado en esta tanda.
+ID: TC-370 — Caso: Mercado Pago no disponible durante la creación de la preferencia. Tipo: failure. Esperado: `502 MP_UNAVAILABLE`, stock restaurado, circuito sin abrirse con un 4xx. Resultado: ok (2026-10-23) con el token local inválido (401 de MP): reserva compensada y circuito `closed`. Un segundo intento inmediato recibió 429 `RATE_LIMITED` (límite de 8 compras por minuto por usuario), como corresponde.
+ID: TC-371 — Caso: webhook de MP. Tipo: edge/failure. Resultado: ok. Tópico no relevante 200; id de pago no numérico 200 (nada que reintentar); pago `1` con el token local inválido 500 `WEBHOOK_FAILED` (MP reintenta).
+ID: TC-372 — Caso: CRUD de producto de prueba con un asset real de Cloudinary. Tipo: happy. Pasos: firmar (`/sign`), subir una imagen de 1x1 a la carpeta `qa-tanda2`, crear el producto inactivo, verlo como admin (200) y como público (404), editarlo, borrarlo. Resultado: ok salvo el último punto: el asset de Cloudinary NO se borró al eliminar el producto (ver H-CLD-DESTROY). Se limpió a mano; la carpeta `qa-tanda2` quedó vacía.
+ID: TC-373 — Caso: borrar un producto cuya imagen NO usa nada más. Tipo: happy. Pasos: subir imagen de prueba, crear producto inactivo, borrarlo. Esperado: el asset desaparece de Cloudinary. Resultado: no probado.
+ID: TC-374 — Caso: borrar un producto cuya imagen usa también un slide del carrusel (o `site_content`). Tipo: edge. Pasos: crear producto con imagen X, agregar X al carrusel, borrar el producto. Esperado: el asset sigue en Cloudinary y el log tiene `cloudinary_asset_in_use`. Resultado: no probado.
+ID: TC-375 — Caso: con el script `2026-10-23_stock_trigger_fail_loud.sql` aplicado, un INSERT en `ventas` por más stock del disponible falla. Tipo: failure. Pasos: en una transacción con ROLLBACK, aplicar el script y descontar `stock + 1` a un producto. Esperado: error 23514 (`productos_stock_non_negative`). Resultado: ok (UPDATE directo, 2026-10-23); el INSERT real en `ventas` y el ciclo completo de compra: no probado.
+ID: TC-376 — Caso: lock del producto retenido por otra transacción durante una reserva. Tipo: failure/concurrencia. Pasos: transacción A hace `SELECT … FOR UPDATE` del producto; transacción B con `lock_timeout` 500 ms pide el mismo lock. Esperado: B falla con 55P03 en ~0,5 s. Resultado: ok a nivel base (676 ms). El 503 `ORDER_BUSY` por HTTP con `RESERVE_LOCK_TIMEOUT_MS` bajo: no probado.
+
+## Hallazgos abiertos (agregado 2026-10-23)
+- ✅ RESUELTO (2026-10-23, pendiente de verificar en vivo) — H-CLD-DESTROY — `utils/cloudinaryDestroy.js` usaba un endpoint inexistente; ahora usa `DELETE /resources/image/upload` y exige `deleted`. `Product.deleteIfNoPendingOrders` no borra el asset si otro producto, `carousel_images` o `site_content` lo referencian. Casos: TC-372, TC-373, TC-374.

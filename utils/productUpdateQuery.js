@@ -34,6 +34,7 @@ const FIELD_COLUMNS = [
   ['warranty', 'warranty', identity],
   ['returnPolicy', 'return_policy', identity],
   ['sizeGuide', 'size_guide', toJsonOrNull],
+  ['cardOptions', 'card_options', toJsonOrNull],
   ['status', 'status', identity],
 ];
 

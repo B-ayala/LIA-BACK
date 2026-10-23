@@ -96,10 +96,12 @@ lia-store/
 ├── middleware/
 │   ├── authMiddleware.js       # verifica el token contra Supabase (con caché corta) + adminMiddleware
 │   ├── rateLimit.js            # límites por endpoint (ventana deslizante) con headers estándar
-│   ├── concurrencyLimit.js     # bulkhead + cola con timeout → 503 en vez de colapso
+│   ├── concurrencyLimit.js     # un bulkhead por carril (read/auth/checkout/admin/webhook) + cola con timeout → 503
+│   ├── requestObserver.js      # X-Request-Id, latencia por ruta (p50/p95/p99) y log de requests lentas/5xx
+│   ├── proxyDiagnostic.js      # loguea al arrancar los saltos de X-Forwarded-For (verifica `trust proxy`)
 │   ├── httpCache.js            # Cache-Control público / no-store
 │   ├── securityHeaders.js      # CSP/HSTS/nosniff/X-Frame-Options en toda respuesta
-│   ├── signupTracker.js        # rate-limit de signup in-memory (Map por email)
+│   ├── requestDeadline.js      # corta con 503 REQUEST_TIMEOUT una request que no responde en 25 s (no se monta en /api/orders)
 │   ├── validateBody.js         # validación de body con Zod
 │   └── validateParams.js       # :id de orden (uuid) y de producto (dígitos) → 400 si no cumple
 │
@@ -188,9 +190,6 @@ config/database.js → Pool de conexiones pg
 ### 5.1 Usuarios — `/api/users` (`userRoutes.js` → `userController.js`)
 | Método | Ruta | Auth | Descripción |
 |---|---|---|---|
-| GET | `/api/users/signup-status/:email` | pública | Estado de rate-limit de signup (solo lectura). |
-| POST | `/api/users/signup-ratelimit` | pública | Registra que Supabase devolvió rate-limit para un email. Body `{ email }`. |
-| POST | `/api/users/login` | pública | Valida credenciales contra Supabase Auth (`/auth/v1/token?grant_type=password`) y devuelve el perfil. Rate limit 10/min. |
 | GET | `/api/users/auth/:userId` | **Bearer + admin** | Usuario por Supabase Auth ID. |
 | GET | `/api/users` | **Bearer + admin** | Lista de perfiles (paginada `?limit&offset`, máx 100). |
 | POST | `/api/users` | **Bearer + admin** | Legacy/obsoleto: devuelve nota de "crear vía Supabase Auth". |
@@ -298,7 +297,8 @@ Rate limit 60/min: cada request consume cuota de la API de Cloudinary.
 | Método | Ruta | Descripción |
 |---|---|---|
 | GET | `/` | Info de la API (`{ message, version }`). |
-| GET | `/health` | Health check (`{ status: 'OK' }`). |
+| GET | `/health` | Liveness (`{ status: 'OK', uptimeSeconds }`). El detalle (pool, carriles, cachés, circuito de MP, latencias por ruta) exige `x-health-token` en producción. |
+| GET | `/ready` | Readiness: `SELECT 1` con plazo de 2 s. `200 READY` / `503 NOT_READY` (detalle con `x-health-token`). Para un monitor externo; el Health Check de la plataforma debería seguir en `/health`. |
 | (cualquiera) | `*` | 404 `{ success:false, message:'Ruta no encontrada' }`. |
 
 ---
@@ -320,7 +320,7 @@ Rate limit 60/min: cada request consume cuota de la API de Cloudinary.
 - **`adminMiddleware`**: debe ir después de `authMiddleware`; exige `req.user.role === 'admin'`
   (403 si no).
 - **Cobertura**: la cadena protege las escrituras de productos, **todo** el router de usuarios
-  salvo login/signup-status/signup-ratelimit, órdenes (salvo el webhook de MP), la analítica
+  completo, órdenes (salvo el webhook de MP), la analítica
   admin completa y Cloudinary salvo `/config`.
 
 ---
@@ -395,15 +395,17 @@ Detalle del mecanismo en [`docs/flows/flow-concurrencia-carga.md`](docs/flows/fl
 | `DB_CONNECTION_TIMEOUT_MS` | `5000` | Espera máxima por una conexión del pool. |
 | `DB_STATEMENT_TIMEOUT_MS` | `10000` | Corta queries colgadas del lado del servidor Postgres. |
 | `DB_QUERY_TIMEOUT_MS` | `10000` | Ídem del lado del cliente `pg`. |
-| `MAX_CONCURRENT_REQUESTS` | `DB_POOL_MAX × 2` | Handlers simultáneos admitidos (bulkhead). |
-| `MAX_QUEUED_REQUESTS` | `200` | Cola de espera; al llenarse se responde **503 + `Retry-After`**. |
-| `QUEUE_TIMEOUT_MS` | `8000` | Espera máxima en cola antes de devolver 503. |
+| `BULKHEAD_<CARRIL>_MAX` / `_QUEUE` | `read`: `DB_POOL_MAX` / 200 · `auth`: 6 / 50 · `checkout`: 6 / 50 · `admin`: 4 / 20 · `webhook`: 4 / 50 | Handlers simultáneos y cola de cada carril del bulkhead. Al llenarse la cola se responde **503 + `Retry-After`**. |
+| `MAX_CONCURRENT_REQUESTS` / `MAX_QUEUED_REQUESTS` | `DB_POOL_MAX` / `200` | Valores del carril `read` (compatibilidad con el bulkhead único anterior). |
+| `QUEUE_TIMEOUT_MS` | `8000` | Espera máxima en cola (todos los carriles) antes de devolver 503. |
+| `SLOW_REQUEST_MS` | `1000` | Umbral para loguear una request como lenta. |
+| `ACCESS_LOG_ALL` | `false` | `true` loguea todas las requests (solo para una prueba de carga puntual). |
 | `CACHE_TTL_PRODUCTS_SECONDS` | `20` | Caché del catálogo. `0` la desactiva. Se invalida sola ante cambios de producto/stock. |
 | `CACHE_TTL_INSIGHTS_SECONDS` | `60` | Caché de la analítica admin. |
 | `CACHE_TTL_AUTH_SECONDS` | `30` | Caché de verificación de token. ⚠️ Un token revocado sigue siendo válido como máximo este tiempo. |
 | `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error`. |
 
-`GET /health` expone en vivo el estado del pool, del bulkhead, del rate limit y de las cachés.
+`GET /health` expone en vivo el estado del pool, de cada carril del bulkhead, del rate limit, de las cachés, del circuito de Mercado Pago y las latencias por ruta.
 
 > El pool de `pg` usa `ssl: { rejectUnauthorized: false }`.
 >
@@ -530,6 +532,8 @@ acota los `GRANT` y **revoca `TRUNCATE`** (que no está sujeto a RLS). El backen
 3. **Auditoría de dependencias**: no hay `npm audit` en un pipeline automático.
 4. **Rate limit y bloqueo de login en memoria de proceso**: correcto con una sola instancia
    (Railway hoy); con más de una instancia hay que mover esos stores a algo compartido (Redis).
+   Los stores (`loginBruteforce`, `emailActionLimiter`) tienen tope duro de entradas y purga
+   periódica (`utils/boundedStore.js`), pero se pierden en cada reinicio.
 
 ---
 

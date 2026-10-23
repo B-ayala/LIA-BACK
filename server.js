@@ -11,6 +11,11 @@ const { corsOptions } = require('./config/cors');
 const { concurrencyLimit, concurrencyStats } = require('./middleware/concurrencyLimit');
 const { createRateLimit, rateLimitStats } = require('./middleware/rateLimit');
 const { securityHeaders } = require('./middleware/securityHeaders');
+const { requestDeadline } = require('./middleware/requestDeadline');
+const { requestObserver } = require('./middleware/requestObserver');
+const { proxyDiagnostic } = require('./middleware/proxyDiagnostic');
+const { getReadiness } = require('./services/readiness');
+const { metricsSnapshot, recordProcessEvent } = require('./utils/requestMetrics');
 const { canSeeHealthDetail } = require('./middleware/healthAccess');
 const { cacheStats } = require('./utils/cache');
 const logger = require('./utils/logger');
@@ -27,9 +32,15 @@ const mercadopago = require('./utils/mercadopago');
 
 const app = express();
 
-// Railway/Vercel terminan TLS en su proxy: sin esto `req.ip` sería siempre la
-// IP del proxy y el rate limit trataría a todo el tráfico como un solo cliente.
+// La plataforma termina TLS en su proxy: sin esto `req.ip` sería siempre la IP
+// del proxy y el rate limit trataría a todo el tráfico como un solo cliente.
+// Un solo salto de confianza: si hay más proxies delante (ej. Cloudflare + Render)
+// el valor es incorrecto. `proxyDiagnostic` loguea al arrancar lo necesario para verificarlo.
 app.set('trust proxy', 1);
+
+// Primero de todo: id de correlación y latencia por ruta incluyen a los demás middlewares.
+app.use(requestObserver);
+app.use(proxyDiagnostic);
 
 // Firma de Express en las respuestas: menos información para un atacante.
 app.disable('x-powered-by');
@@ -48,7 +59,10 @@ app.use(cors(corsOptions));
 // no se firma nada acá, Supabase ya emite el refresh token firmado.
 app.use(cookieParser());
 // Límite explícito de body: un payload gigante consume memoria y CPU de parseo
-// antes de llegar a cualquier validación.
+// antes de llegar a cualquier validación. Auth recibe solo email, contraseña y
+// token de captcha (≤4096): se parsea primero con un tope chico; el parser
+// global de abajo saltea los bodies ya parseados.
+app.use('/api/auth', express.json({ limit: '8kb' }));
 app.use(express.json({ limit: '256kb' }));
 app.use(express.urlencoded({ extended: true, limit: '256kb' }));
 
@@ -64,14 +78,15 @@ app.use(
 // espera en cola acotada y, si se llena, recibe 503 rápido (load shedding).
 app.use('/api', concurrencyLimit);
 
-// Rutas
-app.use('/api/auth', authRoutes);
-app.use('/api/users', userRoutes);
-app.use('/api/cloudinary', cloudinaryRoutes);
-app.use('/api/products', productRoutes);
+// Rutas. /api/orders queda sin `requestDeadline` a propósito (ver el middleware).
+const deadline = requestDeadline();
+app.use('/api/auth', deadline, authRoutes);
+app.use('/api/users', deadline, userRoutes);
+app.use('/api/cloudinary', deadline, cloudinaryRoutes);
+app.use('/api/products', deadline, productRoutes);
 app.use('/api/orders', orderRoutes);
-app.use('/api/shipping', shippingRoutes);
-app.use('/api/admin/insights', insightsRoutes);
+app.use('/api/shipping', deadline, shippingRoutes);
+app.use('/api/admin/insights', deadline, insightsRoutes);
 
 // Ruta base
 app.get('/', (req, res) => {
@@ -94,7 +109,21 @@ app.get('/health', (req, res) => {
     concurrency: concurrencyStats(),
     rateLimit: rateLimitStats(),
     caches: cacheStats(),
+    mercadopago: { circuit: mercadopago.circuitState() },
+    requests: metricsSnapshot(),
   });
+});
+
+// Readiness: a diferencia de /health (el proceso está vivo), comprueba que la base
+// responde por el pool. Pensado para un monitor externo con alertas; el Health Check
+// de la plataforma debería seguir apuntando a /health, porque reiniciar el proceso
+// no arregla una caída de la base y solo generaría un bucle de reinicios.
+app.get('/ready', async (req, res) => {
+  const readiness = await getReadiness();
+  const status = readiness.ready ? 200 : 503;
+  const base = { status: readiness.ready ? 'READY' : 'NOT_READY' };
+  if (!canSeeHealthDetail(req)) return res.status(status).json(base);
+  return res.status(status).json({ ...base, database: readiness.database, pool: readiness.pool });
 });
 
 // Manejo de rutas no encontradas
@@ -128,18 +157,32 @@ const PORT = process.env.PORT || 3000;
 const ORDER_SWEEP_INTERVAL_MS = 60 * 1000;
 const SHUTDOWN_GRACE_MS = 10 * 1000;
 
+// Se completa en `registerShutdown`; hasta que el servidor arranca no hay nada que cerrar en orden.
+let gracefulShutdown = null;
+
 process.on('unhandledRejection', (reason) => {
+  recordProcessEvent('unhandledRejection');
   logger.error('unhandled_rejection', { error: reason instanceof Error ? reason.message : String(reason) });
 });
 
+// Una excepción síncrona sin capturar deja el proceso en un estado desconocido:
+// se loguea (con stack, solo a logs) y se sale ordenadamente para que la plataforma
+// lo reinicie, en vez de seguir sirviendo tráfico con estado corrupto.
+process.on('uncaughtException', (error) => {
+  recordProcessEvent('uncaughtException');
+  logger.error('uncaught_exception', { error: error.message, stack: error.stack });
+  if (gracefulShutdown) gracefulShutdown('uncaughtException', 1);
+  else process.exit(1);
+});
+
 /**
- * Apagado ordenado: Railway manda SIGTERM en cada deploy. Sin esto, las
+ * Apagado ordenado: la plataforma manda SIGTERM en cada deploy. Sin esto, las
  * requests en vuelo (incluida una compra a medio confirmar) se cortan de golpe.
  */
 const registerShutdown = (server, sweepTimer) => {
   let shuttingDown = false;
 
-  const shutdown = async (signal) => {
+  const shutdown = async (signal, exitCode = 0) => {
     if (shuttingDown) return;
     shuttingDown = true;
     logger.info('shutdown_started', { signal });
@@ -156,7 +199,7 @@ const registerShutdown = (server, sweepTimer) => {
       try {
         await closeDB();
         logger.info('shutdown_completed', { signal });
-        process.exit(0);
+        process.exit(exitCode);
       } catch (error) {
         logger.error('shutdown_error', { error: error.message });
         process.exit(1);
@@ -164,6 +207,7 @@ const registerShutdown = (server, sweepTimer) => {
     });
   };
 
+  gracefulShutdown = shutdown;
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
 };
@@ -179,7 +223,7 @@ const registerShutdown = (server, sweepTimer) => {
       logger.info('server_started', { port: PORT, env: process.env.NODE_ENV || 'development' });
     });
 
-    // Debe ser mayor al keep-alive del proxy (Railway usa 60 s) para evitar
+    // Debe ser mayor al keep-alive del proxy de la plataforma (típicamente 60 s) para evitar
     // ECONNRESET esporádicos cuando el proxy reusa una conexión que Node cerró.
     server.keepAliveTimeout = 65 * 1000;
     server.headersTimeout = 70 * 1000;

@@ -71,7 +71,7 @@ describe('PostgreSQL real: reserva, pago y auditoría', { skip: !enabled }, () =
     ({ settleApprovedPayment } = require(path.join(root, 'utils/paymentSettlement.js')));
     const { rows } = await pool.query('SELECT current_database() AS db');
     assert.equal(rows[0].db, 'lia_test', 'solo se corre contra la base de prueba');
-    const proposed = fs.readFileSync(path.join(root, 'db/migrations/2026-10-16_audit_actor_PROPOSED.sql'), 'utf8');
+    const proposed = fs.readFileSync(path.join(root, 'db/migrations/2026-10-16_audit_actor.sql'), 'utf8');
     await pool.query(proposed);
   });
 

@@ -8,8 +8,7 @@ const { requireTrustedOrigin } = require('../middleware/requireTrustedOrigin');
 // Credenciales de sesión: nunca cacheables.
 router.use(noStore);
 
-// Mismo límite que el login histórico de /api/users/login: es el endpoint
-// clásico de fuerza bruta.
+// Es el endpoint clásico de fuerza bruta: lleva el límite más estricto.
 const loginLimit = createRateLimit({ name: 'auth-login', windowMs: 60 * 1000, max: 10 });
 
 // El refresh se dispara solo (timer proactivo en el frontend, más el arranque

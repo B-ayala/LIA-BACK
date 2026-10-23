@@ -1,6 +1,4 @@
 const User = require('../models/User');
-const { getStatus, recordRateLimit } = require('../middleware/signupTracker');
-const { checkLock, recordFailure, recordSuccess } = require('../middleware/loginBruteforce');
 const logger = require('../utils/logger');
 
 /**
@@ -20,95 +18,6 @@ const serverError = (res, action, error) => {
 // (ver models/User.js): son los únicos seguros de reenviar al cliente tal cual.
 const SAFE_USER_VALIDATION_ERROR =
   /^Error al (actualizar|eliminar) usuario: (El nombre no puede tener más de 100 caracteres|El rol debe ser "user" o "admin"|El campo purchase_allowed_exclusive debe ser booleano|Debe proporcionar al menos un campo para actualizar \(name, role o purchase_allowed_exclusive\)|Usuario no encontrado|No se le puede quitar el rol admin al usuario principal|No se puede eliminar al usuario principal)$/;
-
-// Largo máximo de un email según RFC 5321.
-const MAX_EMAIL_LENGTH = 254;
-
-const isNonEmptyString = (value) => typeof value === 'string' && value.trim().length > 0;
-
-/**
- * @desc    Login de usuario
- * @route   POST /api/users/login
- * @note    Valida las credenciales contra Supabase Auth (grant_type=password);
- *          nunca devuelve éxito sin verificar la contraseña.
- */
-exports.loginUser = async (req, res) => {
-  try {
-    const { email, password } = req.body;
-
-    // typeof: un objeto/array en el body (`{"email": {"a":1}}`) llegaría truthy a
-    // `checkLock`/`keyOf` y reventaría con un 500 en vez de un 400.
-    if (!isNonEmptyString(email) || !isNonEmptyString(password) || email.length > MAX_EMAIL_LENGTH) {
-      return res.status(400).json({
-        success: false,
-        message: 'Email y contraseña son requeridos'
-      });
-    }
-
-    const lock = checkLock(email);
-    if (lock.locked) {
-      res.setHeader('Retry-After', lock.retryAfterSeconds);
-      logger.warn('login_locked', { retryAfterSeconds: lock.retryAfterSeconds });
-      return res.status(429).json({
-        success: false,
-        code: 'ACCOUNT_LOCKED',
-        message: 'Demasiados intentos fallidos. Esperá antes de volver a intentar.'
-      });
-    }
-
-    const supabaseUrl = (process.env.SUPABASE_URL || '').replace(/\/+$/, '');
-    const anonKey = process.env.SUPABASE_ANON_KEY || '';
-
-    if (!supabaseUrl || !anonKey) {
-      return res.status(503).json({
-        success: false,
-        message: 'Servicio de autenticación no disponible'
-      });
-    }
-
-    const authResponse = await fetch(`${supabaseUrl}/auth/v1/token?grant_type=password`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', apikey: anonKey },
-      body: JSON.stringify({ email, password })
-    });
-
-    if (!authResponse.ok) {
-      recordFailure(email);
-      return res.status(401).json({
-        success: false,
-        message: 'Credenciales inválidas'
-      });
-    }
-
-    const user = await User.findByEmail(email);
-
-    if (!user) {
-      return res.status(401).json({
-        success: false,
-        message: 'Credenciales inválidas'
-      });
-    }
-
-    recordSuccess(email);
-
-    res.status(200).json({
-      success: true,
-      data: {
-        id: user.id,
-        user_id: user.id,
-        name: user.name,
-        email: user.email,
-        role: user.role
-      }
-    });
-  } catch (error) {
-    logger.error('users_login_failed', { error: error.message });
-    res.status(500).json({
-      success: false,
-      message: 'No se pudo validar las credenciales'
-    });
-  }
-};
 
 /**
  * @desc    Obtener todos los usuarios
@@ -303,27 +212,6 @@ exports.deleteUser = async (req, res) => {
     }
     return serverError(res, 'delete', error);
   }
-};
-
-/**
- * @desc    Leer estado de rate limit para un email (sin modificar nada)
- * @route   GET /api/users/signup-status/:email
- */
-exports.signupStatus = (req, res) => {
-  const { email } = req.params;
-  if (!email) return res.status(400).json({ success: false, message: 'Email requerido' });
-  return res.status(200).json({ success: true, ...getStatus(decodeURIComponent(email)) });
-};
-
-/**
- * @desc    Registrar que Supabase devolvió rate limit para un email
- * @route   POST /api/users/signup-ratelimit
- * @body    { email: string }
- */
-exports.signupRateLimit = (req, res) => {
-  const { email } = req.body;
-  if (!email) return res.status(400).json({ success: false, message: 'Email requerido' });
-  return res.status(200).json({ success: true, ...recordRateLimit(email) });
 };
 
 /**

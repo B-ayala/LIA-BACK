@@ -1,4 +1,5 @@
 const { Pool } = require('pg');
+const logger = require('../utils/logger');
 
 const parseIntEnv = (name, fallback) => {
   const value = Number.parseInt(process.env[name], 10);
@@ -41,69 +42,63 @@ const pool = new Pool({
 
 let isConnected = false;
 
-// Verificar conexión
-pool.on('connect', () => {
-  console.log(`📡 PostgreSQL conectado a ${process.env.DB_HOST}:${process.env.DB_PORT}`);
-});
+// Una conexión nueva del pool no es un evento operativo: queda en debug.
+pool.on('connect', () => logger.debug('db_pool_connection_opened'));
 
 pool.on('error', (err) => {
-  console.error('❌ Error en el pool de PostgreSQL:', err.message);
+  logger.error('db_pool_error', { error: err.message, code: err.code });
   isConnected = false;
 });
 
-const connectDB = async (retries = 3) => {
+const CONNECT_RETRIES = 5;
+const CONNECT_BASE_DELAY_MS = 2000;
+const CONNECT_MAX_DELAY_MS = 10000;
+const JITTER_RATIO = 0.2;
+
+/**
+ * Espera entre reintentos de conexión: exponencial con tope y jitter. Durante un
+ * deploy con solape, la instancia vieja libera sus conexiones en segundos; un
+ * intervalo fijo de 2 s agotaba los 3 intentos antes de que eso ocurriera.
+ */
+const connectRetryDelayMs = (attempt, random = Math.random) => {
+  const exponential = Math.min(CONNECT_BASE_DELAY_MS * 2 ** (attempt - 1), CONNECT_MAX_DELAY_MS);
+  return Math.round(exponential * (1 + (random() * 2 - 1) * JITTER_RATIO));
+};
+
+const verifyProfilesTable = async (client) => {
+  const tableCheck = await client.query(`
+    SELECT EXISTS (
+      SELECT FROM information_schema.tables
+      WHERE table_schema = 'public'
+      AND table_name = 'profiles'
+    );
+  `);
+  if (!tableCheck.rows[0].exists) logger.warn('db_profiles_table_missing', { hint: 'Ejecutar: npm run init-db' });
+};
+
+const connectDB = async (retries = CONNECT_RETRIES) => {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
       const client = await pool.connect();
-      console.log('✓ Conexión a PostgreSQL/Supabase establecida correctamente');
-      
-      // Verificar que la tabla profiles existe
-      const tableCheck = await client.query(`
-        SELECT EXISTS (
-          SELECT FROM information_schema.tables 
-          WHERE table_schema = 'public' 
-          AND table_name = 'profiles'
-        );
-      `);
-      
-      if (!tableCheck.rows[0].exists) {
-        console.warn('⚠️ Tabla profiles no existe. Ejecuta: npm run init-db');
-      } else {
-        console.log('✓ Tabla profiles verificada');
+      try {
+        await verifyProfilesTable(client);
+      } finally {
+        client.release();
       }
-      
-      client.release();
+      logger.info('db_connected');
       isConnected = true;
       return pool;
     } catch (error) {
-      console.error(`\n❌ Intento de conexión ${attempt}/${retries} fallido:`);
-      console.error(`   Host: ${process.env.DB_HOST}`);
-      console.error(`   Port: ${process.env.DB_PORT}`);
-      console.error(`   Usuario: ${process.env.DB_USER}`);
-      console.error(`   Mensaje: ${error.message || 'Sin mensaje'}`);
-      console.error(`   Código: ${error.code || 'UNKNOWN'}`);
-      if (error.detail) console.error(`   Detalle: ${error.detail}`);
-      
-      if (attempt < retries) {
-        console.log(`   ⏳ Reintentando en 2 segundos...\n`);
-        await new Promise(resolve => setTimeout(resolve, 2000));
-      } else {
-        console.error(`\n❌ No se pudo conectar a PostgreSQL después de ${retries} intentos`);
-        console.error('\n📋 Checklist de diagnóstico:');
-        console.error('   1. ¿Supabase está disponible? → https://status.supabase.com');
-        console.error('   2. ¿El archivo .env existe? → Verifica c:/Users/Brian/Desktop/DamianaBella/lia-ecommerce/.env');
-        console.error('   3. ¿Las credenciales son correctas?');
-        console.error(`      - DB_HOST: ${process.env.DB_HOST}`);
-        console.error(`      - DB_PORT: ${process.env.DB_PORT}`);
-        console.error(`      - DB_USER: ${process.env.DB_USER}`);
-        console.error(`      - DB_NAME: ${process.env.DB_NAME}`);
-        console.error('   4. ¿La contraseña es correcta? → Verifica en Supabase Dashboard');
-        console.error('   5. ¿Hay problema de red? → Intenta ping a Supabase');
+      // Sin host ni usuario de la base en el log: la plataforma de logs no es un lugar para esos datos.
+      logger.error('db_connect_failed', { attempt, retries, code: error.code || 'UNKNOWN', error: error.message });
+      if (attempt === retries) {
         isConnected = false;
         throw error;
       }
+      await new Promise((resolve) => setTimeout(resolve, connectRetryDelayMs(attempt)));
     }
   }
+  return pool;
 };
 
 // Verificar estado de conexión
@@ -122,10 +117,33 @@ const getPoolStats = () => ({
   max: pool.options.max,
 });
 
-/** Cierra el pool al apagar el proceso (deploy de Railway envía SIGTERM). */
+/** Cierra el pool al apagar el proceso (el deploy de la plataforma envía SIGTERM). */
 const closeDB = async () => {
   isConnected = false;
   await pool.end();
 };
 
-module.exports = { connectDB, pool, isDBConnected, getPoolStats, closeDB };
+const READINESS_TIMEOUT_MS = 2000;
+
+/**
+ * Prueba real de que la API puede servir: un `SELECT 1` por el pool, con plazo.
+ * Si el pool está agotado o la base no responde, falla en 2 s en vez de colgarse.
+ * @returns {Promise<{ok: boolean, latencyMs: number, error?: string}>}
+ */
+const checkDatabase = async (timeoutMs = READINESS_TIMEOUT_MS) => {
+  const startedAt = Date.now();
+  let timer;
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error('readiness timeout')), timeoutMs);
+  });
+  try {
+    await Promise.race([pool.query('SELECT 1'), deadline]);
+    return { ok: true, latencyMs: Date.now() - startedAt };
+  } catch (error) {
+    return { ok: false, latencyMs: Date.now() - startedAt, error: error.message };
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+module.exports = { connectDB, pool, isDBConnected, getPoolStats, closeDB, checkDatabase, connectRetryDelayMs };

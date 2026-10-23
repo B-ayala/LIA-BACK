@@ -1,8 +1,8 @@
 /**
  * Reserva de stock del checkout (mp-preference y transfer) y su compensación.
  *
- * El trigger `trg_decrement_stock` descuenta al insertar la venta, pero con
- * `GREATEST(stock,0)`, que permitiría sobreventa silenciosa: por eso se valida
+ * El trigger `trg_decrement_stock` descuenta al insertar la venta; si el stock no
+ * alcanzara, el CHECK `stock >= 0` aborta el INSERT. Por eso se valida
  * disponibilidad con la fila bloqueada (`FOR UPDATE`) antes de insertar. El lock
  * se mantiene hasta el COMMIT, así que las líneas posteriores del mismo producto
  * ya ven el stock que descontó el trigger, y dos compras simultáneas del último
@@ -23,6 +23,19 @@ const {
 const HTTP_BAD_REQUEST = 400;
 const HTTP_TOO_MANY_REQUESTS = 429;
 const HTTP_SERVER_ERROR = 500;
+const HTTP_SERVICE_UNAVAILABLE = 503;
+
+// Un producto muy disputado hace cola por su lock; esperar más que esto retiene una
+// conexión del pool sin beneficio (el statement_timeout general es de 10 s).
+const DEFAULT_RESERVE_LOCK_TIMEOUT_MS = 3000;
+const PG_LOCK_NOT_AVAILABLE = '55P03';
+const ORDER_BUSY_MESSAGE = 'Hay mucha demanda sobre este producto. Intentá de nuevo en unos segundos.';
+
+const parseLockTimeoutMs = () => {
+  const configured = Number.parseInt(process.env.RESERVE_LOCK_TIMEOUT_MS, 10);
+  return Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_RESERVE_LOCK_TIMEOUT_MS;
+};
+const RESERVE_LOCK_TIMEOUT_MS = parseLockTimeoutMs();
 
 // Cuánto stock puede retener una sola cuenta sin pagar: sin tope, un script con una
 // cuenta barata vacía el catálogo a fuerza de reservas hasta que vencen (15 min).
@@ -137,10 +150,18 @@ const reserveOrders = async ({ buyerName, buyerEmail, userId, items, shippingMet
     purchaseId: paymentMethod === 'mp' ? crypto.randomUUID() : null,
   };
   try {
-    const result = await withTransaction(`reserve_orders_${paymentMethod}`, (client) => reserveLines(client, plan.lines, order));
+    const result = await withTransaction(
+      `reserve_orders_${paymentMethod}`,
+      (client) => reserveLines(client, plan.lines, order),
+      { lockTimeoutMs: RESERVE_LOCK_TIMEOUT_MS }
+    );
     if (result.ok) invalidateProducts();
     return result;
   } catch (error) {
+    if (error.code === PG_LOCK_NOT_AVAILABLE) {
+      logger.warn('order_reserve_lock_timeout', { paymentMethod });
+      return { ok: false, status: HTTP_SERVICE_UNAVAILABLE, code: 'ORDER_BUSY', message: ORDER_BUSY_MESSAGE };
+    }
     logger.error('order_reserve_failed', { paymentMethod, code: error.code, message: error.message });
     return {
       ok: false,

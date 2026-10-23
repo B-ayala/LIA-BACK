@@ -1,5 +1,5 @@
 -- ============================================================================
--- PROPUESTO (NO APLICADO) — Atribuir al backend en audit_log.actor (SEC-L01)
+-- APLICADO 2026-10-16 — Atribuir al backend en audit_log.actor (SEC-L01)
 --
 -- CONTEXTO
 --  El trigger `audit_row_change` (script 2026-10-13_security_hardening.sql, sección E)
