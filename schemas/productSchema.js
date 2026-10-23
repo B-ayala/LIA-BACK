@@ -54,8 +54,18 @@ const productBaseSchema = z.object({
 const TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d{1,6})?(Z|[+-]\d{2}(:?\d{2})?)?$/;
 
 const createProductSchema = productBaseSchema;
+// Escribir stock o variantes sin comparar `updated_at` pisaría el descuento de una compra concurrente.
+const STOCK_FIELDS = ['stock', 'variants'];
+const EXPECTED_UPDATED_AT_REQUIRED_MESSAGE =
+  'Para modificar stock o talles hay que enviar la fecha de última modificación (expectedUpdatedAt).';
+
 const updateProductSchema = productBaseSchema.partial().extend({
   expectedUpdatedAt: z.string().trim().regex(TIMESTAMP_PATTERN, 'Fecha de última modificación inválida').optional(),
+}).superRefine((body, ctx) => {
+  const touchesStock = STOCK_FIELDS.some((field) => body[field] !== undefined);
+  if (touchesStock && body.expectedUpdatedAt === undefined) {
+    ctx.addIssue({ code: 'custom', path: ['expectedUpdatedAt'], message: EXPECTED_UPDATED_AT_REQUIRED_MESSAGE });
+  }
 });
 
 module.exports = { createProductSchema, updateProductSchema };

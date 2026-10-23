@@ -205,7 +205,7 @@ config/database.js → Pool de conexiones pg
 | GET | `/api/products` | pública | Lista paginada (`?limit&offset`, máx 100), `ORDER BY created_at DESC`. |
 | GET | `/api/products/:id` | pública | Producto por id. `:id` no numérico → **400 `INVALID_PRODUCT_ID`**. |
 | POST | `/api/products` | **Bearer + admin** | Crea producto. Requiere `name` y `price`. |
-| PUT | `/api/products/:id` | **Bearer + admin** | Update dinámico (solo campos presentes: sin `stock` en el body, la columna `stock` no se toca). Opcional `expectedUpdatedAt` (el `updated_at` que leyó el admin, ISO con microsegundos): si no coincide con el actual → **409 `PRODUCT_CHANGED`** sin modificar nada (comparación atómica en el mismo UPDATE). |
+| PUT | `/api/products/:id` | **Bearer + admin** | Update dinámico (solo campos presentes: sin `stock` en el body, la columna `stock` no se toca). `expectedUpdatedAt` (el `updated_at` que leyó el admin, ISO con microsegundos) es **obligatorio si el body trae `stock` o `variants`** (400 `VALIDATION_ERROR` si falta) y opcional en el resto: si no coincide con el actual → **409 `PRODUCT_CHANGED`** sin modificar nada (comparación atómica en el mismo UPDATE). |
 | DELETE | `/api/products/:id` | **Bearer + admin** | Borra el producto y después su imagen en Cloudinary (best-effort). Con ventas `pendiente` del producto → **409 `PRODUCT_HAS_PENDING_ORDERS`** (no borra). |
 
 Body de create/update (camelCase → columnas snake_case): `name`, `price`, `stock`, `category`,

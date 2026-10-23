@@ -81,3 +81,12 @@ test('producto: schema Zod valida cardOptions', () => {
   assert.equal(parse(Array.from({ length: 10 }, () => option)), true);
   assert.equal(updateProductSchema.safeParse({ cardOptions: null }).success, true);
 });
+
+test('producto: editar stock o variants exige expectedUpdatedAt', () => {
+  const { updateProductSchema } = require('../../schemas/productSchema');
+  const stamp = '2026-10-12T15:00:00.123456+00:00';
+  assert.equal(updateProductSchema.safeParse({ stock: 3 }).success, false);
+  assert.equal(updateProductSchema.safeParse({ variants: [] }).success, false);
+  assert.equal(updateProductSchema.safeParse({ stock: 3, expectedUpdatedAt: stamp }).success, true);
+  assert.equal(updateProductSchema.safeParse({ name: 'X' }).success, true);
+});

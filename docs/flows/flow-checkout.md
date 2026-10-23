@@ -335,7 +335,8 @@ sequenceDiagram
   no tiene variantes).
 - **`ventas.review_reason`**: `null` · `amount_mismatch` · `duplicate_payment` · `refunded` ·
   `charged_back` (ver Expiración). Un pago en otra moneda que ARS queda como `amount_mismatch`.
-- **Edición de productos por el admin**: `PUT /api/products/:id` con `expectedUpdatedAt` devuelve
+- **Edición de productos por el admin**: `PUT /api/products/:id` con `expectedUpdatedAt` (obligatorio si el body trae `stock` o
+  `variants`, 400 si falta) devuelve
   409 `PRODUCT_CHANGED` si una compra cambió el producto mientras el admin lo editaba (no pisa el
   stock descontado). Borrar un producto con ventas `pendiente` → 409 `PRODUCT_HAS_PENDING_ORDERS`.
 - **`ventas.origin`** (respuesta del nudge post-WhatsApp): `null` (sin responder / MP) ·

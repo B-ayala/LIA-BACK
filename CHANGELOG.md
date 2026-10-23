@@ -45,6 +45,7 @@
 - Endpoints públicos sin consumidor en el front: `POST /api/users/login` (duplicaba a `POST /api/auth/login`), `GET /api/users/signup-status/:email` y `POST /api/users/signup-ratelimit` (cualquiera podía escribir emails arbitrarios en un Map sin purga). Responden 404. `middleware/signupTracker.js` eliminado.
 
 ### Changed
+- **Contrato** `PUT /api/products/:id`: `expectedUpdatedAt` es obligatorio cuando el body trae `stock` o `variants` (400 `VALIDATION_ERROR` si falta). El front del admin ya lo enviaba siempre; sin esto, una edición sin él podía pisar el descuento de una compra concurrente.
 - Stock (H-07): script SQL `db/migrations/2026-10-23_stock_trigger_fail_loud.sql` (aplicado el 2026-10-23) deja versionado `decrement_stock_on_sale()` y quita el `GREATEST(…, 0)`: una venta que sobrevendería falla con el CHECK `stock >= 0` en vez de pasar en silencio.
 - Checkout (H-15): la reserva de stock espera como máximo `RESERVE_LOCK_TIMEOUT_MS` (3000) por el lock del producto; vencido responde `503 ORDER_BUSY` en vez de hacer cola hasta el `statement_timeout`.
 - Logs: un 503 de degradación controlada (carril saturado, Auth o MP caídos, plazo vencido) ya no se loguea además como `request_failed` de nivel error; cada causa se loguea donde ocurre y el 503 sigue contando en las métricas.
