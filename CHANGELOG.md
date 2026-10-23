@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Added
+- Scripts SQL (aplicados el 2026-10-24) de la auditoría de rendimiento: `2026-10-24_trigram_search_indexes.sql` (índices `pg_trgm` para las búsquedas ILIKE de productos y ventas), `2026-10-24_audit_log_index_and_retention.sql` (índices de `audit_log`, `old_data`/`new_data` solo con columnas vigiladas en UPDATE y función `purge_audit_log(retention)` sin agendar) y `2026-10-24_rls_initplan_and_duplicate_checks.sql` (policies con `(SELECT auth.uid())` y baja del CHECK redundante `ventas_payment_status_domain`).
 - Productos: campo `cardOptions` (columna `productos.card_options`, jsonb) con sellos propios de la card por producto; `null` usa las opciones globales y `[]` no muestra sellos. Requiere correr `db/migrations/2026-10-23_add_card_options_to_productos.sql`.
 - Observabilidad: toda respuesta lleva `X-Request-Id` (también en cada línea de log de esa request); `GET /health` (con token) expone p50/p95/p99 por ruta, el estado de cada carril del bulkhead y del circuito de Mercado Pago; se loguean las requests lentas (`SLOW_REQUEST_MS`) y las 5xx.
 - `GET /ready`: readiness real (`SELECT 1` con plazo de 2 s, memorizado 3 s) para un monitor externo; `/health` sigue siendo liveness.
