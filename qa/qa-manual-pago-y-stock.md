@@ -25,7 +25,7 @@ Guía para probar a mano, de punta a punta, el proceso de compra: Mercado Pago, 
 ### 2.1 Entorno
 - [ ] URL del sitio a probar: ______________________
 - [ ] Versión (commit o fecha de despliegue) del backend: ______ y del front: ______
-- [ ] Confirmar con el responsable técnico que **ya se desplegaron backend y front nuevos** y que se aplicó la migración de base de datos del 2026-10-14. Si falta alguno, no empieces.
+- [ ] Confirmar con el responsable técnico que **ya se desplegaron backend y front nuevos** y que se aplicaron la migración de base de datos del 2026-10-14 y los scripts SQL del 2026-10-24 (ya aplicados). Si falta alguno, no empieces.
 
 ### 2.2 Cuentas (pedírselas al responsable)
 - **Comprador A** — usuario del sitio con email confirmado (navegador normal).
@@ -445,6 +445,31 @@ Verificar rápidamente que nada se rompió fuera del pago:
 
 ---
 
+### 13.1 Cambios de base de datos del 2026-10-24 (rendimiento)
+> Se aplicaron índices de búsqueda, nuevas reglas de seguridad por fila y un registro de auditoría más liviano. No cambian lo que ve el usuario: se prueba que **todo siga funcionando igual**. Equivale a TC-378, TC-379, TC-380 y TC-375 de `qa/test-plan.md`.
+
+#### BD-01 — Catálogo, buscadores y "Mis compras" cargan igual
+- **Pasos:** (1) sin loguearte, abrir el listado de productos, buscar por una palabra del nombre, otra de la descripción y filtrar por una categoría. (2) Logueado como comprador A, abrir "Mis compras". (3) Como Admin, abrir Ventas y buscar por nombre de producto, por nombre de comprador y por parte de un email.
+- **Esperado:** todo carga sin errores ni pantallas vacías inesperadas; las búsquedas devuelven los resultados correctos (también con mayúsculas/minúsculas mezcladas, ej. "PRUEBA"); "Mis compras" muestra solo las compras propias.
+- **Resultado:** ☐ ok ☐ fail ☐ no probado
+
+#### BD-02 — Los permisos siguen iguales (RLS)
+- **Pasos:** (1) Comprador A (usuario común): intentar entrar a `/admin`. (2) Anónimo (sin login): abrir el listado de productos y confirmar que **no** aparece ningún producto inactivo. (3) Admin: editar la descripción de "Prueba" y guardar; crear/editar una categoría; guardar una preferencia del panel.
+- **Esperado:** (1) no accede al admin; (2) solo se ven productos activos; (3) el Admin guarda sin errores.
+- **Resultado:** ☐ ok ☐ fail ☐ no probado
+
+#### BD-03 — Ciclo de stock con transferencia (el trigger sigue descontando)
+- **Pasos:** repetir **TRF-01** (comprar 1 unidad por transferencia) y **TRF-04** (el Admin cancela). Anotar el stock antes, después de comprar y después de cancelar.
+- **Esperado:** compra: total −1 y talle −1, **una sola vez**; cancelación: vuelve al valor inicial. Pedir más unidades que las disponibles de un talle (ver STK-06) falla con mensaje claro y **no** deja stock negativo ni en 0 por error.
+- **Resultado:** ☐ ok ☐ fail ☐ no probado
+
+#### BD-04 — Cambio de precio queda auditado *(solo con acceso de solo lectura a la base, Apéndice A)*
+- **Pasos:** Admin → Productos → editar "Prueba" → cambiar el precio y guardar; luego corregirlo al valor original. Correr la consulta de auditoría del Apéndice A.
+- **Esperado:** aparecen 2 filas nuevas (`UPDATE` sobre `productos`) con el uuid del admin en `actor` y, en `old_data`/`new_data`, **solo** `id`, `price`, `discount`, `original_price` y `status` (sin imágenes ni otros campos largos). Si no tenés acceso a la base, marcá `no probado` y avisá al responsable técnico.
+- **Resultado:** ☐ ok ☐ fail ☐ no probado
+
+---
+
 ## 14. Casos que el QA manual NO puede ejecutar (los cubre el equipo técnico)
 Se listan para que no se den por probados por error:
 
@@ -509,6 +534,15 @@ SELECT left(id::text, 8) AS id, payment_status, payment_method, quantity,
 
 -- Stock actual de Prueba (total y por talle)
 SELECT stock, variants FROM public.productos WHERE name = 'Prueba';
+```
+
+Auditoría de cambios de precio (BD-04):
+
+```sql
+SELECT at, actor, table_name, action, old_data, new_data
+  FROM public.audit_log
+ WHERE table_name = 'productos'
+ ORDER BY id DESC LIMIT 5;
 ```
 
 Valores esperados tras un pago aprobado (PAG-01): `payment_status = pagado`, `tiene_pref` y `tiene_ref` en `true`, `mp_payment_id` con valor, `oversold = false`, `review_reason` vacío.
