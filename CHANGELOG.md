@@ -18,6 +18,7 @@
 - `qa/k6/`: scripts de carga (catálogo con perfiles smoke / load / stress / spike / soak, y carrera por la última unidad). No ejecutados todavía.
 
 ### Security
+- Usuarios (SEC-N10, 2da parte): `PUT /api/users/:id` valida el nombre con `utils/userValidation.js` (2 a 60 caracteres, solo letras, espacios, apóstrofes, puntos y guiones) en vez de solo `<= 100`; `login` rechaza contraseñas de más de 128 caracteres (400). Script `db/migrations/2026-10-25_signup_input_validation.sql` (PENDIENTE de aplicar): `handle_new_user` rechaza el alta si el nombre o el celular no cumplen las mismas reglas. La contraseña no se puede validar ahí: su política se configura en el panel de Supabase.
 - Auth (ABU-001): `forgot-password` y `resend-confirmation` validaban el email con un regex de backtracking cuadrático y sin tope de largo: un solo POST sin autenticar con ~250 kB bloqueaba el event loop cerca de un minuto (toda la tienda, webhook incluido). Ahora `utils/emailValidation.js` acota a 254 caracteres y usa un patrón lineal; `login` también rechaza emails de más de 254 (400).
 - Auth: `/api/auth/*` parsea el body con tope de 8 kB (antes 256 kB, igual que el resto de la API); un body mayor responde 413.
 - Auth (A1): todas las llamadas del backend a Supabase Auth (login, refresh, logout, reenvío, recuperación) tienen timeout de 5 s. Si Auth no responde, la API contesta 503 `AUTH_UNAVAILABLE` con `Retry-After: 2` (el refresh no borra la cookie) en vez de retener un slot del bulkhead hasta saturar toda la API.

@@ -1919,3 +1919,10 @@ ID: TC-380 — Caso: policies con InitPlan y CHECK duplicado. Tipo: regression. 
 
 ## Hallazgos abiertos (agregado 2026-10-23)
 - ✅ RESUELTO (2026-10-23, pendiente de verificar en vivo) — H-CLD-DESTROY — `utils/cloudinaryDestroy.js` usaba un endpoint inexistente; ahora usa `DELETE /resources/image/upload` y exige `deleted`. `Product.deleteIfNoPendingOrders` no borra el asset si otro producto, `carousel_images` o `site_content` lo referencian. Casos: TC-372, TC-373, TC-374.
+
+## Validación de datos de usuario (SEC-N10, 2da parte)
+
+ID: TC-VAL-B01 — Caso: `PUT /api/users/:id` con nombre inválido (HTML, 61 caracteres, objeto/array/número). Tipo: security. Esperado: 400 con mensaje de dominio (o genérico para tipos no string), sin `UPDATE` ni detalle interno. Resultado: ok (`test/user-validation.test.js`).
+ID: TC-VAL-B02 — Caso: asignación masiva (`is_owner`, `id`, `email` en el body). Tipo: security. Esperado: no llegan al `UPDATE`. Resultado: ok (`test/user-validation.test.js`).
+ID: TC-VAL-B03 — Caso: `POST /api/auth/login` con contraseña > 128 caracteres o email/contraseña no string. Tipo: edge. Esperado: 400. Resultado: ok (`test/user-validation.test.js`).
+ID: TC-VAL-B04 — Caso: aplicar `2026-10-25_signup_input_validation.sql` y registrar con nombre inválido / celular inválido / nombre válido con tildes. Tipo: security. Esperado: los dos primeros fallan sin crear cuenta; el tercero crea la cuenta y el perfil. Resultado: no probado (script sin aplicar).
