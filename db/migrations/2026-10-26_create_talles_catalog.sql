@@ -80,6 +80,7 @@ CREATE POLICY talles_delete_admin ON public.talles
   AS PERMISSIVE FOR DELETE TO authenticated USING (public.is_admin());
 
 REVOKE INSERT, UPDATE, DELETE ON public.talles FROM anon, authenticated;
+REVOKE TRUNCATE, REFERENCES, TRIGGER ON public.talles FROM anon, authenticated;
 
 COMMIT;
 
@@ -92,8 +93,7 @@ NOTIFY pgrst, 'reload schema';
 --  WHERE schemaname = 'public' AND tablename = 'talles';
 -- SELECT grantee, privilege_type FROM information_schema.role_table_grants
 --  WHERE table_schema = 'public' AND table_name = 'talles'
---    AND grantee IN ('anon', 'authenticated');   -- solo SELECT (más los que
---    -- tengan por defecto REFERENCES/TRIGGER/TRUNCATE; ninguno de escritura de filas)
+--    AND grantee IN ('anon', 'authenticated');   -- debe quedar solo SELECT
 -- INSERT de prueba desde la API (POST /api/sizes) con "m" y luego con "M" del
 -- mismo tipo: el segundo debe fallar por el índice único.
 

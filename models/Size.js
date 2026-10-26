@@ -2,13 +2,14 @@ const { pool } = require('../config/database');
 
 const UNIQUE_VIOLATION = '23505';
 
-const COLUMNS = 'id, name, type, measurements, active, created_at, updated_at';
+const COLUMNS = 'id, name, type, garment, measurements, active, created_at, updated_at';
 
 const keep = (value) => value;
 
 const UPDATABLE_COLUMNS = [
   ['name', 'name', keep],
   ['type', 'type', keep],
+  ['garment', 'garment', keep],
   ['measurements', 'measurements', JSON.stringify],
   ['active', 'active', keep],
 ];
@@ -17,13 +18,14 @@ const toSize = (row) => ({
   id: row.id,
   name: row.name,
   type: row.type,
+  garment: row.garment,
   measurements: row.measurements,
   active: row.active,
   createdAt: row.created_at,
   updatedAt: row.updated_at,
 });
 
-// El duplicado (type + lower(name)) lo detecta el índice único y no un SELECT previo: no hay carrera entre dos admins.
+// El duplicado (type + lower(prenda) + lower(name)) lo detecta el índice único y no un SELECT previo: no hay carrera entre dos admins.
 const runWrite = async (text, values) => {
   try {
     const result = await pool.query(text, values);
@@ -37,7 +39,7 @@ const runWrite = async (text, values) => {
 /** Acceso a datos del catálogo de talles (tabla public.talles). */
 class Size {
   static async findAll() {
-    const result = await pool.query(`SELECT ${COLUMNS} FROM public.talles ORDER BY type, name`);
+    const result = await pool.query(`SELECT ${COLUMNS} FROM public.talles ORDER BY type, garment NULLS FIRST, name`);
     return result.rows.map(toSize);
   }
 
@@ -50,10 +52,10 @@ class Size {
   }
 
   /** @returns {Promise<{status: 'ok', size: object} | {status: 'duplicate'}>} */
-  static async create({ name, type, measurements = {} }) {
+  static async create({ name, type, garment = null, measurements = {} }) {
     return runWrite(
-      `INSERT INTO public.talles (name, type, measurements) VALUES ($1, $2, $3) RETURNING ${COLUMNS}`,
-      [name, type, JSON.stringify(measurements)]
+      `INSERT INTO public.talles (name, type, garment, measurements) VALUES ($1, $2, $3, $4) RETURNING ${COLUMNS}`,
+      [name, type, garment, JSON.stringify(measurements)]
     );
   }
 

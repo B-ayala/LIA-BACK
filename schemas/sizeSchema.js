@@ -6,6 +6,7 @@ const { z } = require('zod');
  */
 
 const MAX_SIZE_NAME = 20;
+const MAX_GARMENT = 30;
 const MAX_MEASUREMENTS = 8;
 const MAX_MEASUREMENT_KEY = 30;
 const MAX_MEASUREMENT_VALUE = 20;
@@ -43,15 +44,21 @@ const sizeNameSchema = z.string().trim().min(1, 'El nombre es requerido')
   .max(MAX_SIZE_NAME, `Máximo ${MAX_SIZE_NAME} caracteres`)
   .transform((name) => name.toUpperCase());
 
+const garmentSchema = z.string().trim().max(MAX_GARMENT, `Máximo ${MAX_GARMENT} caracteres`)
+  .transform((garment) => (garment === '' ? null : garment))
+  .nullable();
+
 const createSizeSchema = z.strictObject({
   name: sizeNameSchema,
   type: z.enum(SIZE_TYPES),
+  garment: garmentSchema.optional(),
   measurements: measurementsSchema.optional(),
 });
 
 const updateSizeSchema = z.strictObject({
   name: sizeNameSchema.optional(),
   type: z.enum(SIZE_TYPES).optional(),
+  garment: garmentSchema.optional(),
   measurements: measurementsSchema.optional(),
   active: z.boolean().optional(),
 });

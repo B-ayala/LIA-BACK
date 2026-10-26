@@ -20,6 +20,19 @@ test('talle: rechaza nombre vacío, de 21 caracteres y tipo desconocido', () => 
   assert.equal(createSizeSchema.safeParse({ name: 'M', type: 'otro' }).success, false);
 });
 
+test('talle: prenda opcional, recortada, vacía o null => null, máximo 30', () => {
+  const parse = (garment) => createSizeSchema.safeParse({ name: 'M', type: 'indumentaria', garment });
+  assert.equal(parse('  Saco Sastrero ').data.garment, 'Saco Sastrero');
+  assert.equal(parse('').data.garment, null);
+  assert.equal(parse('   ').data.garment, null);
+  assert.equal(parse(null).data.garment, null);
+  assert.equal(parse('x'.repeat(30)).success, true);
+  assert.equal(parse('x'.repeat(31)).success, false);
+  assert.equal(parse(5).success, false);
+  assert.equal('garment' in createSizeSchema.parse({ name: 'M', type: 'calzado' }), false);
+  assert.deepEqual(updateSizeSchema.parse({ garment: null }), { garment: null });
+});
+
 test('talle: campos extra (mass assignment) se rechazan', () => {
   assert.equal(createSizeSchema.safeParse({ name: 'M', type: 'calzado', id: SIZE_ID }).success, false);
   assert.equal(updateSizeSchema.safeParse({ createdAt: 'x' }).success, false);

@@ -3,7 +3,7 @@ const logger = require('../utils/logger');
 const { sendError } = require('../utils/httpResponses');
 
 const WRITE_FAILURES = {
-  duplicate: [409, 'SIZE_DUPLICATE', 'Ya existe un talle con ese nombre para ese tipo.'],
+  duplicate: [409, 'SIZE_DUPLICATE', 'Ya existe un talle con ese nombre para esa prenda y tipo.'],
   not_found: [404, 'SIZE_NOT_FOUND', 'Talle no encontrado'],
   empty: [400, 'NO_FIELDS', 'No hay campos para actualizar'],
 };

@@ -216,9 +216,9 @@ Body de create/update (camelCase → columnas snake_case): `name`, `price`, `sto
 ### 5.2b Talles — `/api/sizes` (`sizeRoutes.js` → `sizeController.js`)
 | Método | Ruta | Auth | Descripción |
 |---|---|---|---|
-| GET | `/api/sizes` | pública (`optionalAuth`, caché 30 s) | Todos los talles (activos e inactivos), orden `type, name`: `{ id, name, type, measurements, active, createdAt, updatedAt }`. |
-| POST | `/api/sizes` | **Bearer + admin** | Crea `{ name, type, measurements? }` (`name` en mayúsculas). Duplicado `type`+nombre → **409 `SIZE_DUPLICATE`**. |
-| PUT | `/api/sizes/:id` | **Bearer + admin** | Update parcial (`name`, `type`, `measurements`, `active`). Id inexistente → **404 `SIZE_NOT_FOUND`**; id no UUID → **400 `INVALID_SIZE_ID`**. |
+| GET | `/api/sizes` | pública (`optionalAuth`, caché 30 s) | Todos los talles (activos e inactivos), orden `type, garment` (sin prenda primero)`, name`: `{ id, name, type, garment, measurements, active, createdAt, updatedAt }`. |
+| POST | `/api/sizes` | **Bearer + admin** | Crea `{ name, type, garment?, measurements? }` (`name` en mayúsculas; `garment` = prenda opcional de 1-30 caracteres, se guarda como se escribe, vacío = `null`). Duplicado `type`+prenda+nombre (sin distinguir mayúsculas) → **409 `SIZE_DUPLICATE`**. |
+| PUT | `/api/sizes/:id` | **Bearer + admin** | Update parcial (`name`, `type`, `garment` —`null` la borra—, `measurements`, `active`). Id inexistente → **404 `SIZE_NOT_FOUND`**; id no UUID → **400 `INVALID_SIZE_ID`**. |
 
 No hay DELETE: se desactiva con `active: false`. `variants[].optionMeta` de `/api/products` (talle `global` con `sizeId` o `custom` con medidas) se valida en el borde; un `sizeId` inexistente → **400 `SIZE_NOT_FOUND`**.
 
