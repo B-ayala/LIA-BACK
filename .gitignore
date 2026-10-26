@@ -48,6 +48,9 @@ coverage/
 # no son parte del código de la app. El plan de pruebas (qa/test-plan.md) sí
 # se versiona: es documentación, no un script.
 qa/*.js
+# Excepción: E2E por HTTP sin credenciales (se pasan por variables de entorno).
+!qa/e2e-endpoints.js
+!qa/e2e-cloudinary-lock.js
 qa_timeout_test_out.txt
 *_test_out.txt
 

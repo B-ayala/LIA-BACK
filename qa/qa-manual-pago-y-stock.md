@@ -468,6 +468,40 @@ Verificar rápidamente que nada se rompió fuera del pago:
 - **Esperado:** aparecen 2 filas nuevas (`UPDATE` sobre `productos`) con el uuid del admin en `actor` y, en `old_data`/`new_data`, **solo** `id`, `price`, `discount`, `original_price` y `status` (sin imágenes ni otros campos largos). Si no tenés acceso a la base, marcá `no probado` y avisá al responsable técnico.
 - **Resultado:** ☐ ok ☐ fail ☐ no probado
 
+### 13.2 Cambios del 2026-10-23 (stock, imágenes y edición de productos)
+> Se aplicaron: el trigger de stock que ya no "tapa" una sobreventa, la columna `card_options` de productos, el borrado real de la imagen en Cloudinary al eliminar un producto, y la fecha de última modificación obligatoria al editar stock o talles. Equivalen a TC-373, TC-374, TC-375, TC-376 y TC-377 de `qa/test-plan.md`. Usar **solo** productos de prueba (el sitio apunta a datos reales).
+
+#### BD-05 — El catálogo público carga con la columna nueva
+- **Pre-condición:** el script SQL de `card_options` ya se ejecutó en Supabase.
+- **Pasos:** sin loguearte, abrir el listado de productos, recargar con Ctrl+F5 y abrir la ficha de 2 productos. Repetir como Admin en Productos.
+- **Esperado:** se ven todos los productos activos (no una lista vacía ni un error); las cards muestran los sellos de siempre (los productos existentes usan las opciones globales).
+- **Resultado:** ☐ ok ☐ fail ☐ no probado
+
+#### PRD-06 — Editar stock y talles desde el admin guarda bien
+- **Pre-condición:** producto "Prueba" con talles (M y L).
+- **Pasos:** Admin → Productos → editar "Prueba" → cambiar el stock de un talle (ej. L de 3 a 4) → guardar. Anotar el stock antes y después. Después editar **solo la descripción** y guardar de nuevo.
+- **Esperado:** ambos guardados funcionan sin mensajes de error; el stock por talle queda como lo escribió el admin y el total coincide con la suma; editar solo la descripción no cambia el stock. Si aparece un mensaje que menciona la "fecha de última modificación", es un **fallo**: anotá captura y hora.
+- **Cierre:** devolver el stock de "Prueba" a sus valores iniciales.
+- **Resultado:** ☐ ok ☐ fail ☐ no probado
+
+#### PRD-07 — Borrar un producto borra también su imagen (TC-373)
+- **Pre-condición:** un producto de prueba **inactivo**, creado para esto, con una imagen subida **solo para él** (no una que uses en otro producto, el carrusel o la home). Anotar el nombre del archivo de la imagen.
+- **Pasos:** Admin → Productos → eliminar ese producto. Después Admin → gestor de imágenes (Cloudinary) y buscar el archivo.
+- **Esperado:** el producto desaparece y la imagen **ya no está** en Cloudinary.
+- **Resultado:** ☐ ok ☐ fail ☐ no probado
+
+#### PRD-08 — Borrar un producto NO borra una imagen que se sigue usando (TC-374)
+- **Pre-condición:** un producto de prueba inactivo cuya imagen **también** esté puesta como slide del carrusel (o como imagen de la home/about). Anotar el archivo.
+- **Pasos:** eliminar el producto de prueba. Abrir el sitio público (home) y el gestor de imágenes.
+- **Esperado:** el producto se elimina, pero la imagen **sigue en Cloudinary** y el carrusel/home la sigue mostrando (no queda una imagen rota). Lo mismo si la usa otro producto.
+- **Resultado:** ☐ ok ☐ fail ☐ no probado
+
+#### Casos del trigger de stock y bloqueo (los ejecuta el equipo técnico)
+> **2026-10-26:** TC-375 (por endpoints) y TC-377 se probaron con `qa/e2e-endpoints.js` (14/14 ok); TC-376, TC-373 y TC-374 con `qa/e2e-cloudinary-lock.js` (11/11 ok). Queda, si se quiere, la variante con `qa/concurrency-stock-test.js`. PRD-07 y PRD-08 siguen valiendo para confirmar a mano desde el panel admin.
+- **TC-375 (ciclo completo con sobreventa):** correr `ALLOW_QA_AGAINST_THIS_DB=1 node qa/concurrency-stock-test.js 20 2` desde `BACK/lia-store` (requiere que `.env` tenga la `DB_PASSWORD` vigente). Esperado en cada corrida: 1 reserva exitosa, las otras con 409, stock final 0, nunca negativo y 1 venta creada. Crea y borra su propio producto inactivo `QA-CONCURRENCY-TEST-STOCK`. ☐ ok ☐ fail ☐ no probado
+- **TC-376 (bloqueo por demanda):** con `RESERVE_LOCK_TIMEOUT_MS` bajo (ej. 200) y un producto bloqueado desde otra sesión, "Continuar al pago" debe responder 503 `ORDER_BUSY` con el mensaje "Hay mucha demanda sobre este producto…", sin crear la orden ni descontar stock. ☐ ok ☐ fail ☐ no probado
+- **TC-377 (contrato del PUT):** `PUT /api/products/:id` como admin con `{ "stock": 3 }` y sin `expectedUpdatedAt` → 400 y nada cambia; con la fecha vigente → 200; editando solo `name` sin fecha → 200. ☐ ok ☐ fail ☐ no probado
+
 ---
 
 ## 14. Casos que el QA manual NO puede ejecutar (los cubre el equipo técnico)
@@ -481,6 +515,7 @@ Se listan para que no se den por probados por error:
 | Cobro duplicado de la misma compra | Requiere dos pagos aprobados sobre la misma preferencia. |
 | Compras simultáneas masivas / bloqueos cruzados | Requiere pruebas automatizadas de carga. |
 | Webhook de Mercado Pago configurado en producción | Es configuración del servidor. |
+| Sobreventa del último ítem con trigger nuevo, 503 `ORDER_BUSY` y 400 por falta de fecha al editar stock | Son los "Casos del trigger de stock y bloqueo" de la sección 13.2 (TC-375/376/377). |
 
 ---
 
