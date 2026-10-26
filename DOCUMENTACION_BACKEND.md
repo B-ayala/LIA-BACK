@@ -213,6 +213,15 @@ Body de create/update (camelCase → columnas snake_case): `name`, `price`, `sto
 `discount` (admite null), `condition` (`new`/`used`), `freeShipping`, `variants`,
 `specifications`, `features`, `faqs` (JSONB), `warranty`, `returnPolicy`, `status`.
 
+### 5.2b Talles — `/api/sizes` (`sizeRoutes.js` → `sizeController.js`)
+| Método | Ruta | Auth | Descripción |
+|---|---|---|---|
+| GET | `/api/sizes` | pública (`optionalAuth`, caché 30 s) | Todos los talles (activos e inactivos), orden `type, name`: `{ id, name, type, measurements, active, createdAt, updatedAt }`. |
+| POST | `/api/sizes` | **Bearer + admin** | Crea `{ name, type, measurements? }` (`name` en mayúsculas). Duplicado `type`+nombre → **409 `SIZE_DUPLICATE`**. |
+| PUT | `/api/sizes/:id` | **Bearer + admin** | Update parcial (`name`, `type`, `measurements`, `active`). Id inexistente → **404 `SIZE_NOT_FOUND`**; id no UUID → **400 `INVALID_SIZE_ID`**. |
+
+No hay DELETE: se desactiva con `active: false`. `variants[].optionMeta` de `/api/products` (talle `global` con `sizeId` o `custom` con medidas) se valida en el borde; un `sizeId` inexistente → **400 `SIZE_NOT_FOUND`**.
+
 ### 5.3 Órdenes y pagos — `/api/orders` (`orderRoutes.js` → `orderController.js`)
 | Método | Ruta | Auth | Descripción |
 |---|---|---|---|

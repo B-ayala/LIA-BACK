@@ -1,9 +1,10 @@
 const { z } = require('zod');
+const { variantSchema } = require('./variantSchema');
 
 /**
  * Validación de borde para /api/products (solo admin, ver productRoutes.js).
  *
- * Los campos anidados complejos (variants, specifications, features, faqs,
+ * Los campos anidados complejos (specifications, features, faqs,
  * sizeGuide) se aceptan como arrays/objetos sueltos: su forma la valida el
  * front al construirlos y ya se persisten como JSON opaco en la base. Acá se
  * acota lo que sí importa para AppSec: tipos primitivos, longitudes y rangos
@@ -39,7 +40,7 @@ const productBaseSchema = z.object({
   hoverImageEnabled: z.boolean().optional(),
   // null = usa las opciones globales; [] = sin sellos.
   cardOptions: z.array(cardOptionSchema).max(MAX_CARD_OPTIONS).nullable().optional(),
-  variants: z.array(z.any()).max(MAX_ARRAY_ITEMS).optional(),
+  variants: z.array(variantSchema).max(MAX_ARRAY_ITEMS).optional(),
   specifications: z.array(z.any()).max(MAX_ARRAY_ITEMS).optional(),
   features: z.array(z.any()).max(MAX_ARRAY_ITEMS).optional(),
   faqs: z.array(z.any()).max(MAX_ARRAY_ITEMS).optional(),

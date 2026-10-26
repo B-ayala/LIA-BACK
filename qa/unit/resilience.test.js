@@ -277,3 +277,12 @@ test('token: descarta sin consultar a Supabase lo vencido y lo desmedido; deja p
   assert.equal(isClearlyUnusableToken(fakeJwt({ sub: 'x' })), false, 'sin exp no se puede afirmar');
   assert.equal(isClearlyUnusableToken('a.%%%.c'), false);
 });
+
+test('trust proxy: TRUST_PROXY_HOPS válido se respeta; inválido o fuera de rango cae a 1', () => {
+  const { resolveTrustProxyHops } = require('../../config/trustProxy');
+  assert.equal(resolveTrustProxyHops('3'), 3);
+  assert.equal(resolveTrustProxyHops(undefined), 1);
+  assert.equal(resolveTrustProxyHops('0'), 1);
+  assert.equal(resolveTrustProxyHops('99'), 1);
+  assert.equal(resolveTrustProxyHops('abc'), 1);
+});

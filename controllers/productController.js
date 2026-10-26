@@ -1,4 +1,6 @@
 const Product = require('../models/Product');
+const Size = require('../models/Size');
+const { collectGlobalSizeIds } = require('../schemas/variantSchema');
 const { caches, TTL, invalidateProducts } = require('../utils/cache');
 const logger = require('../utils/logger');
 const { sendError } = require('../utils/httpResponses');
@@ -81,10 +83,21 @@ const toInsertValues = (body) => {
   ];
 };
 
+/** Responde 400 SIZE_NOT_FOUND si alguna opción global apunta a un talle que no existe (activo o no). @returns {Promise<boolean>} true si ya respondió. */
+const rejectUnknownSizes = async (res, variants) => {
+  const missing = await Size.findMissingIds(collectGlobalSizeIds(variants));
+  if (missing.length === 0) return false;
+  sendError(res, 400, 'SIZE_NOT_FOUND', 'Alguno de los talles seleccionados no existe en el catálogo.', {
+    details: missing.map((sizeId) => ({ field: 'variants.optionMeta.sizeId', message: sizeId })),
+  });
+  return true;
+};
+
 // Un producto "Activo" sin stock es un estado válido: se muestra en la tienda
 // marcado "Sin stock" y no se puede comprar (el front pide confirmación antes).
 const createProduct = async (req, res) => {
   try {
+    if (await rejectUnknownSizes(res, req.body.variants)) return undefined;
     const product = await Product.create(toInsertValues(req.body), req.user.id);
     invalidateProducts();
     return res.status(201).json({ success: true, data: product });
@@ -156,6 +169,7 @@ const UPDATE_FAILURES = {
 const updateProduct = async (req, res) => {
   try {
     const { expectedUpdatedAt, ...fields } = req.body;
+    if (await rejectUnknownSizes(res, fields.variants)) return undefined;
     const result = await Product.update(req.params.id, fields, expectedUpdatedAt, req.user.id);
     if (result.status !== 'updated') {
       const [status, code, message] = UPDATE_FAILURES[result.status];

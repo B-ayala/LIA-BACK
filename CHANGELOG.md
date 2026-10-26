@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+- Catálogo de talles: `GET /api/sizes` (público, cacheable 30 s), `POST /api/sizes` y `PUT /api/sizes/:id` (admin; los talles se desactivan con `active`, no se borran). Errores `SIZE_DUPLICATE` (409) y `SIZE_NOT_FOUND` (404). Requiere correr `db/migrations/2026-10-26_create_talles_catalog.sql` (PENDIENTE de aplicar).
+- Productos: `variants[].optionMeta` opcional en las variantes de talle (`global` con `sizeId` del catálogo o `custom` con medidas propias). Un `sizeId` inexistente responde 400 `SIZE_NOT_FOUND`; `variants` ahora se valida con un schema laxo en vez de `z.any` y `sizeGuide` queda como legado de solo lectura.
+
 ### Removed
 - `User.findByEmail`: método sin llamadores (la búsqueda por email vive en Supabase Auth).
 
@@ -18,6 +22,7 @@
 - `qa/k6/`: scripts de carga (catálogo con perfiles smoke / load / stress / spike / soak, y carrera por la última unidad). No ejecutados todavía.
 
 ### Security
+- **Rate limit por IP real (A5)**: en Render el log `proxy_diagnostic` mostró 3 saltos en `X-Forwarded-For` (Cloudflare + proxies internos) con `trust proxy = 1`, así que `req.ip` era una IP interna `10.x` y todos los usuarios compartían el mismo cupo de rate limit. Nueva variable `TRUST_PROXY_HOPS` (1 a 5, default 1: sin cambios hasta configurarla); en Render va `3`.
 - Usuarios (SEC-N10, 2da parte): `PUT /api/users/:id` valida el nombre con `utils/userValidation.js` (2 a 60 caracteres, solo letras, espacios, apóstrofes, puntos y guiones) en vez de solo `<= 100`; `login` rechaza contraseñas de más de 128 caracteres (400). Script `db/migrations/2026-10-25_signup_input_validation.sql` (PENDIENTE de aplicar): `handle_new_user` rechaza el alta si el nombre o el celular no cumplen las mismas reglas. La contraseña no se puede validar ahí: su política se configura en el panel de Supabase.
 - Auth (ABU-001): `forgot-password` y `resend-confirmation` validaban el email con un regex de backtracking cuadrático y sin tope de largo: un solo POST sin autenticar con ~250 kB bloqueaba el event loop cerca de un minuto (toda la tienda, webhook incluido). Ahora `utils/emailValidation.js` acota a 254 caracteres y usa un patrón lineal; `login` también rechaza emails de más de 254 (400).
 - Auth: `/api/auth/*` parsea el body con tope de 8 kB (antes 256 kB, igual que el resto de la API); un body mayor responde 413.

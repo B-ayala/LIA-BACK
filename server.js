@@ -14,6 +14,7 @@ const { securityHeaders } = require('./middleware/securityHeaders');
 const { requestDeadline } = require('./middleware/requestDeadline');
 const { requestObserver } = require('./middleware/requestObserver');
 const { proxyDiagnostic } = require('./middleware/proxyDiagnostic');
+const { resolveTrustProxyHops } = require('./config/trustProxy');
 const { getReadiness } = require('./services/readiness');
 const { metricsSnapshot, recordProcessEvent } = require('./utils/requestMetrics');
 const { canSeeHealthDetail } = require('./middleware/healthAccess');
@@ -24,6 +25,7 @@ const authRoutes = require('./routes/authRoutes');
 const userRoutes = require('./routes/userRoutes');
 const cloudinaryRoutes = require('./routes/cloudinaryRoutes');
 const productRoutes = require('./routes/productRoutes');
+const sizeRoutes = require('./routes/sizeRoutes');
 const orderRoutes = require('./routes/orderRoutes');
 const shippingRoutes = require('./routes/shippingRoutes');
 const insightsRoutes = require('./routes/insightsRoutes');
@@ -34,9 +36,9 @@ const app = express();
 
 // La plataforma termina TLS en su proxy: sin esto `req.ip` sería siempre la IP
 // del proxy y el rate limit trataría a todo el tráfico como un solo cliente.
-// Un solo salto de confianza: si hay más proxies delante (ej. Cloudflare + Render)
-// el valor es incorrecto. `proxyDiagnostic` loguea al arrancar lo necesario para verificarlo.
-app.set('trust proxy', 1);
+// Saltos de confianza: `TRUST_PROXY_HOPS` (default 1). Con Cloudflare + Render delante son más;
+// `proxyDiagnostic` loguea al arrancar lo necesario para verificar que `req.ip` sea la del cliente.
+app.set('trust proxy', resolveTrustProxyHops(process.env.TRUST_PROXY_HOPS));
 
 // Primero de todo: id de correlación y latencia por ruta incluyen a los demás middlewares.
 app.use(requestObserver);
@@ -84,6 +86,7 @@ app.use('/api/auth', deadline, authRoutes);
 app.use('/api/users', deadline, userRoutes);
 app.use('/api/cloudinary', deadline, cloudinaryRoutes);
 app.use('/api/products', deadline, productRoutes);
+app.use('/api/sizes', deadline, sizeRoutes);
 app.use('/api/orders', orderRoutes);
 app.use('/api/shipping', deadline, shippingRoutes);
 app.use('/api/admin/insights', deadline, insightsRoutes);

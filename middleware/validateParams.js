@@ -20,4 +20,9 @@ const validateProductIdParam = (req, res, next, id) => {
   return next();
 };
 
-module.exports = { validateOrderIdParam, validateProductIdParam };
+const validateSizeIdParam = (req, res, next, id) => {
+  if (!isUuid(id)) return sendError(res, 400, 'INVALID_SIZE_ID', 'El identificador del talle no es válido.');
+  return next();
+};
+
+module.exports = { validateOrderIdParam, validateProductIdParam, validateSizeIdParam };
