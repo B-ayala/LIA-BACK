@@ -23,6 +23,9 @@ const REFRESH_COOKIE_PATH = '/api/auth';
 // pega si el usuario está 2h sin visitar el sitio (pestaña cerrada o inactiva).
 const REFRESH_COOKIE_MAX_AGE_MS = 2 * 60 * 60 * 1000;
 
+// Tope defensivo de login (no la regla de alta, que es 8-64): Supabase rechaza todo lo que exceda 72 bytes.
+const MAX_LOGIN_PASSWORD_LENGTH = 128;
+
 const isProduction = () => process.env.NODE_ENV === 'production';
 
 /**
@@ -132,7 +135,7 @@ exports.login = async (req, res) => {
     const { email, password, captchaToken } = req.body;
     // Un email no-string (objeto/array) rompería email.toLowerCase() en el tracker de fuerza bruta,
     // y uno sin tope de largo se guardaría entero como clave de ese tracker.
-    if (typeof email !== 'string' || typeof password !== 'string' || !email || !password || email.length > MAX_EMAIL_LENGTH) {
+    if (typeof email !== 'string' || typeof password !== 'string' || !email || !password || email.length > MAX_EMAIL_LENGTH || password.length > MAX_LOGIN_PASSWORD_LENGTH) {
       return res.status(400).json({ success: false, message: 'Email y contraseña son requeridos' });
     }
 

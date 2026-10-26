@@ -1,5 +1,6 @@
 const User = require('../models/User');
 const logger = require('../utils/logger');
+const { INVALID_USER_NAME_MESSAGE } = require('../utils/userValidation');
 
 /**
  * Responde un error de servidor sin exponer internals (detalle de Postgres,
@@ -16,8 +17,19 @@ const serverError = (res, action, error) => {
 
 // Mensajes de validación de dominio que el modelo lanza intencionalmente
 // (ver models/User.js): son los únicos seguros de reenviar al cliente tal cual.
-const SAFE_USER_VALIDATION_ERROR =
-  /^Error al (actualizar|eliminar) usuario: (El nombre no puede tener más de 100 caracteres|El rol debe ser "user" o "admin"|El campo purchase_allowed_exclusive debe ser booleano|Debe proporcionar al menos un campo para actualizar \(name, role o purchase_allowed_exclusive\)|Usuario no encontrado|No se le puede quitar el rol admin al usuario principal|No se puede eliminar al usuario principal)$/;
+const SAFE_USER_VALIDATION_ERRORS = new Set([
+  INVALID_USER_NAME_MESSAGE,
+  'El rol debe ser "user" o "admin"',
+  'El campo purchase_allowed_exclusive debe ser booleano',
+  'Debe proporcionar al menos un campo para actualizar (name, role o purchase_allowed_exclusive)',
+  'Usuario no encontrado',
+  'No se le puede quitar el rol admin al usuario principal',
+  'No se puede eliminar al usuario principal',
+]);
+const MODEL_ERROR_PREFIX = /^Error al (actualizar|eliminar) usuario: /;
+
+const isSafeUserValidationError = (message) =>
+  MODEL_ERROR_PREFIX.test(message) && SAFE_USER_VALIDATION_ERRORS.has(message.replace(MODEL_ERROR_PREFIX, ''));
 
 /**
  * @desc    Obtener todos los usuarios
@@ -165,7 +177,7 @@ exports.updateUser = async (req, res) => {
     // inválido, nombre demasiado largo, no encontrado): son seguros de
     // mostrar. Cualquier otro error (fallo real de Postgres) no se reenvía
     // tal cual al cliente.
-    if (SAFE_USER_VALIDATION_ERROR.test(error.message)) {
+    if (isSafeUserValidationError(error.message)) {
       return res.status(400).json({ success: false, message: error.message });
     }
 
@@ -206,7 +218,7 @@ exports.deleteUser = async (req, res) => {
       data: user
     });
   } catch (error) {
-    if (SAFE_USER_VALIDATION_ERROR.test(error.message)) {
+    if (isSafeUserValidationError(error.message)) {
       logger.warn('users_delete_rejected', { error: error.message });
       return res.status(400).json({ success: false, message: error.message });
     }
