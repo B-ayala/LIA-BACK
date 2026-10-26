@@ -220,7 +220,7 @@ Body de create/update (camelCase → columnas snake_case): `name`, `price`, `sto
 | POST | `/api/sizes` | **Bearer + admin** | Crea `{ name, type, garment?, measurements? }` (`name` en mayúsculas; `garment` = prenda opcional de 1-30 caracteres, se guarda como se escribe, vacío = `null`). Duplicado `type`+prenda+nombre (sin distinguir mayúsculas) → **409 `SIZE_DUPLICATE`**. |
 | PUT | `/api/sizes/:id` | **Bearer + admin** | Update parcial (`name`, `type`, `garment` —`null` la borra—, `measurements`, `active`). Id inexistente → **404 `SIZE_NOT_FOUND`**; id no UUID → **400 `INVALID_SIZE_ID`**. |
 
-No hay DELETE: se desactiva con `active: false`. `variants[].optionMeta` de `/api/products` (talle `global` con `sizeId` o `custom` con medidas) se valida en el borde; un `sizeId` inexistente → **400 `SIZE_NOT_FOUND`**.
+No hay DELETE: se desactiva con `active: false`. El catálogo se usa desde la guía de talles del producto: los talles globales se eligen como columnas y los específicos se crean en el formulario del producto; la guía se guarda tal cual en `productos.size_guide` (body `sizeGuide`, `z.any()`, sin validar forma), con un campo opcional `columnSources` (columna → `{ sizeId }`) que el backend no valida ni verifica contra el catálogo. `variants[].optionMeta` de `/api/products` (talle `global` con `sizeId` o `custom` con medidas) sigue aceptado y validado en el borde (un `sizeId` inexistente → **400 `SIZE_NOT_FOUND`**), pero el frontend ya no lo envía ni lo usa; se mantiene por compatibilidad. La variante Talle del producto es de texto libre con stock y no depende del catálogo.
 
 ### 5.3 Órdenes y pagos — `/api/orders` (`orderRoutes.js` → `orderController.js`)
 | Método | Ruta | Auth | Descripción |

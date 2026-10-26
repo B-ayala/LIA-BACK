@@ -7,6 +7,9 @@
 - Catálogo de talles: `GET /api/sizes` (público, cacheable 30 s), `POST /api/sizes` y `PUT /api/sizes/:id` (admin; los talles se desactivan con `active`, no se borran). Errores `SIZE_DUPLICATE` (409) y `SIZE_NOT_FOUND` (404). Requiere correr `db/migrations/2026-10-26_create_talles_catalog.sql` (PENDIENTE de aplicar).
 - Productos: `variants[].optionMeta` opcional en las variantes de talle (`global` con `sizeId` del catálogo o `custom` con medidas propias). Un `sizeId` inexistente responde 400 `SIZE_NOT_FOUND`; `variants` ahora se valida con un schema laxo en vez de `z.any` y `sizeGuide` queda como legado de solo lectura.
 
+### Changed
+- Talles: `variants[].optionMeta` queda como campo opcional sin uso del frontend (el backend lo sigue aceptando y validando); el catálogo de talles (`/api/sizes`) se usará desde la guía de talles del producto (`size_guide`, con `columnSources` opcional que el backend no valida). `sizeGuide` se guarda y se devuelve como cualquier otro campo del producto.
+
 ### Removed
 - `User.findByEmail`: método sin llamadores (la búsqueda por email vive en Supabase Auth).
 
