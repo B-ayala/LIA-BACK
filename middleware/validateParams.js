@@ -25,4 +25,9 @@ const validateSizeIdParam = (req, res, next, id) => {
   return next();
 };
 
-module.exports = { validateOrderIdParam, validateProductIdParam, validateSizeIdParam };
+const validateWithdrawalIdParam = (req, res, next, id) => {
+  if (!isUuid(id)) return sendError(res, 400, 'INVALID_WITHDRAWAL_ID', 'El identificador de la solicitud no es válido.');
+  return next();
+};
+
+module.exports = { validateOrderIdParam, validateProductIdParam, validateSizeIdParam, validateWithdrawalIdParam };

@@ -89,6 +89,7 @@ const reserveLine = async (client, line, order) => {
     paymentMethod: order.paymentMethod,
     shippingMethod: order.shippingMethod,
     mpExternalReference: order.purchaseId,
+    orderNumber: order.orderNumber,
   });
   const nextVariants = applySizeDelta(product.variants, evaluation.units, DEDUCT);
   if (nextVariants) await Order.setVariants(client, productId, nextVariants);
@@ -110,9 +111,12 @@ const reserveLines = async (client, lines, order) => {
   const blocked = await checkPendingLimit(client, order.buyer.userId, lines);
   if (blocked) return rollbackWith(blocked);
 
+  // Un número por checkout: todas las líneas del carrito lo comparten. Se pide dentro de la
+  // transacción; si se hace rollback queda un hueco en la secuencia, que es inocuo.
+  const numbered = { ...order, orderNumber: await Order.nextOrderNumber(client) };
   const reserved = new Array(lines.length);
   for (const line of lines) {
-    const result = await reserveLine(client, line, order);
+    const result = await reserveLine(client, line, numbered);
     if (!result.ok) return rollbackWith(result);
     reserved[result.index] = result;
   }
@@ -122,6 +126,7 @@ const reserveLines = async (client, lines, order) => {
     pricedItems: reserved.map((line) => line.pricedItem),
     shippingCost: order.surcharge,
     purchaseId: order.purchaseId,
+    orderNumber: numbered.orderNumber,
   };
 };
 
@@ -131,7 +136,7 @@ const reserveLines = async (client, lines, order) => {
  * la MISMA transacción, antes del COMMIT.
  *
  * @returns {Promise<{ok: true, orderIds: string[], pricedItems: object[], shippingCost: number,
- *   purchaseId: string|null} | {ok: false, status: number, code: string, message: string,
+ *   purchaseId: string|null, orderNumber: number} | {ok: false, status: number, code: string, message: string,
  *   productId?: string|null, size?: string}>}
  */
 const reserveOrders = async ({ buyerName, buyerEmail, userId, items, shippingMethod, shippingCost, paymentMethod }) => {

@@ -31,7 +31,7 @@ class Order {
       `SELECT id, user_id, buyer_name, buyer_email, product_id, product_name,
               product_image, quantity, unit_price, total_price, units_config,
               payment_method, payment_status, shipping_method, dispatch_status,
-              mp_preference_id, origin, created_at, paid_at, dispatched_at,
+              mp_preference_id, origin, created_at, paid_at, dispatched_at, order_number::int AS order_number,
               COUNT(*) OVER()::int AS total_count
          FROM public.ventas
         WHERE LOWER(buyer_email) = LOWER($1)
@@ -140,14 +140,20 @@ class Order {
     }
   }
 
+  /** Número de pedido nuevo: se pide UNA vez por checkout y lo comparten todas sus líneas. */
+  static async nextOrderNumber(client) {
+    const result = await client.query("SELECT nextval('public.ventas_order_number_seq')::int AS order_number");
+    return result.rows[0].order_number;
+  }
+
   /** Inserta una línea de venta pendiente y devuelve su id. */
   static async insertPending(client, row) {
     const result = await client.query(
       `INSERT INTO public.ventas
         (buyer_name, buyer_email, user_id, product_id, product_name, product_image,
          quantity, unit_price, total_price, units_config,
-         payment_method, payment_status, shipping_method, mp_external_reference)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pendiente', $12, $13)
+         payment_method, payment_status, shipping_method, mp_external_reference, order_number)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pendiente', $12, $13, $14)
        RETURNING id`,
       [
         row.buyerName || null,
@@ -163,6 +169,7 @@ class Order {
         row.paymentMethod,
         row.shippingMethod || null,
         row.mpExternalReference || null,
+        row.orderNumber ?? null,
       ]
     );
     return result.rows[0].id;

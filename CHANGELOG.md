@@ -3,6 +3,8 @@
 ## [Unreleased]
 
 ### Added
+- Número de pedido por compra (`ventas.order_number`, desde 1001, compartido por todas las líneas de un checkout): los checkouts lo devuelven como `order_number` y `GET /api/orders/user` lo incluye en cada fila (`null` en filas sin número). Requiere correr `db/migrations/2026-10-27_order_number_and_withdrawal_requests.sql` ANTES de desplegar (PENDIENTE de aplicar).
+- Botón de Arrepentimiento: `POST /api/withdrawals` (público, sin login, con rate limit por IP y por email) registra la solicitud y devuelve un código `ARR-AAAA-NNNN`; `GET /api/withdrawals` y `PATCH /api/withdrawals/:id` (admin) la gestionan. Sin compra coincidente se guarda igual, marcada para revisión.
 - Talles: campo opcional `garment` (prenda, 1-30 caracteres) en `GET/POST/PUT /api/sizes`; la unicidad pasa a tipo + prenda + nombre (409 `SIZE_DUPLICATE`). Requiere correr `db/migrations/2026-10-26_add_garment_to_talles.sql` (PENDIENTE de aplicar).
 - Catálogo de talles: `GET /api/sizes` (público, cacheable 30 s), `POST /api/sizes` y `PUT /api/sizes/:id` (admin; los talles se desactivan con `active`, no se borran). Errores `SIZE_DUPLICATE` (409) y `SIZE_NOT_FOUND` (404). Requiere correr `db/migrations/2026-10-26_create_talles_catalog.sql` (PENDIENTE de aplicar).
 - Productos: `variants[].optionMeta` opcional en las variantes de talle (`global` con `sizeId` del catálogo o `custom` con medidas propias). Un `sizeId` inexistente responde 400 `SIZE_NOT_FOUND`; `variants` ahora se valida con un schema laxo en vez de `z.any` y `sizeGuide` queda como legado de solo lectura.

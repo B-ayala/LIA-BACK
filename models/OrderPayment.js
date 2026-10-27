@@ -14,6 +14,7 @@ const PAYMENT_COLUMN_MIGRATIONS = {
   mp_payment_id: '2026-10-13_payment_reconciliation_and_schema_hardening.sql',
   oversold: '2026-10-13_payment_reconciliation_and_schema_hardening.sql',
   review_reason: '2026-10-14_add_review_reason_to_ventas.sql',
+  order_number: '2026-10-27_order_number_and_withdrawal_requests.sql',
 };
 const PAYMENT_COLUMNS = Object.keys(PAYMENT_COLUMN_MIGRATIONS);
 

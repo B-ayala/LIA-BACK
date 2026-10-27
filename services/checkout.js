@@ -83,7 +83,12 @@ const buildMpCheckout = async (input) => {
     await recordPreferenceId(reservation.orderIds, preference.id);
     return {
       status: HTTP_CREATED,
-      body: { success: true, init_point: preference.init_point, order_ids: reservation.orderIds },
+      body: {
+        success: true,
+        init_point: preference.init_point,
+        order_ids: reservation.orderIds,
+        order_number: reservation.orderNumber,
+      },
     };
   } catch (error) {
     logPreferenceFailure(error, reservation.orderIds);
@@ -96,7 +101,10 @@ const buildMpCheckout = async (input) => {
 const buildTransferCheckout = async (input) => {
   const reservation = await reserveOrders({ ...input, paymentMethod: 'transfer' });
   if (!reservation.ok) return failureResult(reservation);
-  return { status: HTTP_CREATED, body: { success: true, order_ids: reservation.orderIds } };
+  return {
+    status: HTTP_CREATED,
+    body: { success: true, order_ids: reservation.orderIds, order_number: reservation.orderNumber },
+  };
 };
 
 module.exports = { buildMpCheckout, buildTransferCheckout };

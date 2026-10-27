@@ -6,12 +6,17 @@ process.env.MP_ACCESS_TOKEN = 'APP_USR-test-token';
 
 let product;
 let pendingLines;
+let nextOrderNumber = 1000;
 const pool = installFakeDatabase((sql, params) => {
   if (sql.includes('FROM public.productos') && sql.includes('FOR UPDATE') && sql.includes('WHERE id = $1')) {
     return { rows: product ? [product] : [] };
   }
   if (sql.includes("payment_status = 'pendiente'") && sql.includes('COUNT(*)')) {
     return { rows: [{ pending: pendingLines }] };
+  }
+  if (sql.includes('ventas_order_number_seq')) {
+    nextOrderNumber += 1;
+    return { rows: [{ order_number: nextOrderNumber }] };
   }
   if (sql.startsWith('INSERT INTO public.ventas')) return { rows: [{ id: `order-${params[3]}` }] };
   return undefined;
@@ -223,5 +228,53 @@ describe('Idempotencia y reintentos (prueba 7/E)', () => {
     );
     assert.equal(res.statusCode, 400);
     assert.equal(res.body.code, 'IDEMPOTENCY_KEY_INVALID');
+  });
+});
+
+describe('Número de pedido por compra', () => {
+  const ORDER_NUMBER_PARAM = 13;
+  const insertedRows = () => pool.queries.filter((q) => q.sql.startsWith('INSERT INTO public.ventas'));
+  const twoLineCart = () => validBody({
+    body: {
+      items: [
+        { productId: 7, productName: 'a', productImage: 'x', quantity: 1, unitPrice: 1, totalPrice: 1, unitsConfig: [] },
+        { productId: 7, productName: 'b', productImage: 'x', quantity: 1, unitPrice: 1, totalPrice: 1, unitsConfig: [] },
+      ],
+    },
+  });
+
+  test('POSITIVO: todas las líneas de un carrito comparten el mismo número de pedido', async () => {
+    const res = await placeTransfer(twoLineCart());
+    assert.equal(res.statusCode, 201);
+    const rows = insertedRows();
+    assert.equal(rows.length, 2);
+    assert.equal(rows[0].params[ORDER_NUMBER_PARAM], rows[1].params[ORDER_NUMBER_PARAM]);
+    assert.equal(res.body.order_number, rows[0].params[ORDER_NUMBER_PARAM]);
+  });
+
+  test('POSITIVO: dos compras distintas reciben números distintos', async () => {
+    const first = await placeTransfer(validBody());
+    const second = await placeTransfer(validBody());
+    assert.notEqual(first.body.order_number, second.body.order_number);
+  });
+
+  test('el número se pide una sola vez por checkout, dentro de la reserva', async () => {
+    await placeTransfer(twoLineCart());
+    const requests = pool.queries.filter((q) => q.sql.includes('ventas_order_number_seq'));
+    assert.equal(requests.length, 1);
+  });
+
+  test('NEGATIVO: una compra rechazada por stock no inserta líneas', async () => {
+    product.stock = 0;
+    const res = await placeTransfer(validBody());
+    assert.equal(res.statusCode, 409);
+    assert.equal(insertedRows().length, 0);
+  });
+
+  test('"Mis compras" devuelve el número de pedido como número (o null en filas legacy)', async () => {
+    const Order = require(abs('models/Order.js'));
+    await Order.findPurchasesByEmail('buyer@example.test', 10, 0);
+    const query = pool.queries.find((q) => q.sql.includes('LOWER(buyer_email)'));
+    assert.match(query.sql, /order_number::int AS order_number/);
   });
 });
