@@ -1,6 +1,7 @@
 const crypto = require('crypto');
 const Order = require('../models/Order');
 const User = require('../models/User');
+const TermsAcceptance = require('../models/TermsAcceptance');
 const mercadopago = require('../utils/mercadopago');
 const logger = require('../utils/logger');
 const { caches, invalidateProducts } = require('../utils/cache');
@@ -21,6 +22,8 @@ const MP_NOT_CONFIGURED_MESSAGE =
 const PURCHASES_DISABLED_MESSAGE =
   'Por el momento no es posible comprar. Sitio en mantenimiento, gracias por tu paciencia.';
 
+const HTTP_CREATED = 201;
+const HTTP_CONFLICT = 409;
 const DEFAULT_ORDER_PAGE_SIZE = 200;
 const MAX_ORDER_PAGE_SIZE = 500;
 // Los ids de pago de Mercado Pago son enteros: cualquier otra forma no llega a su API.
@@ -91,6 +94,30 @@ const isPurchaseBlocked = async (req) => {
   return !allowed;
 };
 
+const TERMS_NOT_ACCEPTED_MESSAGE = 'Para comprar tenés que aceptar los términos y condiciones vigentes.';
+
+/**
+ * Deja constancia de la versión de los Términos vigente en la compra recién creada. La versión la fija
+ * el servidor (no el body): el cliente no puede dejar constancia de otra. Un fallo no corta el
+ * checkout (la compra ya está reservada): queda en el log.
+ */
+const withTermsAcceptance = (build, req, termsVersion) => async (input) => {
+  const result = await build(input);
+  if (result.status !== HTTP_CREATED) return result;
+  try {
+    await TermsAcceptance.record({
+      userId: req.user.id,
+      buyerEmail: input.buyerEmail,
+      orderNumber: result.body.order_number,
+      termsVersion,
+      ip: req.ip,
+    });
+  } catch (error) {
+    logger.error('terms_acceptance_not_saved', { userId: req.user.id, code: error.code, message: error.message });
+  }
+  return result;
+};
+
 const startCheckout = async (req, res, prefix, build) => {
   try {
     const input = checkoutInput(req);
@@ -100,7 +127,13 @@ const startCheckout = async (req, res, prefix, build) => {
     if (prefix === 'mp' && !mercadopago.isConfigured()) {
       return sendError(res, 503, 'MP_NOT_CONFIGURED', MP_NOT_CONFIGURED_MESSAGE);
     }
-    return await runCheckout(prefix, req, res, input, build);
+    const terms = await TermsAcceptance.statusFor(req.user);
+    if (!terms.accepted) {
+      return sendError(res, HTTP_CONFLICT, 'TERMS_NOT_ACCEPTED', TERMS_NOT_ACCEPTED_MESSAGE, {
+        currentVersion: terms.currentVersion,
+      });
+    }
+    return await runCheckout(prefix, req, res, input, withTermsAcceptance(build, req, terms.currentVersion));
   } catch (error) {
     logger.error('checkout_failed', { prefix, code: error.code, message: error.message });
     if (res.headersSent) return undefined;

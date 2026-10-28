@@ -2,19 +2,33 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { createWithdrawalSchema, updateWithdrawalSchema } = require('../../schemas/withdrawalSchema');
 
-const valid = { name: 'Ana', email: 'ana@example.test', description: 'Campera negra, 6/10' };
+const valid = { name: 'Ana', email: 'ana@example.test', description: 'Campera negra, 6/10', orderNumber: 1001 };
 const parse = (overrides) => createWithdrawalSchema.safeParse({ ...valid, ...overrides });
 
 test('arrepentimiento: normaliza nombre, email (minúsculas) y descripción', () => {
   const result = parse({ name: '  Ana ', email: '  ANA@Example.TEST ', description: ' Campera ' });
   assert.equal(result.success, true);
-  assert.deepEqual(result.data, { name: 'Ana', email: 'ana@example.test', description: 'Campera' });
+  assert.deepEqual(result.data, { name: 'Ana', email: 'ana@example.test', description: 'Campera', orderNumber: 1001 });
 });
 
-test('arrepentimiento: el número de pedido es opcional (ausente, vacío o null)', () => {
-  assert.equal(parse({}).success, true);
-  assert.equal(parse({ orderNumber: '' }).data.orderNumber, undefined);
-  assert.equal(parse({ orderNumber: null }).data.orderNumber, undefined);
+test('arrepentimiento: pedido, fecha e importe son opcionales (ausentes, vacíos o null)', () => {
+  const { orderNumber, ...withoutOrder } = valid;
+  assert.equal(createWithdrawalSchema.safeParse(withoutOrder).success, true);
+  ['orderNumber', 'purchaseDate', 'purchaseAmount'].forEach((field) => {
+    assert.equal(parse({ [field]: '' }).data[field], undefined);
+    assert.equal(parse({ [field]: null }).data[field], undefined);
+  });
+});
+
+test('arrepentimiento: valida fecha de compra e importe', () => {
+  assert.equal(parse({ purchaseDate: '2026-10-06' }).data.purchaseDate, '2026-10-06');
+  assert.equal(parse({ purchaseAmount: '15000.5' }).data.purchaseAmount, 15000.5);
+  ['2026-13-01', '2026-02-31', '06/10/2026', '2999-01-01', 'ayer'].forEach((purchaseDate) => {
+    assert.equal(parse({ purchaseDate }).success, false, purchaseDate);
+  });
+  [0, -1, 'abc', 1e12].forEach((purchaseAmount) => {
+    assert.equal(parse({ purchaseAmount }).success, false, String(purchaseAmount));
+  });
 });
 
 test('arrepentimiento: acepta el número de pedido como número o como texto numérico', () => {

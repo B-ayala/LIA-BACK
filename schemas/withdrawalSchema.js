@@ -11,6 +11,8 @@ const MAX_DESCRIPTION = 500;
 const MAX_ADMIN_NOTE = 1000;
 // `order_number` se lee como int4 (`::int`): un valor mayor no puede existir en la base.
 const MAX_ORDER_NUMBER = 2147483647;
+// `purchase_amount` es numeric(12,2): el tope evita un error de rango en la base.
+const MAX_PURCHASE_AMOUNT = 9999999999;
 const WITHDRAWAL_STATUSES = ['recibida', 'en_gestion', 'resuelta', 'rechazada'];
 
 const emptyToUndefined = (value) => (value === '' || value === null ? undefined : value);
@@ -24,7 +26,8 @@ const emailSchema = z.string().trim().toLowerCase()
 const descriptionSchema = z.string().trim().min(1, 'Contanos qué compraste')
   .max(MAX_DESCRIPTION, `Máximo ${MAX_DESCRIPTION} caracteres`);
 
-// Opcional: el cliente puede no tener el número a mano y la solicitud igual se registra.
+// Opcional: quien compró como invitado o perdió el mail igual puede arrepentirse. Con los datos
+// opcionales (pedido, fecha, importe) el negocio encuentra la compra; sin ellos se revisa a mano.
 const orderNumberSchema = z.preprocess(
   emptyToUndefined,
   z.coerce.number('El número de pedido debe ser un número').int('El número de pedido debe ser un entero')
@@ -32,11 +35,34 @@ const orderNumberSchema = z.preprocess(
     .optional()
 );
 
+const ISO_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+const MS_PER_DAY = 86_400_000;
+
+const isRealPastDate = (value) => {
+  const time = Date.parse(`${value}T00:00:00Z`);
+  // `toISOString` descarta fechas como 2026-02-31 que Date.parse "corrige" en silencio.
+  return Number.isFinite(time) && new Date(time).toISOString().startsWith(value)
+    && time <= Date.now() + MS_PER_DAY;
+};
+
+const purchaseDateSchema = z.preprocess(
+  emptyToUndefined,
+  z.string().regex(ISO_DATE_PATTERN, 'Ingresá la fecha de compra').refine(isRealPastDate, 'La fecha de compra no es válida').optional()
+);
+
+const purchaseAmountSchema = z.preprocess(
+  emptyToUndefined,
+  z.coerce.number('El importe debe ser un número').positive('El importe debe ser positivo')
+    .max(MAX_PURCHASE_AMOUNT, 'El importe no es válido').optional()
+);
+
 const createWithdrawalSchema = z.strictObject({
   name: nameSchema,
   email: emailSchema,
   description: descriptionSchema,
   orderNumber: orderNumberSchema,
+  purchaseDate: purchaseDateSchema,
+  purchaseAmount: purchaseAmountSchema,
 });
 
 const adminNoteSchema = z.string().trim().max(MAX_ADMIN_NOTE, `Máximo ${MAX_ADMIN_NOTE} caracteres`)

@@ -7,7 +7,7 @@ const MAX_LINKED_PURCHASES = 20;
 const ACTIVE_PURCHASE_FILTER = "payment_status NOT IN ('expirado', 'cancelado')";
 
 const LIST_COLUMNS = `w.id, w.code, w.name, w.email, w.description, w.order_number::int AS order_number,
-       w.status, w.needs_review, w.admin_note, w.created_at, w.updated_at, w.resolved_at`;
+       w.purchase_date, w.purchase_amount::float8 AS purchase_amount, w.status, w.needs_review, w.admin_note, w.created_at, w.updated_at, w.resolved_at`;
 
 const LINKED_PURCHASES = `COALESCE((
          SELECT json_agg(json_build_object(
@@ -20,28 +20,43 @@ const LINKED_PURCHASES = `COALESCE((
 /** Acceso a datos de las solicitudes de arrepentimiento (tabla public.withdrawal_requests). */
 class Withdrawal {
   /**
-   * Compras del email (y del número de pedido, si vino) a vincular con la solicitud.
-   * @returns {Promise<string[]>} ids de `ventas`; vacío si no hay coincidencia.
+   * Compras del email a vincular con la solicitud. Si el cliente dio pedido y/o fecha se busca primero
+   * con esos filtros; si no hay coincidencia exacta se cae al email solo, así el admin ve candidatas.
+   * @returns {Promise<{ids: string[], exact: boolean}>} `exact` es false si faltó algún dato o no coincidió.
    */
-  static async findPurchaseIds(email, orderNumber) {
+  static async findPurchaseIds(email, { orderNumber, purchaseDate } = {}) {
+    const hasFilters = orderNumber !== undefined || purchaseDate !== undefined;
+    if (hasFilters) {
+      const strict = await Withdrawal.queryPurchases(email, orderNumber, purchaseDate);
+      if (strict.length > 0) return { ids: strict, exact: true };
+    }
+    return { ids: await Withdrawal.queryPurchases(email, undefined, undefined), exact: false };
+  }
+
+  // La fecha se compara en hora argentina con ±1 día de margen (el cliente puede recordarla mal).
+  static async queryPurchases(email, orderNumber, purchaseDate) {
     const result = await pool.query(
       `SELECT id FROM public.ventas
         WHERE LOWER(buyer_email) = $1 AND ${ACTIVE_PURCHASE_FILTER}
           AND ($2::int IS NULL OR order_number = $2::int)
+          AND ($3::date IS NULL
+               OR (created_at AT TIME ZONE 'America/Argentina/Buenos_Aires')::date
+                  BETWEEN $3::date - 1 AND $3::date + 1)
         ORDER BY created_at DESC
-        LIMIT $3`,
-      [email, orderNumber ?? null, MAX_LINKED_PURCHASES]
+        LIMIT $4`,
+      [email, orderNumber ?? null, purchaseDate ?? null, MAX_LINKED_PURCHASES]
     );
     return result.rows.map((row) => row.id);
   }
 
   /** El código `ARR-AAAA-NNNN` lo genera la base (default sobre su secuencia). */
-  static async create({ name, email, description, orderNumber, ventaIds }) {
+  static async create({ name, email, description, orderNumber, purchaseDate, purchaseAmount, ventaIds, needsReview }) {
     const result = await pool.query(
-      `INSERT INTO public.withdrawal_requests (name, email, description, order_number, venta_ids, needs_review)
-       VALUES ($1, $2, $3, $4, $5::uuid[], $6)
+      `INSERT INTO public.withdrawal_requests
+         (name, email, description, order_number, purchase_date, purchase_amount, venta_ids, needs_review)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::uuid[], $8)
        RETURNING code, created_at`,
-      [name, email, description, orderNumber ?? null, ventaIds, ventaIds.length === 0]
+      [name, email, description, orderNumber ?? null, purchaseDate ?? null, purchaseAmount ?? null, ventaIds, needsReview]
     );
     return { code: result.rows[0].code, createdAt: result.rows[0].created_at };
   }

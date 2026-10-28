@@ -16,13 +16,13 @@ Registrar cada solicitud de arrepentimiento sin exigir login (Disposición 954/2
 ## Pasos principales (happy path)
 1. En cada checkout (MP o transferencia) el backend pide UN número de pedido (`ventas_order_number_seq`, desde 1001) dentro de la transacción de reserva. Todas las filas de `ventas` del carrito lo comparten, y la respuesta del checkout lo incluye como `order_number`.
 2. "Mis compras" (`GET /api/orders/user`) devuelve `order_number` en cada fila (`null` en filas anteriores que no lo tengan).
-3. El cliente envía `POST /api/withdrawals { name, email, description, orderNumber? }`, sin sesión. `orderNumber` es opcional.
-4. El backend valida en el borde, busca en `ventas` las compras del email (activas, no vencidas ni canceladas; si vino `orderNumber`, solo las de ese número) y guarda la solicitud con `venta_ids` y `needs_review = false`.
+3. El cliente envía `POST /api/withdrawals { name, email, description, orderNumber?, purchaseDate?, purchaseAmount? }`, sin sesión. Los tres últimos son opcionales: quien compró como invitado o perdió el mail no queda sin poder arrepentirse.
+4. El backend valida en el borde, busca en `ventas` las compras del email (activas, no vencidas ni canceladas) filtrando por `orderNumber` y/o fecha (±1 día, hora argentina) si vinieron, y guarda la solicitud con `venta_ids`. `needs_review = false` solo si hubo coincidencia exacta con esos filtros.
 5. Responde 201 `{ success, code: 'ARR-AAAA-NNNN', receivedAt }`. El código lo genera la base con una secuencia: no hay carrera entre dos solicitudes.
 6. El admin lista (`GET /api/withdrawals?status=&limit=&offset=`), ve las compras vinculadas y cambia estado y nota (`PATCH /api/withdrawals/:id { status?, adminNote? }`). Al pasar a `resuelta` o `rechazada` se fija `resolved_at`; al reabrir se limpia.
 
 ## Caminos alternativos
-- Si no hay compras del email (o no coinciden con el `orderNumber`), la solicitud se guarda igual con `needs_review = true`: nunca se rechaza por no-match. El admin la revisa a mano.
+- Si no hay filtros, o no coinciden, se vinculan las compras del email como candidatas y la solicitud queda con `needs_review = true`; si ni el email tiene compras, se guarda sin vínculos. Nunca se rechaza por no-match. El admin la revisa a mano.
 - La respuesta del paso 5 es idéntica con o sin coincidencia, para que el endpoint no sirva para averiguar qué emails tienen compras.
 - Compras anteriores al script SQL: el backfill agrupa por `mp_external_reference`; las transferencias sin referencia reciben un número cada una.
 
@@ -46,6 +46,8 @@ sequenceDiagram
   API->>DB: INSERT withdrawal_requests
   DB-->>API: code ARR-AAAA-NNNN
   API-->>C: 201 { code, receivedAt }
+  API--)C: mail con el código (asíncrono, si hay SMTP configurado)
+  API--)A: aviso a la casilla del local
   A->>API: GET /api/withdrawals
   API-->>A: solicitudes + compras vinculadas
   A->>API: PATCH /api/withdrawals/:id { status, adminNote }

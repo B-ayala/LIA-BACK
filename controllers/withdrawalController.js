@@ -1,5 +1,6 @@
 const Withdrawal = require('../models/Withdrawal');
 const logger = require('../utils/logger');
+const { notifyWithdrawalReceived } = require('../services/withdrawalNotifications');
 const { sendError } = require('../utils/httpResponses');
 const { boundedInt } = require('../utils/boundedInt');
 const { WITHDRAWAL_STATUSES } = require('../schemas/withdrawalSchema');
@@ -21,10 +22,17 @@ const serverError = (res, action, error) => {
  */
 const createWithdrawal = async (req, res) => {
   try {
-    const { name, email, description, orderNumber } = req.body;
-    const ventaIds = await Withdrawal.findPurchaseIds(email, orderNumber);
-    const { code, createdAt } = await Withdrawal.create({ name, email, description, orderNumber, ventaIds });
-    logger.info('withdrawal_received', { code, linkedPurchases: ventaIds.length });
+    const { name, email, description, orderNumber, purchaseDate, purchaseAmount } = req.body;
+    const { ids: ventaIds, exact } = await Withdrawal.findPurchaseIds(email, { orderNumber, purchaseDate });
+    // Sin vínculo exacto (faltan datos o no coinciden) el admin la revisa a mano.
+    const needsReview = !exact;
+    const { code, createdAt } = await Withdrawal.create({
+      name, email, description, orderNumber, purchaseDate, purchaseAmount, ventaIds, needsReview,
+    });
+    logger.info('withdrawal_received', { code, linkedPurchases: ventaIds.length, needsReview });
+    notifyWithdrawalReceived({
+      name, email, description, orderNumber, purchaseDate, purchaseAmount, code, needsReview, receivedAt: createdAt,
+    });
     return res.status(201).json({ success: true, code, receivedAt: createdAt });
   } catch (error) {
     return serverError(res, 'create', error);

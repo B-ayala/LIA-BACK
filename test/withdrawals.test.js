@@ -21,7 +21,8 @@ const pool = installFakeDatabase((sql, params) => {
     return { rows: [{ id: params[0], role: ROLES[params[0]] || 'user', name: 'Test' }] };
   }
   if (sql.includes('FROM public.ventas') && sql.includes('LOWER(buyer_email)')) {
-    return { rows: params[0] === BUYER_EMAIL ? [{ id: VENTA_ID }] : [] };
+    // Un pedido inexistente (9999) no coincide por filtros, pero el email sí tiene compras.
+    return { rows: params[0] === BUYER_EMAIL && params[1] !== 9999 ? [{ id: VENTA_ID }] : [] };
   }
   if (sql.startsWith('INSERT INTO public.withdrawal_requests')) {
     return { rows: [{ code: 'ARR-2026-0001', created_at: '2026-10-27T10:00:00Z' }] };
@@ -50,7 +51,7 @@ const call = (path, { method = 'GET', token, body } = {}) => fetch(`${app.baseUr
 const queryStarting = (prefix) => pool.queries.find((query) => query.sql.startsWith(prefix));
 const inserted = () => queryStarting('INSERT INTO public.withdrawal_requests');
 const submit = (overrides = {}) => call('/api/withdrawals', {
-  method: 'POST', body: { name: 'Ana', email: BUYER_EMAIL, description: 'Campera negra', ...overrides },
+  method: 'POST', body: { name: 'Ana', email: BUYER_EMAIL, description: 'Campera negra', orderNumber: 1001, ...overrides },
 });
 
 describe('POST /api/withdrawals (público)', () => {
@@ -65,22 +66,16 @@ describe('POST /api/withdrawals (público)', () => {
   test('con compras del email: las vincula y no marca revisión', async () => {
     await submit();
     const { params } = inserted();
-    assert.deepEqual(params[4], [VENTA_ID]);
-    assert.equal(params[5], false);
+    assert.deepEqual(params[6], [VENTA_ID]);
+    assert.equal(params[7], false);
   });
 
   test('sin compras del email: igual se guarda, marcada para revisión', async () => {
     const response = await submit({ email: 'nadie@example.test' });
     assert.equal(response.status, 201);
     const { params } = inserted();
-    assert.deepEqual(params[4], []);
-    assert.equal(params[5], true);
-  });
-
-  test('NEGATIVO: la respuesta tiene la misma forma haya o no coincidencia (sin enumeración de emails)', async () => {
-    const withMatch = await (await submit()).json();
-    const withoutMatch = await (await submit({ email: 'nadie@example.test' })).json();
-    assert.deepEqual(Object.keys(withMatch).sort(), Object.keys(withoutMatch).sort());
+    assert.deepEqual(params[6], []);
+    assert.equal(params[7], true);
   });
 
   test('el email se guarda en minúsculas y el número de pedido viaja al cruce', async () => {

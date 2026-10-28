@@ -7,6 +7,9 @@ process.env.MP_ACCESS_TOKEN = 'APP_USR-test-token';
 let product;
 let pendingLines;
 let nextOrderNumber = 1000;
+let failAcceptanceInsert = false;
+let publishedTermsVersion = null;
+let acceptedVersions = [];
 const pool = installFakeDatabase((sql, params) => {
   if (sql.includes('FROM public.productos') && sql.includes('FOR UPDATE') && sql.includes('WHERE id = $1')) {
     return { rows: product ? [product] : [] };
@@ -19,6 +22,13 @@ const pool = installFakeDatabase((sql, params) => {
     return { rows: [{ order_number: nextOrderNumber }] };
   }
   if (sql.startsWith('INSERT INTO public.ventas')) return { rows: [{ id: `order-${params[3]}` }] };
+  if (sql.startsWith('INSERT INTO public.terms_acceptances') && failAcceptanceInsert) throw new Error('db down');
+  if (sql.includes('FROM public.site_content')) {
+    return { rows: publishedTermsVersion ? [{ version: publishedTermsVersion }] : [] };
+  }
+  if (sql.includes('FROM public.terms_acceptances')) {
+    return { rows: acceptedVersions.includes(params[1]) ? [{ '?column?': 1 }] : [] };
+  }
   return undefined;
 });
 
@@ -44,10 +54,10 @@ const validBody = (overrides = {}) => ({
 
 let uniqueCart = 0;
 // Cada llamada usa un carrito distinto: evita que el single-flight de checkout colapse requests de tests distintos.
-const placeTransfer = async (body) => {
+const placeTransfer = async (body, user = USER) => {
   uniqueCart += 1;
   const res = createRes();
-  await createTransferOrder({ body: { ...body, buyerName: `${body.buyerName} ${uniqueCart}` }, user: USER, get: () => undefined }, res);
+  await createTransferOrder({ body: { ...body, buyerName: `${body.buyerName} ${uniqueCart}` }, user, get: () => undefined }, res);
   return res;
 };
 
@@ -56,6 +66,8 @@ const insertedRow = () => pool.queries.find((q) => q.sql.startsWith('INSERT INTO
 beforeEach(() => {
   pool.queries.length = 0;
   pendingLines = 0;
+  publishedTermsVersion = null;
+  acceptedVersions = ['2026-10-28'];
   product = {
     stock: 5, price: 10000, discount: null, original_price: null, name: 'Remera Lisa',
     image: 'db.jpg', variants: null, status: 'active',
@@ -276,5 +288,62 @@ describe('Número de pedido por compra', () => {
     await Order.findPurchasesByEmail('buyer@example.test', 10, 0);
     const query = pool.queries.find((q) => q.sql.includes('LOWER(buyer_email)'));
     assert.match(query.sql, /order_number::int AS order_number/);
+  });
+});
+
+describe('Aceptación de términos', () => {
+  const acceptanceRow = () => pool.queries.find((q) => q.sql.startsWith('INSERT INTO public.terms_acceptances'));
+
+  test('POSITIVO: la compra deja constancia con el N° de pedido, el usuario y la versión vigente', async () => {
+    const res = await placeTransfer(validBody());
+    assert.equal(res.statusCode, 201);
+    const { params } = acceptanceRow();
+    assert.equal(params[0], USER.id);
+    assert.equal(params[1], 'buyer@example.test');
+    assert.equal(params[2], res.body.order_number);
+    assert.equal(params[3], '2026-10-28');
+    assert.equal(params[5], 'checkout');
+  });
+
+  test('NEGATIVO: la versión la fija el servidor, aunque el body mande otra', async () => {
+    const res = await placeTransfer({ ...validBody(), termsVersion: '1999-01-01' });
+    assert.equal(res.statusCode, 201);
+    assert.equal(acceptanceRow().params[3], '2026-10-28');
+  });
+
+  test('NEGATIVO: sin haber aceptado la versión vigente responde 409 TERMS_NOT_ACCEPTED y no reserva stock', async () => {
+    acceptedVersions = [];
+    const res = await placeTransfer(validBody());
+    assert.equal(res.statusCode, 409);
+    assert.equal(res.body.code, 'TERMS_NOT_ACCEPTED');
+    assert.equal(res.body.currentVersion, '2026-10-28');
+    assert.equal(insertedRow(), undefined);
+  });
+
+  test('NEGATIVO: si el admin publicó una versión nueva, la aceptación de la anterior ya no alcanza', async () => {
+    publishedTermsVersion = '2026-11-02';
+    const res = await placeTransfer(validBody());
+    assert.equal(res.statusCode, 409);
+    assert.equal(res.body.currentVersion, '2026-11-02');
+  });
+
+  test('POSITIVO: haber tildado los términos al crear la cuenta (metadato) alcanza sin otra constancia', async () => {
+    acceptedVersions = [];
+    const res = await placeTransfer(validBody(), { ...USER, termsVersion: '2026-10-28' });
+    assert.equal(res.statusCode, 201);
+  });
+
+  test('NEGATIVO: un metadato de una versión vieja no habilita la compra', async () => {
+    acceptedVersions = [];
+    publishedTermsVersion = '2026-11-02';
+    const res = await placeTransfer(validBody(), { ...USER, termsVersion: '2026-10-28' });
+    assert.equal(res.statusCode, 409);
+  });
+
+  test('un fallo al guardar la constancia no corta la compra', async () => {
+    failAcceptanceInsert = true;
+    const res = await placeTransfer(validBody());
+    failAcceptanceInsert = false;
+    assert.equal(res.statusCode, 201);
   });
 });

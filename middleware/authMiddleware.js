@@ -109,6 +109,8 @@ const resolveRequestUser = async (token) => {
     name: profile.name,
     email: supabaseUser.email || null,
     role: profile.role || 'user',
+    // Versión de los Términos que tildó al crear la cuenta (metadato de Supabase); null en cuentas anteriores.
+    termsVersion: supabaseUser.user_metadata?.terms_version ?? null,
   };
 };
 

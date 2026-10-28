@@ -23,7 +23,7 @@ after(() => app.close());
 const submit = (email) => fetch(`${app.baseUrl}/api/withdrawals`, {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ name: 'Ana', email, description: 'Campera' }),
+  body: JSON.stringify({ name: 'Ana', email, description: 'Campera', orderNumber: 1001 }),
 });
 
 test('NEGATIVO: el email se bloquea tras 5 solicitudes por hora y la IP tras 10 en 10 minutos', async () => {

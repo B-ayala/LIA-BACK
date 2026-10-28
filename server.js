@@ -28,6 +28,7 @@ const productRoutes = require('./routes/productRoutes');
 const sizeRoutes = require('./routes/sizeRoutes');
 const orderRoutes = require('./routes/orderRoutes');
 const withdrawalRoutes = require('./routes/withdrawalRoutes');
+const termsRoutes = require('./routes/termsRoutes');
 const shippingRoutes = require('./routes/shippingRoutes');
 const insightsRoutes = require('./routes/insightsRoutes');
 const { expireStaleOrders, warnIfPaymentMigrationMissing } = require('./services/orderMaintenance');
@@ -90,6 +91,7 @@ app.use('/api/products', deadline, productRoutes);
 app.use('/api/sizes', deadline, sizeRoutes);
 app.use('/api/orders', orderRoutes);
 app.use('/api/withdrawals', deadline, withdrawalRoutes);
+app.use('/api/terms', deadline, termsRoutes);
 app.use('/api/shipping', deadline, shippingRoutes);
 app.use('/api/admin/insights', deadline, insightsRoutes);
 

@@ -28,6 +28,8 @@ const pool = installFakeDatabase((sql, params) => {
   }
   if (sql.includes("payment_status = 'pendiente'") && sql.includes('COUNT(*)')) return { rows: [pending] };
   if (sql.includes('ventas_order_number_seq')) return { rows: [{ order_number: 1001 }] };
+  // Los compradores de estos tests ya aceptaron los términos vigentes.
+  if (sql.includes('FROM public.terms_acceptances')) return { rows: [{ '?column?': 1 }] };
   if (sql.startsWith('INSERT INTO public.ventas')) return { rows: [{ id: `order-${pool.queries.length}` }] };
   if (sql.includes('FROM public.ventas WHERE id = ANY($1::uuid[])')) {
     return { rows: [{ id: OTHERS_ORDER, user_id: 'x', buyer_email: 'otro@example.test', payment_method: 'mp', payment_status: 'pendiente' }] };
