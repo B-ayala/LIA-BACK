@@ -1,5 +1,15 @@
 const { test, describe, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
+const { installFakeDatabase } = require('./helpers/harness');
+
+let publishedFollowUp;
+let failFollowUpLoad;
+installFakeDatabase((sql) => {
+  if (!sql.includes('FROM public.site_content')) return undefined;
+  if (failFollowUpLoad) throw new Error('db down');
+  return { rows: publishedFollowUp === undefined ? [] : [{ value: publishedFollowUp }] };
+});
+
 const mailer = require('../services/mailer');
 const { notifyWithdrawalReceived } = require('../services/withdrawalNotifications');
 
@@ -10,7 +20,11 @@ const REQUEST = {
 const ENV_KEYS = ['MAIL_USER', 'MAIL_PASS', 'MAIL_NOTIFY_TO', 'WITHDRAWAL_REFUND_TERM'];
 
 describe('mail de arrepentimiento', () => {
-  afterEach(() => ENV_KEYS.forEach((key) => { delete process.env[key]; }));
+  afterEach(() => {
+    ENV_KEYS.forEach((key) => { delete process.env[key]; });
+    publishedFollowUp = undefined;
+    failFollowUpLoad = false;
+  });
 
   test('sin credenciales de mail: no envía y no lanza', async () => {
     assert.equal(await mailer.sendMail({ to: 'a@example.test', subject: 'x', text: 'y' }), false);
@@ -56,5 +70,39 @@ describe('mail de arrepentimiento', () => {
     process.env.WITHDRAWAL_REFUND_TERM = '10 días hábiles desde que retiramos el producto';
     await notifyWithdrawalReceived(REQUEST);
     assert.ok(clientMail().text.includes('Plazo del reintegro: 10 días hábiles'));
+  });
+
+  describe('"Qué sigue" editable desde el panel', () => {
+    const sentToClient = async (t) => {
+      process.env.MAIL_USER = 'local@example.test';
+      const sendMail = t.mock.method(mailer, 'sendMail', async () => true);
+      await notifyWithdrawalReceived(REQUEST);
+      return sendMail.mock.calls.map((call) => call.arguments[0]).find((mail) => mail.to === REQUEST.email).text;
+    };
+
+    test('usa los pasos y el plazo que publicó el admin, y conserva código y fecha', async (t) => {
+      publishedFollowUp = { nextSteps: 'Te escribimos en 48 horas.\n\n  Podés cambiarlo por crédito.  ', refundTerm: '5 días hábiles' };
+      const text = await sentToClient(t);
+      assert.ok(text.includes('- Te escribimos en 48 horas.'));
+      assert.ok(text.includes('- Podés cambiarlo por crédito.'));
+      assert.ok(text.includes('Plazo del reintegro: 5 días hábiles.'));
+      assert.ok(!text.includes('24 horas'));
+      assert.ok(text.includes(REQUEST.code) && text.includes('28 de octubre de 2026'));
+    });
+
+    test('NEGATIVO: si falla la lectura o el valor es inválido, manda el texto por defecto', async (t) => {
+      failFollowUpLoad = true;
+      assert.ok((await sentToClient(t)).includes('Dentro de las 24 horas nos ponemos en contacto'));
+      failFollowUpLoad = false;
+      publishedFollowUp = { nextSteps: 42, refundTerm: ['x'] };
+      assert.ok((await sentToClient(t)).includes('Te reintegramos lo que pagaste por el mismo medio de pago'));
+    });
+
+    test('limita la cantidad y el largo de los pasos', async (t) => {
+      publishedFollowUp = { nextSteps: Array.from({ length: 12 }, (_, i) => `paso${i}`).join('\n') + `\n${'x'.repeat(500)}` };
+      const text = await sentToClient(t);
+      assert.ok(text.includes('- paso7') && !text.includes('paso8'));
+      assert.ok(!text.includes('x'.repeat(301)));
+    });
   });
 });
