@@ -29,8 +29,8 @@ class Product {
         `INSERT INTO public.productos
          (name, price, stock, category, image_url, public_id, description,
           discount, condition, free_shipping, hover_image_enabled, variants, specifications, features, faqs,
-          warranty, return_policy, size_guide, status, images, original_price, card_options)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+          warranty, return_policy, size_guide, status, images, original_price, card_options, transfer_price)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
          RETURNING *`,
         fields
       );

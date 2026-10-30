@@ -35,6 +35,8 @@ const productBaseSchema = z.object({
   discount: z.coerce.number().min(0).max(100).nullable().optional(),
   // Precio de lista tachado; el controller lo descarta si no es mayor a `price`.
   originalPrice: z.coerce.number().positive().nullable().optional(),
+  // Precio informativo "con transferencia" (solo se muestra; el checkout cobra `price`). null lo borra.
+  transferPrice: z.coerce.number().positive().nullable().optional(),
   condition: z.enum(['new', 'used']).optional(),
   freeShipping: z.boolean().optional(),
   hoverImageEnabled: z.boolean().optional(),

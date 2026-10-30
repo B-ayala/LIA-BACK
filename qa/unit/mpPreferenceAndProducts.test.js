@@ -64,6 +64,20 @@ test('producto: cardOptions array (incluso vacío) y null se persisten como JSON
   assert.deepEqual(buildProductAssignments({ name: 'X' }).map(([column]) => column), ['name']);
 });
 
+test('producto: transferPrice se persiste, null lo borra y el schema lo acota a positivos', () => {
+  assert.deepEqual(buildProductAssignments({ transferPrice: '64350.5' }), [['transfer_price', 64350.5]]);
+  assert.deepEqual(buildProductAssignments({ transferPrice: null }), [['transfer_price', null]]);
+  assert.deepEqual(buildProductAssignments({ name: 'X' }).map(([column]) => column), ['name']);
+
+  const parse = (transferPrice) => createProductSchema.safeParse({ name: 'X', price: 10, transferPrice }).success;
+  assert.equal(parse(9), true);
+  assert.equal(parse(null), true);
+  assert.equal(parse(undefined), true);
+  assert.equal(parse(0), false);
+  assert.equal(parse(-5), false);
+  assert.equal(parse('abc'), false);
+});
+
 test('producto: schema Zod valida cardOptions', () => {
   const base = { name: 'X', price: 10 };
   const option = { label: 'Envío gratis', icon: 'truck', isActive: true };

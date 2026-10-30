@@ -80,6 +80,7 @@ const toInsertValues = (body) => {
     images ? JSON.stringify(images) : null,
     resolveOriginalPrice(body.originalPrice, body.price),
     body.cardOptions ? JSON.stringify(body.cardOptions) : null,
+    body.transferPrice ? Number.parseFloat(body.transferPrice) : null,
   ];
 };
 

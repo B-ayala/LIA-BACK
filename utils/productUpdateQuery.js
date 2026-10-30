@@ -24,6 +24,7 @@ const FIELD_COLUMNS = [
   ['publicId', 'public_id', identity],
   ['description', 'description', identity],
   ['discount', 'discount', toFloatOrNull],
+  ['transferPrice', 'transfer_price', toFloatOrNull],
   ['condition', 'condition', identity],
   ['freeShipping', 'free_shipping', identity],
   ['hoverImageEnabled', 'hover_image_enabled', identity],
