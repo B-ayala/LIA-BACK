@@ -587,8 +587,8 @@ Caso: Catálogo devuelve Cache-Control y ETag
 Tipo: happy
 Pasos:
   1. curl -D - "http://localhost:3000/api/products?limit=5&offset=0"
-Esperado: `Cache-Control: public, max-age=30, stale-while-revalidate=90` + `ETag`
-Resultado: OK (2026-08-08)
+Esperado: `Cache-Control: public, max-age=10, stale-while-revalidate=30` + `ETag`
+Resultado: no probado tras bajar el plazo de 30 s a 10 s (2026-10-30); antes OK (2026-08-08)
 
 ID: TC-184
 Caso: Revalidación condicional devuelve 304 sin cuerpo

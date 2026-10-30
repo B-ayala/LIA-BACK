@@ -15,9 +15,10 @@ const { createProductSchema, updateProductSchema } = require('../schemas/product
 const { validateProductIdParam } = require('../middleware/validateParams');
 
 // El catálogo es el endpoint más leído y el que menos cambia: se deja cachear
-// 30 s en navegador/CDN. Combinado con el ETag de Express, las relecturas
-// vuelven como 304 sin cuerpo y ni siquiera tocan la base.
-const catalogCache = publicCache(30);
+// 10 s en navegador/CDN. Combinado con el ETag de Express, las relecturas
+// vuelven como 304 sin cuerpo y ni siquiera tocan la base. El plazo es corto a
+// propósito: un cambio del admin (precio, stock) no puede tardar minutos en verse.
+const catalogCache = publicCache(10, 30);
 
 // Lecturas públicas: 10 req/s sostenidas por IP. El techo está puesto para
 // frenar scraping y floods, no navegación normal ni una oficina detrás de un
