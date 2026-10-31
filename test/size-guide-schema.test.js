@@ -22,12 +22,18 @@ describe('sizeGuideSchema', () => {
       unit: 'cm',
       measurementBasis: 'body',
       notes: ['Las medidas de la tabla corresponden a {medidas}.'],
+      fitReferenceMode: 'custom',
       fitReference: {
         modelHeightCm: 170, topSize: 'S', bottomSize: 'M', fit: 'Ajustado',
         image: 'https://res.cloudinary.com/demo/image/upload/a.jpg',
       },
     };
     assert.equal(sizeGuideSchema.safeParse(guide).success, true);
+  });
+
+  test('acepta ocultar la modelo y rechaza modos desconocidos', () => {
+    assert.equal(sizeGuideSchema.safeParse({ ...LEGACY_GUIDE, fitReferenceMode: 'hidden' }).success, true);
+    assert.equal(sizeGuideSchema.safeParse({ ...LEGACY_GUIDE, fitReferenceMode: 'global' }).success, false);
   });
 
   test('rechaza una base de medidas desconocida', () => {

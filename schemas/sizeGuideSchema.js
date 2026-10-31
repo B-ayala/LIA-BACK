@@ -29,8 +29,8 @@ const fitReferenceSchema = z.strictObject({
   fittedSize: optionalText(MAX_FIT_SIZE),
   fit: optionalText(MAX_FIT_TEXT),
   notes: optionalText(MAX_FIT_NOTES),
-  // Solo una imagen propia del producto: el front lo exige y la tienda la oculta si ya no está en `images`.
-  // z.url() acepta `javascript:`; se exige https para que nunca llegue a un `src` otro esquema.
+  // Foto de la biblioteca de imágenes o del producto. z.url() acepta `javascript:`; se exige https
+  // para que nunca llegue a un `src` otro esquema.
   image: z.string().trim().max(MAX_IMAGE_URL).regex(/^https:\/\/[^\s]+$/, 'La imagen debe ser una URL https.').optional(),
 });
 
@@ -39,6 +39,8 @@ const sizeGuideSchema = z.object({
   measurementBasis: z.enum(['body', 'garment']).optional(),
   // Ausente = usa las aclaraciones globales; presente = propias de este producto.
   notes: z.array(z.string().trim().min(1).max(MAX_NOTE_TEXT)).max(MAX_NOTES).optional(),
+  // Ausente = modelo general (Admin > Talles > Guía de talles); custom = `fitReference`; hidden = no se muestra.
+  fitReferenceMode: z.enum(['custom', 'hidden']).optional(),
   fitReference: fitReferenceSchema.optional(),
 }).passthrough();
 
