@@ -96,6 +96,20 @@ test('producto: schema Zod valida cardOptions', () => {
   assert.equal(updateProductSchema.safeParse({ cardOptions: null }).success, true);
 });
 
+test('producto: un sello de cardOptions no puede mencionar la transferencia (sale de transferPrice)', () => {
+  const option = { icon: 'truck', isActive: true };
+  const parse = (label) => createProductSchema.safeParse({ name: 'X', price: 10, cardOptions: [{ ...option, label }] }).success;
+  assert.equal(parse('$50.000 con transferencia'), false);
+  assert.equal(parse('10% OFF con TRANSFERENCIA'), false);
+  assert.equal(parse('10% OFF transf.'), false);
+  assert.equal(updateProductSchema.safeParse({ cardOptions: [{ ...option, label: 'Pagá con transferencia' }] }).success, false);
+  assert.equal(parse('$45.000 c/transferencia'), false);
+  assert.equal(parse('Transferencias aceptadas'), false);
+  assert.equal(parse('3 cuotas sin interés'), true);
+  assert.equal(parse('Transformá tu look'), true);
+  assert.equal(parse('Te lo transfiero hoy'), true);
+});
+
 test('producto: editar stock o variants exige expectedUpdatedAt', () => {
   const { updateProductSchema } = require('../../schemas/productSchema');
   const stamp = '2026-10-12T15:00:00.123456+00:00';

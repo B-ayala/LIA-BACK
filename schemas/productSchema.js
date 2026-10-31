@@ -17,8 +17,15 @@ const MAX_ARRAY_ITEMS = 50;
 const MAX_CARD_OPTIONS = 10;
 const MAX_CARD_OPTION_TEXT = 40;
 
+// El precio con transferencia sale solo de `transfer_price`: un sello que lo mencione sería una
+// segunda fuente que se desincroniza. Misma regla en el front (productCardOptions.ts) y en la base.
+// "transferencia(s)", "transf." o "transf" suelto; deja pasar "transformá" o "transfiero".
+const TRANSFER_LABEL_PATTERN = /\btransf(?:er[eé]ncia|\.|\b)/i;
+const TRANSFER_LABEL_ERROR = 'El precio con transferencia se carga en Datos Básicos, campo "En transferencia ($)".';
+
 const cardOptionSchema = z.object({
-  label: z.string().trim().min(1).max(MAX_CARD_OPTION_TEXT),
+  label: z.string().trim().min(1).max(MAX_CARD_OPTION_TEXT)
+    .refine((label) => !TRANSFER_LABEL_PATTERN.test(label), TRANSFER_LABEL_ERROR),
   icon: z.string().trim().min(1).max(MAX_CARD_OPTION_TEXT),
   isActive: z.boolean(),
 });
