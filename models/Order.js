@@ -85,7 +85,7 @@ class Order {
       `SELECT stock, variants, name, status,
               COALESCE(NULLIF(images->>0, ''), NULLIF(image_url, '')) AS image,
               price::float8 AS price, discount::float8 AS discount,
-              original_price::float8 AS original_price
+              original_price::float8 AS original_price, transfer_price::float8 AS transfer_price
          FROM public.productos
         WHERE id = $1
           FOR UPDATE`,

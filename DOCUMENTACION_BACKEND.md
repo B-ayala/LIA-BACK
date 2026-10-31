@@ -220,7 +220,7 @@ Body de create/update (camelCase → columnas snake_case): `name`, `price`, `sto
 | POST | `/api/sizes` | **Bearer + admin** | Crea `{ name, type, garment?, measurements? }` (`name` en mayúsculas; `garment` = prenda opcional de 1-30 caracteres, se guarda como se escribe, vacío = `null`). Duplicado `type`+prenda+nombre (sin distinguir mayúsculas) → **409 `SIZE_DUPLICATE`**. |
 | PUT | `/api/sizes/:id` | **Bearer + admin** | Update parcial (`name`, `type`, `garment` —`null` la borra—, `measurements`, `active`). Id inexistente → **404 `SIZE_NOT_FOUND`**; id no UUID → **400 `INVALID_SIZE_ID`**. |
 
-No hay DELETE: se desactiva con `active: false`. El catálogo se usa desde la guía de talles del producto: los talles globales se eligen como columnas y los específicos se crean en el formulario del producto; la guía se guarda tal cual en `productos.size_guide` (body `sizeGuide`, `z.any()`, sin validar forma), con un campo opcional `columnSources` (columna → `{ sizeId }`) que el backend no valida ni verifica contra el catálogo. `variants[].optionMeta` de `/api/products` (talle `global` con `sizeId` o `custom` con medidas) sigue aceptado y validado en el borde (un `sizeId` inexistente → **400 `SIZE_NOT_FOUND`**), pero el frontend ya no lo envía ni lo usa; se mantiene por compatibilidad. La variante Talle del producto es de texto libre con stock y no depende del catálogo.
+No hay DELETE: se desactiva con `active: false`. El catálogo se usa desde la guía de talles del producto: los talles globales se eligen como columnas y los específicos se crean en el formulario del producto; la guía se guarda en `productos.size_guide` (body `sizeGuide`, `schemas/sizeGuideSchema.js`): `type`, `columns`, `rows` y `columnSources` (columna → `{ sizeId }`) pasan sin validar forma ni verificarse contra el catálogo (compatibilidad con guías guardadas); los bloques informativos opcionales sí se validan estrictos: `unit` (`cm`/`mm`), `measurementBasis` (`body`/`garment`), `notes` (≤ 8 × 300) y `fitReference` (altura entera 100–230, talles ≤ 20, calce ≤ 60, notas ≤ 300, `image` solo https). `variants[].optionMeta` de `/api/products` (talle `global` con `sizeId` o `custom` con medidas) sigue aceptado y validado en el borde (un `sizeId` inexistente → **400 `SIZE_NOT_FOUND`**), pero el frontend ya no lo envía ni lo usa; se mantiene por compatibilidad. La variante Talle del producto es de texto libre con stock y no depende del catálogo.
 
 ### 5.3 Órdenes y pagos — `/api/orders` (`orderRoutes.js` → `orderController.js`)
 | Método | Ruta | Auth | Descripción |
@@ -246,12 +246,20 @@ Las respuestas de error de órdenes tienen la forma `{ success: false, code, mes
 `SIZE_REQUIRED` **400** (falta el talle de alguna unidad) · `INVALID_VARIANT` **400** (otra variante
 sin elegir o con una opción inexistente) · `INVALID_PRODUCT_ID` **400** (`productId` no numérico) ·
 `PRODUCT_UNAVAILABLE` **409** (precio no positivo). `message` es el texto humano de siempre.
+`PRICE_CHANGED` **409** (`{ success:false, code, message, expectedTotal }`): el `totalPrice` del body
+difiere del total que se cobraría (comparación exacta al centavo) (cambió un precio entre el carrito y la confirmación);
+la reserva se deshace y no queda ninguna venta.
 Otros: `VALIDATION_ERROR` 400, `INVALID_SHIPPING` 400, `PURCHASES_DISABLED` 403, `MP_NOT_CONFIGURED` 503.
 
 **El importe lo decide el servidor.** `reserveOrders` lee `price`/`discount`/`original_price` en el
 mismo `SELECT … FOR UPDATE` que bloquea el stock y recalcula `unit_price`/`total_price`; el
 `unitPrice` del body se ignora. La regla replica `getProductPricing` del frontend
-(`src/utils/pricing.ts`): **si cambia una, hay que cambiar la otra**. El costo de envío se valida
+(`src/utils/pricing.ts`): **si cambia una, hay que cambiar la otra**. Con **transferencia**
+(`POST /transfer`) se cobra `transfer_price` cuando está cargado, salvo que el precio vigente ya
+sea menor (`resolvePaymentUnitPrice`, espejo de `getTransferUnitPrice` del front); Mercado Pago
+siempre cobra el precio de lista. El medio lo define la ruta, no un campo del body. El
+`totalPrice` del body no decide el cobro: solo se compara con el total calculado y, si difiere en
+un solo centavo, responde 409 `PRICE_CHANGED`. Los precios con descuento se redondean a centavos. El costo de envío se valida
 contra la tarifa de `shippingController` (`local` 0, `correo` `CORREO_COST`, `moto` variable
 acotado). Un ítem sin `productId` se rechaza con 400: sin producto no hay precio verificable.
 También salen de la base **el nombre y la imagen** de la venta y del ítem de MP (`productos.name` y

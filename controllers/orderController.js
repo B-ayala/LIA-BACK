@@ -48,6 +48,9 @@ const checkoutInput = (req) => ({
   items: req.body.items,
   shippingMethod: req.body.shippingMethod,
   shippingCost: req.body.shippingCost,
+  // El total que el comprador vio y aceptó: no decide el cobro (lo calcula el servidor),
+  // solo frena la compra si el precio cambió en el medio.
+  expectedTotal: req.body.totalPrice,
 });
 
 /**

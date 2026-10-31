@@ -1,14 +1,16 @@
 const { z } = require('zod');
 const { variantSchema } = require('./variantSchema');
+const { sizeGuideSchema } = require('./sizeGuideSchema');
 
 /**
  * Validación de borde para /api/products (solo admin, ver productRoutes.js).
  *
- * Los campos anidados complejos (specifications, features, faqs,
- * sizeGuide) se aceptan como arrays/objetos sueltos: su forma la valida el
- * front al construirlos y ya se persisten como JSON opaco en la base. Acá se
- * acota lo que sí importa para AppSec: tipos primitivos, longitudes y rangos
- * numéricos, para que un payload malformado nunca llegue a la query SQL.
+ * Los campos anidados complejos (specifications, features, faqs) se aceptan
+ * como arrays sueltos: su forma la valida el front al construirlos y ya se
+ * persisten como JSON opaco en la base. Acá se acota lo que sí importa para
+ * AppSec: tipos primitivos, longitudes y rangos numéricos, para que un payload
+ * malformado nunca llegue a la query SQL. `sizeGuide` tiene su propio schema
+ * (sizeGuideSchema.js).
  */
 
 const MAX_TEXT = 500;
@@ -55,7 +57,7 @@ const productBaseSchema = z.object({
   faqs: z.array(z.any()).max(MAX_ARRAY_ITEMS).optional(),
   warranty: z.string().trim().max(MAX_TEXT).nullable().optional(),
   returnPolicy: z.string().trim().max(MAX_LONG_TEXT).nullable().optional(),
-  sizeGuide: z.any().optional(),
+  sizeGuide: sizeGuideSchema.nullable().optional(),
   status: z.enum(['active', 'inactive']).optional(),
 });
 

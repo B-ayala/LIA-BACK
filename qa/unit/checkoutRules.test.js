@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
   CHECKOUT_ERROR, planReservationLines, evaluateLine, parseProductId, resolveShippingCost,
+  resolvePaymentUnitPrice, checkExpectedTotal,
 } = require('../../utils/checkoutRules');
 const { validateUnitsConfig } = require('../../utils/unitsConfig');
 
@@ -116,4 +117,29 @@ test('unitsConfig: talle case-insensitive y sin talle con variantes de talle →
   assert.deepEqual(validateUnitsConfig(variants, [{ Talle: ' m ' }], 1), { ok: true, units: [{ Talle: 'M' }] });
   assert.equal(validateUnitsConfig(variants, 'x', 1).code, 'SIZE_REQUIRED');
   assert.equal(validateUnitsConfig(variants, [null], 1).code, 'SIZE_REQUIRED');
+});
+
+test('resolvePaymentUnitPrice: transfer_price solo aplica a transferencia y nunca encarece', () => {
+  const withTransfer = { price: 1000, discount: null, original_price: null, transfer_price: 900 };
+  assert.equal(resolvePaymentUnitPrice(withTransfer, 'transfer'), 900);
+  assert.equal(resolvePaymentUnitPrice(withTransfer, 'mp'), 1000, 'Mercado Pago cobra el precio de lista');
+  assert.equal(resolvePaymentUnitPrice({ ...withTransfer, discount: 20 }, 'transfer'), 800, 'gana el menor');
+  assert.equal(resolvePaymentUnitPrice({ ...withTransfer, transfer_price: null }, 'transfer'), 1000);
+  assert.equal(resolvePaymentUnitPrice({ ...withTransfer, transfer_price: 0 }, 'transfer'), 1000);
+});
+
+test('resolvePaymentUnitPrice redondea el descuento a centavos (igual que el front)', () => {
+  assert.equal(resolvePaymentUnitPrice({ price: 999.99, discount: 15 }, 'mp'), 849.99);
+});
+
+test('checkExpectedTotal es exacto al centavo', () => {
+  assert.equal(checkExpectedTotal(1000, 1000), null);
+  assert.equal(checkExpectedTotal(0.1 + 0.2, 0.3), null, 'ruido de coma flotante no es diferencia');
+  assert.equal(checkExpectedTotal(1000.01, 1000).code, CHECKOUT_ERROR.priceChanged);
+  assert.equal(checkExpectedTotal(999.99, 1000).code, CHECKOUT_ERROR.priceChanged);
+  const failure = checkExpectedTotal(1000, 900);
+  assert.equal(failure.status, 409);
+  assert.equal(failure.code, CHECKOUT_ERROR.priceChanged);
+  assert.equal(failure.expectedTotal, 900);
+  assert.equal(checkExpectedTotal(undefined, 900).code, CHECKOUT_ERROR.priceChanged);
 });

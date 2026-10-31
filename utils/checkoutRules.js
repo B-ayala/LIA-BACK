@@ -23,6 +23,11 @@ const PRODUCT_ID_PATTERN = /^\d{1,18}$/;
 const HTTP_BAD_REQUEST = 400;
 const HTTP_CONFLICT = 409;
 
+const CENTS_FACTOR = 100;
+
+/** Mismo redondeo que `roundToCents` del frontend: los dos lados cobran el mismo centavo. */
+const roundToCents = (value) => Math.round((value + Number.EPSILON) * CENTS_FACTOR) / CENTS_FACTOR;
+
 // Costo de envío por método. `moto` es variable (se acuerda por WhatsApp según
 // distancia), así que solo se acota; el resto es una constante del negocio y se
 // impone desde acá: el cliente no puede elegir cuánto paga de envío.
@@ -37,6 +42,7 @@ const CHECKOUT_ERROR = Object.freeze({
   invalidProductId: 'INVALID_PRODUCT_ID',
   productUnavailable: 'PRODUCT_UNAVAILABLE',
   invalidShipping: 'INVALID_SHIPPING',
+  priceChanged: 'PRICE_CHANGED',
 });
 
 /**
@@ -53,9 +59,22 @@ const resolveUnitPrice = ({ price, discount, original_price: originalPrice }) =>
 
   const safeDiscount = Number(discount);
   if (Number.isFinite(safeDiscount) && safeDiscount > 0) {
-    return basePrice * (1 - safeDiscount / 100);
+    return roundToCents(basePrice * (1 - safeDiscount / 100));
   }
   return basePrice;
+};
+
+/**
+ * Precio unitario a cobrar según el medio de pago. Con transferencia se cobra el
+ * `transfer_price` publicado en la card ("$X con transferencia"), salvo que el precio
+ * vigente ya sea menor: un descuento posterior nunca deja al de transferencia más caro.
+ * Replica `getUnitPriceFor` del frontend (`src/utils/pricing.ts`).
+ */
+const resolvePaymentUnitPrice = (product, paymentMethod) => {
+  const listPrice = resolveUnitPrice(product);
+  const transferPrice = Number(product.transfer_price);
+  if (paymentMethod !== 'transfer' || !(transferPrice > 0)) return listPrice;
+  return Math.min(listPrice, transferPrice);
 };
 
 /** @returns {{ok: true, cost: number} | {ok: false, message: string}} */
@@ -197,7 +216,7 @@ const outOfStock = (name, productId) =>
  * @returns {{ok: true, name: string, image: string|null, unitPrice: number, units: object[]}
  *   | {ok: false, status: number, code: string, message: string, productId: string, size?: string}}
  */
-const evaluateLine = (product, { item, productId }) => {
+const evaluateLine = (product, { item, productId }, paymentMethod) => {
   if (!product) return outOfStock(item.productName, productId);
   const name = product.name || item.productName;
 
@@ -226,7 +245,7 @@ const evaluateLine = (product, { item, productId }) => {
     return lineFailure(status, code, message, productId, sizeCheck.size);
   }
 
-  const unitPrice = resolveUnitPrice(product);
+  const unitPrice = resolvePaymentUnitPrice(product, paymentMethod);
   if (!(unitPrice > 0)) {
     return lineFailure(HTTP_CONFLICT, CHECKOUT_ERROR.productUnavailable,
       `El producto "${name}" no está disponible para la venta.`, productId);
@@ -234,9 +253,35 @@ const evaluateLine = (product, { item, productId }) => {
   return { ok: true, name, image: product.image || null, unitPrice, units: units.units };
 };
 
+/**
+ * El total que vio el comprador ya no coincide con el que se va a cobrar (cambió un
+ * precio entre que armó el pedido y lo confirmó). Se corta antes de cobrar: nunca se
+ * cobra un monto distinto del que la persona aceptó.
+ * @returns {object|null} el fallo 409 a devolver, o null si los totales coinciden.
+ */
+const checkExpectedTotal = (expectedTotal, chargedTotal) => {
+  // Exacto al centavo: front y back calculan con la misma fórmula y el mismo redondeo, así que
+  // cualquier diferencia es un precio que cambió (o una regla desalineada), nunca ruido.
+  // Se comparan centavos enteros para no depender de la representación en coma flotante.
+  const expected = Number(expectedTotal);
+  if (Number.isFinite(expected) && Math.round(expected * CENTS_FACTOR) === Math.round(chargedTotal * CENTS_FACTOR)) {
+    return null;
+  }
+  return {
+    ok: false,
+    status: HTTP_CONFLICT,
+    code: CHECKOUT_ERROR.priceChanged,
+    message: 'El precio de tu pedido cambió. Revisá el nuevo total antes de confirmar.',
+    expectedTotal: roundToCents(chargedTotal),
+  };
+};
+
 module.exports = {
   CHECKOUT_ERROR,
+  roundToCents,
   resolveUnitPrice,
+  resolvePaymentUnitPrice,
+  checkExpectedTotal,
   resolveShippingCost,
   validateOrderPayload,
   maxQuantityPerLine,

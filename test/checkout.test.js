@@ -34,6 +34,8 @@ const pool = installFakeDatabase((sql, params) => {
 
 const User = require(abs('models/User.js'));
 const { createTransferOrder } = require(abs('controllers/orderController.js'));
+const { resolvePaymentUnitPrice } = require(abs('utils/checkoutRules.js'));
+const { CORREO_COST } = require(abs('controllers/shippingController.js'));
 
 User.getPurchasePermission = async () => ({ allowed: true });
 
@@ -44,7 +46,6 @@ const validBody = (overrides = {}) => ({
   buyerEmail: 'buyer@example.test',
   shippingMethod: 'local',
   shippingCost: 0,
-  totalPrice: 1,
   items: [{
     productId: 7, productName: 'Remera', productImage: 'x', quantity: 1, unitPrice: 1, totalPrice: 1, unitsConfig: [],
     ...(overrides.item || {}),
@@ -53,11 +54,22 @@ const validBody = (overrides = {}) => ({
 });
 
 let uniqueCart = 0;
+// El total que mostraría el front con el producto actual: el servidor lo compara con el que cobra.
+const matchingTotal = (body) => {
+  const units = body.items.reduce((sum, item) => sum + (Number(item.quantity) || 0), 0);
+  const unitPrice = product ? resolvePaymentUnitPrice(product, 'transfer') : 1;
+  return unitPrice * units + (body.shippingMethod === 'correo' ? CORREO_COST : 0);
+};
+
 // Cada llamada usa un carrito distinto: evita que el single-flight de checkout colapse requests de tests distintos.
 const placeTransfer = async (body, user = USER) => {
   uniqueCart += 1;
   const res = createRes();
-  await createTransferOrder({ body: { ...body, buyerName: `${body.buyerName} ${uniqueCart}` }, user, get: () => undefined }, res);
+  const totalPrice = body.totalPrice ?? matchingTotal(body);
+  await createTransferOrder(
+    { body: { ...body, totalPrice, buyerName: `${body.buyerName} ${uniqueCart}` }, user, get: () => undefined },
+    res
+  );
   return res;
 };
 
@@ -75,8 +87,8 @@ beforeEach(() => {
 });
 
 describe('El servidor decide el importe (prueba 4)', () => {
-  test('NEGATIVO: el unitPrice/totalPrice del navegador se ignoran: se cobra el precio de la base', async () => {
-    const res = await placeTransfer(validBody({ item: { unitPrice: 1, totalPrice: 1 }, body: { totalPrice: 1 } }));
+  test('NEGATIVO: el unitPrice/totalPrice de cada línea del navegador se ignoran: se cobra el precio de la base', async () => {
+    const res = await placeTransfer(validBody({ item: { unitPrice: 1, totalPrice: 1 } }));
     assert.equal(res.statusCode, 201);
     const { params } = insertedRow();
     assert.equal(params[7], 10000, 'unit_price sale de la base');
@@ -102,6 +114,53 @@ describe('El servidor decide el importe (prueba 4)', () => {
     assert.equal(res.statusCode, 201);
     assert.equal(res.body.success, true);
     assert.equal(res.body.order_ids.length, 1);
+  });
+});
+
+describe('Precio con transferencia y total cambiado (CHK-02)', () => {
+  test('POSITIVO: por transferencia se cobra el transfer_price publicado en la card', async () => {
+    product.transfer_price = 8500;
+    const res = await placeTransfer(validBody({ item: { quantity: 2 }, body: { totalPrice: 17000 } }));
+    assert.equal(res.statusCode, 201);
+    assert.equal(insertedRow().params[7], 8500, 'unit_price con transferencia');
+    assert.equal(insertedRow().params[8], 17000, 'total_price con transferencia');
+  });
+
+  test('POSITIVO: si el precio vigente ya es menor que el de transferencia, se cobra el vigente', async () => {
+    product.transfer_price = 9500;
+    product.discount = 20;
+    const res = await placeTransfer(validBody({ body: { totalPrice: 8000 } }));
+    assert.equal(res.statusCode, 201);
+    assert.equal(insertedRow().params[7], 8000);
+  });
+
+  test('NEGATIVO: si el total que vio el comprador no coincide, responde 409 PRICE_CHANGED y no confirma nada', async () => {
+    product.transfer_price = 8500;
+    const res = await placeTransfer(validBody({ body: { totalPrice: 10000 } }));
+    assert.equal(res.statusCode, 409);
+    assert.equal(res.body.code, 'PRICE_CHANGED');
+    assert.equal(res.body.expectedTotal, 8500);
+    const sqls = pool.queries.map((q) => q.sql);
+    assert.ok(sqls.includes('ROLLBACK'), 'la reserva se deshace');
+    assert.ok(!sqls.includes('COMMIT'), 'no se confirma ninguna venta');
+  });
+
+  test('NEGATIVO: un precio que subió entre el carrito y la confirmación también se frena', async () => {
+    product.price = 12000;
+    const res = await placeTransfer(validBody({ body: { totalPrice: 10000 } }));
+    assert.equal(res.statusCode, 409);
+    assert.equal(res.body.code, 'PRICE_CHANGED');
+  });
+
+  test('NEGATIVO: el control es exacto: un centavo de diferencia ya frena la compra', async () => {
+    const res = await placeTransfer(validBody({ body: { totalPrice: 10000.01 } }));
+    assert.equal(res.statusCode, 409);
+    assert.equal(res.body.code, 'PRICE_CHANGED');
+  });
+
+  test('POSITIVO: el mismo total escrito con ruido de coma flotante pasa', async () => {
+    const res = await placeTransfer(validBody({ body: { totalPrice: 0.1 + 0.2 + 9999.7 } }));
+    assert.equal(res.statusCode, 201);
   });
 });
 
@@ -235,7 +294,7 @@ describe('Idempotencia y reintentos (prueba 7/E)', () => {
     uniqueCart += 1;
     const res = createRes();
     await createTransferOrder(
-      { body: validBody({ body: { buyerName: `Cliente ${uniqueCart}` } }), user: USER, get: () => 'corta' },
+      { body: validBody({ body: { buyerName: `Cliente ${uniqueCart}`, totalPrice: 10000 } }), user: USER, get: () => 'corta' },
       res
     );
     assert.equal(res.statusCode, 400);

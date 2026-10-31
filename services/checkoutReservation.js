@@ -17,7 +17,7 @@ const { invalidateProducts } = require('../utils/cache');
 const { withTransaction, rollbackWith } = require('../utils/transaction');
 const { DEDUCT, applySizeDelta } = require('../utils/variantStock');
 const {
-  CHECKOUT_ERROR, resolveShippingCost, planReservationLines, evaluateLine,
+  CHECKOUT_ERROR, resolveShippingCost, planReservationLines, evaluateLine, checkExpectedTotal, roundToCents,
 } = require('../utils/checkoutRules');
 
 const HTTP_BAD_REQUEST = 400;
@@ -72,10 +72,11 @@ const checkPendingLimit = async (client, userId, newLines) => {
 /** Valida, inserta y descuenta talle de UNA línea con la fila del producto bloqueada. */
 const reserveLine = async (client, line, order) => {
   const product = await Order.getProductForUpdate(client, line.productId);
-  const evaluation = evaluateLine(product, line);
+  const evaluation = evaluateLine(product, line, order.paymentMethod);
   if (!evaluation.ok) return evaluation;
 
   const { item, index, productId } = line;
+  const itemsTotal = roundToCents(evaluation.unitPrice * item.quantity);
   const orderId = await Order.insertPending(client, {
     ...order.buyer,
     productId,
@@ -84,7 +85,7 @@ const reserveLine = async (client, line, order) => {
     quantity: item.quantity,
     unitPrice: evaluation.unitPrice,
     // El costo de envío se suma a la PRIMERA línea del pedido original (mismo criterio que el front).
-    totalPrice: evaluation.unitPrice * item.quantity + (index === 0 ? order.surcharge : 0),
+    totalPrice: itemsTotal + (index === 0 ? order.surcharge : 0),
     unitsConfig: evaluation.units,
     paymentMethod: order.paymentMethod,
     shippingMethod: order.shippingMethod,
@@ -98,6 +99,7 @@ const reserveLine = async (client, line, order) => {
     ok: true,
     index,
     orderId: String(orderId),
+    itemsTotal,
     pricedItem: {
       productName: evaluation.name,
       productImage: evaluation.image,
@@ -120,6 +122,12 @@ const reserveLines = async (client, lines, order) => {
     if (!result.ok) return rollbackWith(result);
     reserved[result.index] = result;
   }
+  const chargedTotal = roundToCents(reserved.reduce((sum, line) => sum + line.itemsTotal, 0) + order.surcharge);
+  const priceChanged = checkExpectedTotal(order.expectedTotal, chargedTotal);
+  if (priceChanged) {
+    logger.info('order_rejected_price_changed', { paymentMethod: order.paymentMethod, chargedTotal });
+    return rollbackWith(priceChanged);
+  }
   return {
     ok: true,
     orderIds: reserved.map((line) => line.orderId),
@@ -139,7 +147,9 @@ const reserveLines = async (client, lines, order) => {
  *   purchaseId: string|null, orderNumber: number} | {ok: false, status: number, code: string, message: string,
  *   productId?: string|null, size?: string}>}
  */
-const reserveOrders = async ({ buyerName, buyerEmail, userId, items, shippingMethod, shippingCost, paymentMethod }) => {
+const reserveOrders = async ({
+  buyerName, buyerEmail, userId, items, shippingMethod, shippingCost, paymentMethod, expectedTotal,
+}) => {
   const shipping = resolveShippingCost(shippingMethod, shippingCost);
   if (!shipping.ok) {
     return { ok: false, status: HTTP_BAD_REQUEST, code: CHECKOUT_ERROR.invalidShipping, message: shipping.message };
@@ -152,6 +162,7 @@ const reserveOrders = async ({ buyerName, buyerEmail, userId, items, shippingMet
     surcharge: shipping.cost,
     paymentMethod,
     shippingMethod,
+    expectedTotal,
     purchaseId: paymentMethod === 'mp' ? crypto.randomUUID() : null,
   };
   try {

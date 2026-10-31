@@ -55,7 +55,6 @@ const validBody = (overrides = {}) => ({
   buyerEmail: USER_A.email,
   shippingMethod: 'local',
   shippingCost: 0,
-  totalPrice: 1,
   items: [{
     productId: 7, productName: 'Remera', productImage: 'x', quantity: 1, unitPrice: 1, totalPrice: 1, unitsConfig: [],
     ...(overrides.item || {}),
@@ -64,9 +63,16 @@ const validBody = (overrides = {}) => ({
 });
 
 let cartCounter = 0;
-const placeTransfer = async (user, body, idempotencyKey) => {
+// El total que mostraría el front: el servidor lo compara con el que cobra (precio 10000, retiro en local).
+const withMatchingTotal = (body) => ({
+  ...body,
+  totalPrice: body.totalPrice ?? product.price * body.items.reduce((sum, item) => sum + item.quantity, 0),
+});
+
+const placeTransfer = async (user, rawBody, idempotencyKey) => {
   cartCounter += 1;
   const res = createRes();
+  const body = withMatchingTotal(rawBody);
   const unique = { ...body, buyerName: `${body.buyerName} ${cartCounter}` };
   await createTransferOrder({
     body: idempotencyKey ? body : unique,

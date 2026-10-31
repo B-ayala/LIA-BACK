@@ -12,8 +12,8 @@ const { reserveOrders, releaseOrders } = require('./checkoutReservation');
 const HTTP_CREATED = 201;
 const HTTP_BAD_GATEWAY = 502;
 
-/** Cuerpo de error del checkout: `{ success: false, code, message, productId?, size? }`. */
-const failureResult = ({ status, code, message, productId, size }) => ({
+/** Cuerpo de error del checkout: `{ success: false, code, message, productId?, size?, expectedTotal? }`. */
+const failureResult = ({ status, code, message, productId, size, expectedTotal }) => ({
   status,
   body: {
     success: false,
@@ -21,6 +21,7 @@ const failureResult = ({ status, code, message, productId, size }) => ({
     message,
     ...(productId !== undefined ? { productId } : {}),
     ...(size ? { size } : {}),
+    ...(expectedTotal !== undefined ? { expectedTotal } : {}),
   },
 });
 

@@ -3,6 +3,14 @@
 ## [Unreleased]
 
 ### Added
+- Checkout por transferencia (`POST /api/orders/transfer`): se cobra el `transfer_price` del producto cuando está cargado (o el precio vigente si es menor). Mercado Pago sigue cobrando el precio de lista. Deja de ser un precio solo informativo.
+- `mp-preference` y `transfer` comparan el `totalPrice` que vio el comprador con el que calcula el servidor: si difieren (comparación exacta al centavo) responden 409 `PRICE_CHANGED` (con `expectedTotal`) y no queda ninguna venta.
+
+### Fixed
+- Precio con descuento porcentual redondeado a centavos en el servidor (igual que el front): `unit_price` y el monto enviado a Mercado Pago ya no llevan fracciones de centavo.
+
+### Added
+- Productos: `sizeGuide` deja de ser `z.any()` y se valida con `schemas/sizeGuideSchema.js`: campos opcionales nuevos `unit` (`cm`/`mm`), `measurementBasis` (`body`/`garment`), `notes` (hasta 8 de 300 caracteres) y `fitReference` (estricto: altura entera 100–230, talles, calce, notas e `image` solo https). Columnas y filas se aceptan igual que antes (passthrough): las guías guardadas no se rechazan. Sin script SQL (es JSONB).
 - Productos: campo opcional `transferPrice` (columna `productos.transfer_price`) en `POST`/`PUT /api/products`: precio informativo "con transferencia" que se muestra en el detalle del producto; `PUT` con `transferPrice: null` lo borra. No cambia el importe del checkout (sigue saliendo de `price`). Requiere correr `db/migrations/2026-10-30_add_transfer_price_to_productos.sql` ANTES de desplegar (ya aplicado en producción; `init-db` también crea la columna).
 - Productos: un sello de `cardOptions` que mencione la transferencia ("transferencia", "transf.", "transf"; no "transformá") responde 400 en `POST`/`PUT /api/products`: el precio con transferencia sale solo de `transferPrice`. Script SQL `db/migrations/2026-10-30_move_transfer_badge_to_transfer_price.sql` (aplicado en producción el 2026-10-30; en otro entorno, correr primero su bloque DIAGNÓSTICO y después el script, ANTES de desplegar back y front): pasa a `transfer_price` los montos de los sellos "$X con transferencia" ya cargados, quita esos sellos (también los globales) y agrega el CHECK `product_card_options_label_no_transfer_check`.
 - El mail de constancia del arrepentimiento toma el "Qué sigue" y el plazo de reintegro de `site_content` (clave `withdrawal_followup`, máx. 8 pasos de 300 caracteres). Sin texto publicado, o si falla la lectura, usa el de siempre; `WITHDRAWAL_REFUND_TERM` queda como respaldo del plazo.
