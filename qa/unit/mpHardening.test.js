@@ -107,6 +107,20 @@ describe('S-12: webhook sin MP_WEBHOOK_SECRET', () => {
     assert.equal(errors.filter((entry) => entry.message === 'mp_webhook_secret_missing').length, 1);
   });
 
+  test('producción con MP_WEBHOOK_ALLOW_UNSIGNED=true: acepta sin firma y revalida contra MP', async () => {
+    process.env.MP_WEBHOOK_ALLOW_UNSIGNED = 'true';
+    try {
+      await captureLogs('warn', async () => withoutSecret('production', async () => {
+        const res = createRes();
+        await mpWebhook(webhookReq(), res);
+        assert.equal(res.statusCode, 200);
+      }));
+    } finally {
+      delete process.env.MP_WEBHOOK_ALLOW_UNSIGNED;
+    }
+    assert.equal(getPaymentCalls, 1);
+  });
+
   test('desarrollo/test: sigue permisivo (revalida contra MP) con warning', async () => {
     const warnings = await captureLogs('warn', async () => withoutSecret('test', async () => {
       const res = createRes();

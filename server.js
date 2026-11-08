@@ -238,7 +238,13 @@ const registerShutdown = (server, sweepTimer) => {
     server.requestTimeout = 30 * 1000;
 
     if (!mercadopago.isWebhookSecretConfigured()) {
-      logger.warn('mp_webhook_unsigned', { reason: 'MP_WEBHOOK_SECRET no configurada: el webhook se acepta sin verificar firma', phase: 'startup' });
+      const acceptsUnsigned = process.env.NODE_ENV !== 'production' || process.env.MP_WEBHOOK_ALLOW_UNSIGNED === 'true';
+      logger.warn('mp_webhook_unsigned', {
+        reason: acceptsUnsigned
+          ? 'MP_WEBHOOK_SECRET no configurada: el webhook se acepta sin verificar firma'
+          : 'MP_WEBHOOK_SECRET no configurada: el webhook rechaza todo con 401',
+        phase: 'startup',
+      });
     }
 
     // Expira órdenes pendientes vencidas (MP 15 min, transferencia 5 h)

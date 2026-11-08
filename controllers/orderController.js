@@ -273,6 +273,9 @@ let missingSecretAlerted = false;
 
 const isProduction = () => process.env.NODE_ENV === 'production';
 
+// Salida provisoria y explícita para producción sin secreto: hay que activarla a propósito y se alerta al arrancar.
+const allowsUnsignedWebhook = () => process.env.MP_WEBHOOK_ALLOW_UNSIGNED === 'true';
+
 /**
  * Sin `MP_WEBHOOK_SECRET` el webhook no puede autenticar a quien llama. En producción FALLA CERRADO (401): un
  * atacante no puede disparar consultas a MP ni saldos con notificaciones falsas, y los pagos igual se confirman
@@ -304,7 +307,7 @@ const rejectUnverifiedWebhook = (req, res, paymentId) => {
     return res.status(401).json({ success: false, code: 'INVALID_SIGNATURE', message: 'Firma inválida' });
   }
   if (signatureValid !== null) return null;
-  if (isProduction()) return failClosedWithoutSecret(res);
+  if (isProduction() && !allowsUnsignedWebhook()) return failClosedWithoutSecret(res);
   logger.warn('mp_webhook_unsigned_allowed', { env: 'MP_WEBHOOK_SECRET', nodeEnv: process.env.NODE_ENV || 'unset' });
   return null;
 };
