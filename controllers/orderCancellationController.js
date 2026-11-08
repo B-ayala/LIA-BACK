@@ -1,6 +1,6 @@
 const Order = require('../models/Order');
 const logger = require('../utils/logger');
-const { invalidateProducts } = require('../utils/cache');
+const { flushAvailabilityChange } = require('../utils/catalogInvalidation');
 const { sendError } = require('../utils/httpResponses');
 const { isUuid } = require('../utils/uuid');
 const { isOrderOwnerOrAdmin } = require('../utils/orderAccess');
@@ -109,7 +109,7 @@ const recordNudge = async (req, res) => {
 
   try {
     const applied = await applyNudge(ids, req.user, origin);
-    if (origin === NUDGE_ORIGIN.abandonado && applied > 0) invalidateProducts();
+    if (origin === NUDGE_ORIGIN.abandonado && applied > 0) flushAvailabilityChange();
     return res.status(200).json({ success: true, applied });
   } catch (error) {
     logger.error('nudge_failed', { code: error.code, message: error.message });

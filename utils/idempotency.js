@@ -14,12 +14,16 @@
  *  - `public.idempotency_keys` (Supabase): sobrevive a reinicios de Render.
  * La base es fail-open: si falla (ej. migración sin aplicar) se loguea y se sigue con
  * solo memoria, porque cortar el checkout es peor que perder la garantía de replay.
- * El doble submit concurrente lo cubre el single-flight por carrito del controlador.
+ * El doble submit concurrente lo cubre el single-flight por carrito del controlador en la misma
+ * instancia y, entre instancias, la base: `ventas.idempotency_key` (índice único) + lock por usuario
+ * en la reserva (ver services/checkoutReservation.js). La base es la fuente de verdad: lo recordado
+ * acá solo se reenvía si `isReplayable` confirma que el intento sigue vivo (no cancelado/expirado).
  */
 
 const { caches } = require('./cache');
 const IdempotencyKey = require('../models/IdempotencyKey');
 const logger = require('./logger');
+const { KEY_REUSED } = require('./checkoutAttempt');
 
 const KEY_PATTERN = /^[A-Za-z0-9_-]{8,128}$/;
 
@@ -30,7 +34,6 @@ const MS_PER_SECOND = 1000;
 
 const HTTP_CREATED = 201;
 const HTTP_BAD_REQUEST = 400;
-const HTTP_UNPROCESSABLE = 422;
 
 const INVALID_KEY_RESULT = {
   status: HTTP_BAD_REQUEST,
@@ -42,12 +45,8 @@ const INVALID_KEY_RESULT = {
 };
 
 const KEY_REUSED_RESULT = {
-  status: HTTP_UNPROCESSABLE,
-  body: {
-    success: false,
-    code: 'IDEMPOTENCY_KEY_REUSED',
-    message: 'Esta compra ya fue iniciada con otros datos. Volvé al carrito e iniciá una nueva compra.',
-  },
+  status: KEY_REUSED.status,
+  body: { success: false, code: KEY_REUSED.code, message: KEY_REUSED.message },
 };
 
 /**
@@ -91,16 +90,18 @@ const persist = async (scope, key, storeKey, fingerprint, result) => {
  * que una key no pueda cruzarse entre usuarios ni entre mp/transferencia.
  *
  * @param {{scope: string, key: string | null, fingerprint: string,
- *          execute: () => Promise<{status: number, body: object}>}} options
+ *          execute: () => Promise<{status: number, body: object}>,
+ *          isReplayable?: (result: {status: number, body: object}) => Promise<boolean>}} options
  */
-const withIdempotency = async ({ scope, key, fingerprint, execute }) => {
+const withIdempotency = async ({ scope, key, fingerprint, execute, isReplayable = async () => true }) => {
   if (!key) return execute();
 
   const storeKey = `${scope}:${key}`;
   const saved = await findSaved(scope, key, storeKey);
-  if (saved) {
-    return saved.fingerprint === fingerprint ? saved.result : KEY_REUSED_RESULT;
-  }
+  if (saved && saved.fingerprint !== fingerprint) return KEY_REUSED_RESULT;
+  if (saved && (await isReplayable(saved.result))) return saved.result;
+  // Intento cancelado/vencido: se olvida lo recordado y la reserva decide (nuevo intento o 409).
+  if (saved) caches.idempotency.delete(storeKey);
 
   const result = await execute();
   if (result.status === HTTP_CREATED) {

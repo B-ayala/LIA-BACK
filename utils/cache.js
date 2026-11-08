@@ -18,9 +18,14 @@ const DEFAULT_MAX_ENTRIES = 500;
 const PURGE_INTERVAL_MS = 60 * 1000;
 
 class TtlCache {
-  constructor({ name, maxEntries = DEFAULT_MAX_ENTRIES } = {}) {
+  /**
+   * `lru`: una lectura exitosa mueve la clave al final, así lo que se desaloja al llenarse es lo
+   * MENOS usado (no lo más viejo). Para cachés cuyas claves salen de input público (catálogo).
+   */
+  constructor({ name, maxEntries = DEFAULT_MAX_ENTRIES, lru = false } = {}) {
     this.name = name || 'cache';
     this.maxEntries = maxEntries;
+    this.lru = lru;
     this.entries = new Map(); // key -> { value, expiresAt }
     this.inFlight = new Map(); // key -> Promise
     this.metrics = { hits: 0, misses: 0, coalesced: 0, evictions: 0 };
@@ -37,14 +42,17 @@ class TtlCache {
       this.entries.delete(key);
       return undefined;
     }
+    if (this.lru) {
+      this.entries.delete(key);
+      this.entries.set(key, entry);
+    }
     return entry.value;
   }
 
   set(key, value, ttlMs) {
     if (!(ttlMs > 0)) return value;
 
-    // FIFO simple: la entrada más vieja sale primero. Suficiente para un set
-    // acotado de claves (catálogo + insights), sin el costo de un LRU real.
+    // Sale la primera clave del Map: la más vieja (FIFO) o, con `lru`, la menos usada.
     if (this.entries.size >= this.maxEntries && !this.entries.has(key)) {
       const oldestKey = this.entries.keys().next().value;
       this.entries.delete(oldestKey);
@@ -145,11 +153,31 @@ const ttlFromEnv = (name, fallbackMs) => {
   return Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : fallbackMs;
 };
 
+// Sesiones simultáneas que caben en la caché sin expulsarse entre sí: con un tope bajo, un pico de
+// sesiones distintas (o de tokens falsos) hace rotar la caché y cada request vuelve a pegarle a Supabase.
+const AUTH_CACHE_MAX_ENTRIES = 5000;
+const AUTH_REJECTED_MAX_ENTRIES = 5000;
+// Catálogo: páginas, facets por categoría y resultados vacíos van en cachés separadas y con LRU, para que
+// combinaciones de filtros únicas (scraping) no expulsen las claves calientes.
+const CATALOG_MAX_ENTRIES = 200;
+const CATALOG_FACETS_MAX_ENTRIES = 100;
+const CATALOG_MISSES_MAX_ENTRIES = 100;
+
 const caches = {
   products: new TtlCache({ name: 'products', maxEntries: 300 }),
   insights: new TtlCache({ name: 'insights', maxEntries: 50 }),
-  auth: new TtlCache({ name: 'auth', maxEntries: 1000 }),
+  // Sesiones verificadas y tokens que Supabase rechazó (solo un booleano por hash de token).
+  auth: new TtlCache({ name: 'auth', maxEntries: AUTH_CACHE_MAX_ENTRIES, lru: true }),
+  authRejected: new TtlCache({ name: 'authRejected', maxEntries: AUTH_REJECTED_MAX_ENTRIES }),
   orders: new TtlCache({ name: 'orders', maxEntries: 200 }),
+  // Páginas del catálogo público (una clave por combinación de filtros): aparte de `products` para que
+  // un cliente que recorre filtros al azar no expulse las claves calientes del listado ni del detalle.
+  catalog: new TtlCache({ name: 'catalog', maxEntries: CATALOG_MAX_ENTRIES, lru: true }),
+  // Talles/colores con stock por categoría: solo cambian con altas/ediciones o cuando un producto se agota
+  // o vuelve (ambos invalidan), así que viven más que las páginas.
+  catalogFacets: new TtlCache({ name: 'catalogFacets', maxEntries: CATALOG_FACETS_MAX_ENTRIES, lru: true }),
+  // Consultas del catálogo sin resultados (categoría inventada, offset fuera de rango): entrada corta y aparte.
+  catalogMisses: new TtlCache({ name: 'catalogMisses', maxEntries: CATALOG_MISSES_MAX_ENTRIES, lru: true }),
   // Ids de producto inexistentes: separados del catálogo para que un scraper que
   // pida ids al azar no expulse las claves calientes (FIFO) de `products`.
   productMisses: new TtlCache({ name: 'productMisses', maxEntries: 100 }),
@@ -160,18 +188,26 @@ const TTL = {
   products: ttlFromEnv('CACHE_TTL_PRODUCTS_SECONDS', 20 * 1000),
   insights: ttlFromEnv('CACHE_TTL_INSIGHTS_SECONDS', 60 * 1000),
   auth: ttlFromEnv('CACHE_TTL_AUTH_SECONDS', 30 * 1000),
+  // Tokens rechazados por Supabase: 45 s (rango pedido 30-60 s). Un token rechazado no se "arregla" solo.
+  authRejected: ttlFromEnv('CACHE_TTL_AUTH_REJECTED_SECONDS', 45 * 1000),
+  catalogFacets: ttlFromEnv('CACHE_TTL_CATALOG_FACETS_SECONDS', 60 * 1000),
+  catalogMisses: ttlFromEnv('CACHE_TTL_CATALOG_MISSES_SECONDS', 10 * 1000),
 };
 
 const cacheStats = () => Object.values(caches).map((cache) => cache.stats());
 
 /**
- * Invalida el catálogo cacheado. Se llama ante cualquier cambio de producto o
- * de stock (alta/edición/baja, creación de órdenes, cancelaciones, sweep de
- * expiración) para que el stock publicado no quede viejo más de lo necesario.
+ * Invalidación COMPLETA del catálogo cacheado (páginas, detalle, facets, vacíos). Es para cambios del
+ * admin: alta, edición, borrado, orden de categorías. Las reservas y liberaciones de stock NO la usan
+ * salvo que agoten o revivan un producto (ver `utils/catalogInvalidation.js`): el TTL de `TTL.products`
+ * cubre el stock mostrado.
  */
 const invalidateProducts = () => {
   caches.products.clear();
   caches.productMisses.clear();
+  caches.catalog.clear();
+  caches.catalogFacets.clear();
+  caches.catalogMisses.clear();
 };
 
 module.exports = { TtlCache, caches, TTL, cacheStats, invalidateProducts };

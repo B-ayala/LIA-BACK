@@ -1,6 +1,7 @@
 const { pool } = require('../config/database');
 const { withTransaction } = require('../utils/transaction');
 const { RESTORE, applySizeDelta } = require('../utils/variantStock');
+const { noteStockChange } = require('../utils/catalogInvalidation');
 
 /**
  * Acceso a datos de órdenes (tabla public.ventas) y stock (public.productos).
@@ -14,6 +15,9 @@ const { RESTORE, applySizeDelta } = require('../utils/variantStock');
  * Orden de bloqueo (evita deadlocks entre reserva, pago, cancelación y sweep):
  * filas de `ventas` por `id` ascendente; filas de `productos` por `id` ascendente.
  */
+
+// Espacio de claves del advisory lock de checkout (el segundo int4 es el hash del usuario).
+const CHECKOUT_LOCK_NAMESPACE = 7301;
 
 const byProductId = (a, b) => (Number(a.product_id) || 0) - (Number(b.product_id) || 0);
 
@@ -109,6 +113,45 @@ class Order {
     return { lines: row.pending, units: Number(row.units) || 0 };
   }
 
+  /**
+   * Serializa los checkouts de UN usuario hasta el fin de la transacción (`pg_advisory_xact_lock`
+   * con la forma de dos int4: namespace fijo + hash estable del id). Sin esto, N requests
+   * paralelas leen el mismo contador de pendientes y lo sobrepasan (tope de reservas) o crean
+   * el mismo intento dos veces (idempotencia). Se libera solo en COMMIT/ROLLBACK.
+   */
+  static async lockUserCheckout(client, userId) {
+    await client.query('SELECT pg_advisory_xact_lock($1::int4, hashtext($2::text))', [CHECKOUT_LOCK_NAMESPACE, String(userId)]);
+  }
+
+  /**
+   * Líneas de un intento de compra ya registrado con esa `Idempotency-Key` (columna
+   * `ventas.idempotency_key` = `<key>:<huella>:<índice de línea>`, ver 2026-10-06_idempotency_key.sql).
+   * Va por el prefijo `user_id` del índice único; `starts_with` evita que `_` de la key actúe de comodín.
+   */
+  static async findByIdempotencyKey(db, userId, key) {
+    const result = await db.query(
+      `SELECT id, payment_status, idempotency_key, order_number::int AS order_number,
+              mp_external_reference
+         FROM public.ventas
+        WHERE user_id = $1::uuid AND starts_with(idempotency_key, $2)`,
+      [String(userId), `${key}:`]
+    );
+    return result.rows;
+  }
+
+  /** Libera la key de intentos ya cerrados (cancelados/expirados) para que un reintento cree uno nuevo. */
+  static async clearIdempotencyKey(client, ids) {
+    if (ids.length === 0) return;
+    await client.query('UPDATE public.ventas SET idempotency_key = NULL WHERE id = ANY($1::uuid[])', [ids]);
+  }
+
+  /** `true` si TODAS las ventas siguen `pendiente` (un intento recordado solo se reenvía mientras esté vivo). */
+  static async areAllPending(ids) {
+    if (!Array.isArray(ids) || ids.length === 0) return false;
+    const result = await pool.query('SELECT payment_status FROM public.ventas WHERE id = ANY($1::uuid[])', [ids]);
+    return result.rows.length === ids.length && result.rows.every((row) => row.payment_status === 'pendiente');
+  }
+
   /** Guarda el desglose de stock por talle (la fila del producto ya está bloqueada por el caller). */
   static async setVariants(client, productId, variants) {
     await client.query(
@@ -125,12 +168,18 @@ class Order {
     if (productId == null) return;
     const result = await client.query(
       `UPDATE public.productos SET stock = stock + $2, updated_at = NOW()
-        WHERE id = $1 RETURNING variants`,
+        WHERE id = $1 RETURNING stock, variants`,
       [productId, quantity]
     );
     const product = result.rows[0];
     const nextVariants = product ? applySizeDelta(product.variants, unitsConfig, RESTORE) : null;
     if (nextVariants) await Order.setVariants(client, productId, nextVariants);
+    if (product) {
+      noteStockChange(
+        { stock: product.stock == null ? null : product.stock - quantity, variants: product.variants },
+        { stock: product.stock, variants: nextVariants || product.variants }
+      );
+    }
   }
 
   /** Devuelve el stock de varias ventas, bloqueando productos en orden ascendente. */
@@ -146,31 +195,39 @@ class Order {
     return result.rows[0].order_number;
   }
 
-  /** Inserta una línea de venta pendiente y devuelve su id. */
+  /**
+   * Inserta una línea de venta pendiente y devuelve su id. `idempotency_key` solo viaja en el INSERT
+   * cuando hay key: sin header el statement es el de siempre y no depende de la columna (script
+   * 2026-10-06_idempotency_key.sql). Un 23505 del índice único lo resuelve el caller.
+   */
   static async insertPending(client, row) {
+    const values = [
+      row.buyerName || null,
+      row.buyerEmail || null,
+      row.userId || null,
+      row.productId,
+      row.productName,
+      row.productImage || null,
+      row.quantity,
+      row.unitPrice,
+      row.totalPrice,
+      JSON.stringify(row.unitsConfig || []),
+      row.paymentMethod,
+      row.shippingMethod || null,
+      row.mpExternalReference || null,
+      row.orderNumber ?? null,
+    ];
+    if (row.idempotencyKey) values.push(row.idempotencyKey);
+    const keyColumn = row.idempotencyKey ? ', idempotency_key' : '';
+    const keyValue = row.idempotencyKey ? ', $15' : '';
     const result = await client.query(
       `INSERT INTO public.ventas
         (buyer_name, buyer_email, user_id, product_id, product_name, product_image,
          quantity, unit_price, total_price, units_config,
-         payment_method, payment_status, shipping_method, mp_external_reference, order_number)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pendiente', $12, $13, $14)
+         payment_method, payment_status, shipping_method, mp_external_reference, order_number${keyColumn})
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pendiente', $12, $13, $14${keyValue})
        RETURNING id`,
-      [
-        row.buyerName || null,
-        row.buyerEmail || null,
-        row.userId || null,
-        row.productId,
-        row.productName,
-        row.productImage || null,
-        row.quantity,
-        row.unitPrice,
-        row.totalPrice,
-        JSON.stringify(row.unitsConfig || []),
-        row.paymentMethod,
-        row.shippingMethod || null,
-        row.mpExternalReference || null,
-        row.orderNumber ?? null,
-      ]
+      values
     );
     return result.rows[0].id;
   }

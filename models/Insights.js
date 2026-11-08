@@ -20,7 +20,7 @@ const TODAY_START_SQL = "(date_trunc('day', now() AT TIME ZONE $1) AT TIME ZONE 
 // WhatsApp (el checkout abre wa.me con el pedido), así que es nuestro proxy de canal.
 const WHATSAPP_PAYMENT_METHOD = 'transfer';
 // Valor real de shipping_method para retiro en local (ver checkout y utils/labels
-// del front). Los envíos a domicilio (moto/correo) quedan fuera de esta release.
+// del front). Los envíos a domicilio (correo) quedan fuera de esta release.
 const PICKUP_SHIPPING_METHOD = 'local';
 // dispatch_status: 'pendiente' | 'en_preparacion' | 'despachado' | 'listo_para_retiro' | 'entregado'.
 // Un retiro en local sigue pendiente de entrega mientras no esté entregado (o NULL).

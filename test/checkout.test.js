@@ -268,9 +268,16 @@ describe('Entradas maliciosas en la orden (prueba 10)', () => {
   });
 
   test('NEGATIVO: en un producto sin variantes el unitsConfig del cliente no se persiste', async () => {
-    const res = await placeTransfer(validBody({ item: { unitsConfig: [{ '<img src=x>': 'x'.repeat(500) }] } }));
+    const res = await placeTransfer(validBody({ item: { unitsConfig: [{ hack: '<img src=x>' }] } }));
     assert.equal(res.statusCode, 201);
     assert.equal(insertedRow().params[9], '[]');
+  });
+
+  test('NEGATIVO: un unitsConfig con claves o valores desmedidos se corta en el borde, sin tocar la base', async () => {
+    const res = await placeTransfer(validBody({ item: { unitsConfig: [{ '<img src=x>': 'x'.repeat(500) }] } }));
+    assert.equal(res.statusCode, 400);
+    assert.equal(res.body.code, 'VALIDATION_ERROR');
+    assert.equal(pool.queries.length, 0);
   });
 
   test('POSITIVO: variantes por unidad legítimas (talle y color) se guardan como JSON', async () => {
@@ -364,39 +371,31 @@ describe('Aceptación de términos', () => {
     assert.equal(params[5], 'checkout');
   });
 
-  test('NEGATIVO: la versión la fija el servidor, aunque el body mande otra', async () => {
+  test('NEGATIVO: la versión la fija el servidor: un body que intenta mandar otra se rechaza (strict)', async () => {
     const res = await placeTransfer({ ...validBody(), termsVersion: '1999-01-01' });
-    assert.equal(res.statusCode, 201);
-    assert.equal(acceptanceRow().params[3], '2026-10-28');
+    assert.equal(res.statusCode, 400);
+    assert.equal(res.body.code, 'VALIDATION_ERROR');
+    assert.equal(acceptanceRow(), undefined);
   });
 
-  test('NEGATIVO: sin haber aceptado la versión vigente responde 409 TERMS_NOT_ACCEPTED y no reserva stock', async () => {
+  test('POSITIVO: sin haber aceptado la versión vigente igual se puede comprar, sin dejar constancia falsa', async () => {
     acceptedVersions = [];
     const res = await placeTransfer(validBody());
-    assert.equal(res.statusCode, 409);
-    assert.equal(res.body.code, 'TERMS_NOT_ACCEPTED');
-    assert.equal(res.body.currentVersion, '2026-10-28');
-    assert.equal(insertedRow(), undefined);
+    assert.equal(res.statusCode, 201);
+    assert.equal(acceptanceRow(), undefined);
   });
 
-  test('NEGATIVO: si el admin publicó una versión nueva, la aceptación de la anterior ya no alcanza', async () => {
+  test('POSITIVO: si el admin publicó una versión nueva, la compra no se bloquea ni registra la vieja', async () => {
     publishedTermsVersion = '2026-11-02';
     const res = await placeTransfer(validBody());
-    assert.equal(res.statusCode, 409);
-    assert.equal(res.body.currentVersion, '2026-11-02');
+    assert.equal(res.statusCode, 201);
+    assert.equal(acceptanceRow(), undefined);
   });
 
   test('POSITIVO: haber tildado los términos al crear la cuenta (metadato) alcanza sin otra constancia', async () => {
     acceptedVersions = [];
     const res = await placeTransfer(validBody(), { ...USER, termsVersion: '2026-10-28' });
     assert.equal(res.statusCode, 201);
-  });
-
-  test('NEGATIVO: un metadato de una versión vieja no habilita la compra', async () => {
-    acceptedVersions = [];
-    publishedTermsVersion = '2026-11-02';
-    const res = await placeTransfer(validBody(), { ...USER, termsVersion: '2026-10-28' });
-    assert.equal(res.statusCode, 409);
   });
 
   test('un fallo al guardar la constancia no corta la compra', async () => {

@@ -1,5 +1,6 @@
 const Insights = require('../models/Insights');
 const { caches, TTL } = require('../utils/cache');
+const logger = require('../utils/logger');
 
 /**
  * Endpoints de analítica del asistente del panel admin.
@@ -62,10 +63,10 @@ const ok = (res, insight, generatedAt) =>
   });
 
 const fail = (res, action) => (error) => {
-  console.error(`Error en insights/${action}:`, error.message);
+  logger.error('insights_query_failed', { action, code: error.code, error: error.message });
   return res
     .status(500)
-    .json({ success: false, message: 'No se pudo generar la consulta. Reintentá en unos segundos.' });
+    .json({ success: false, code: 'INSIGHT_FAILED', message: 'No se pudo generar la consulta. Reintentá en unos segundos.' });
 };
 
 const getLowStock = async (req, res) => {

@@ -14,11 +14,12 @@
 
 const Order = require('../models/Order');
 const mercadopago = require('../utils/mercadopago');
-const { invalidateProducts } = require('../utils/cache');
+const { flushAvailabilityChange } = require('../utils/catalogInvalidation');
 const { withTransaction } = require('../utils/transaction');
 const { PAYMENT_STATE, checkPaymentState } = require('../utils/paymentReconciliation');
 const { settleApprovedPayment, AMOUNT_MISMATCH } = require('../utils/paymentSettlement');
 const { isOrderOwnerOrAdmin } = require('../utils/orderAccess');
+const { expireReleasedPreferences } = require('./mpPreferenceExpiry');
 
 const CANCEL_OUTCOME = Object.freeze({ released: 'released', held: 'held', paid: 'paid' });
 const OUTCOME_PRIORITY = { released: 0, held: 1, paid: 2 };
@@ -43,7 +44,7 @@ const inspectPurchase = async (reference) => {
   if (state !== PAYMENT_STATE.approved) return CANCEL_OUTCOME.held;
 
   const settled = await settleApprovedPayment(payment);
-  if (settled > 0) invalidateProducts();
+  if (settled > 0) flushAvailabilityChange();
   return settled === AMOUNT_MISMATCH ? CANCEL_OUTCOME.held : CANCEL_OUTCOME.paid;
 };
 
@@ -70,7 +71,11 @@ const cancelMpOrder = async (order) => {
     if (lockedState === 'cancelled') await Order.cancelLockedPending(client, [locked]);
     return lockedState;
   });
-  if (state === 'cancelled') invalidateProducts();
+  if (state === 'cancelled') {
+    flushAvailabilityChange();
+    // Sin await: expirar el link de pago en MP no puede demorar ni romper la cancelación (no lanza).
+    expireReleasedPreferences([order.mp_preference_id]);
+  }
   return state;
 };
 
@@ -105,14 +110,19 @@ const inspectPendingPurchases = async (pending) => {
 /** Cancela las ventas liberables; si alguna se pagó entre medio, el resultado es `paid`. */
 const releasePurchases = async (orderIds) => {
   if (orderIds.length === 0) return [];
-  const { cancelled, paidMeanwhile } = await withTransaction('cancel_mp_purchases', async (client) => {
+  const { cancelled, paidMeanwhile, preferenceIds } = await withTransaction('cancel_mp_purchases', async (client) => {
     const rows = await Order.findByIdsForUpdate(client, orderIds);
+    const pending = rows.filter((row) => row.payment_status === 'pendiente');
     return {
       cancelled: await Order.cancelLockedPending(client, rows),
       paidMeanwhile: rows.some((row) => row.payment_status === 'pagado'),
+      preferenceIds: pending.map((row) => row.mp_preference_id),
     };
   });
-  if (cancelled > 0) invalidateProducts();
+  if (cancelled > 0) {
+    flushAvailabilityChange();
+    expireReleasedPreferences(preferenceIds);
+  }
   return paidMeanwhile ? [CANCEL_OUTCOME.paid] : [];
 };
 

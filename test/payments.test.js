@@ -14,7 +14,9 @@ const { mpWebhook, confirmMpPayment } = require(abs('controllers/orderController
 
 const ORDER_ID = '11111111-1111-4111-8111-111111111111';
 
-const sign = (dataId, { requestId = 'req-1', ts = '1700000000', secret = WEBHOOK_SECRET } = {}) => {
+const nowSeconds = () => String(Math.floor(Date.now() / 1000));
+
+const sign = (dataId, { requestId = 'req-1', ts = nowSeconds(), secret = WEBHOOK_SECRET } = {}) => {
   const manifest = `id:${String(dataId).toLowerCase()};request-id:${requestId};ts:${ts};`;
   const v1 = crypto.createHmac('sha256', secret).update(manifest).digest('hex');
   return { 'x-signature': `ts=${ts},v1=${v1}`, 'x-request-id': requestId };

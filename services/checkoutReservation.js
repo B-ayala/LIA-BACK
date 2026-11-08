@@ -11,11 +11,13 @@
  */
 
 const crypto = require('crypto');
+const { pool } = require('../config/database');
 const Order = require('../models/Order');
 const logger = require('../utils/logger');
-const { invalidateProducts } = require('../utils/cache');
+const { noteStockChange, flushAvailabilityChange } = require('../utils/catalogInvalidation');
 const { withTransaction, rollbackWith } = require('../utils/transaction');
 const { DEDUCT, applySizeDelta } = require('../utils/variantStock');
+const { buildRowKey, resolveExistingAttempt } = require('../utils/checkoutAttempt');
 const {
   CHECKOUT_ERROR, resolveShippingCost, planReservationLines, evaluateLine, checkExpectedTotal, roundToCents,
 } = require('../utils/checkoutRules');
@@ -29,6 +31,8 @@ const HTTP_SERVICE_UNAVAILABLE = 503;
 // conexión del pool sin beneficio (el statement_timeout general es de 10 s).
 const DEFAULT_RESERVE_LOCK_TIMEOUT_MS = 3000;
 const PG_LOCK_NOT_AVAILABLE = '55P03';
+const PG_UNIQUE_VIOLATION = '23505';
+const RESERVE_FAILED_MESSAGE = 'No se pudo registrar la orden. Intentá de nuevo.';
 const ORDER_BUSY_MESSAGE = 'Hay mucha demanda sobre este producto. Intentá de nuevo en unos segundos.';
 
 const parseLockTimeoutMs = () => {
@@ -91,9 +95,14 @@ const reserveLine = async (client, line, order) => {
     shippingMethod: order.shippingMethod,
     mpExternalReference: order.purchaseId,
     orderNumber: order.orderNumber,
+    idempotencyKey: order.idempotency ? buildRowKey(order.idempotency.key, order.idempotency.fingerprint, index) : null,
   });
   const nextVariants = applySizeDelta(product.variants, evaluation.units, DEDUCT);
   if (nextVariants) await Order.setVariants(client, productId, nextVariants);
+  noteStockChange(
+    { stock: product.stock, variants: product.variants },
+    { stock: product.stock == null ? null : product.stock - item.quantity, variants: nextVariants || product.variants }
+  );
 
   return {
     ok: true,
@@ -109,7 +118,29 @@ const reserveLine = async (client, line, order) => {
   };
 };
 
+/** Intento previo con la misma key: lo reenvía, lo rechaza o libera su key si ya murió. */
+const resolvePreviousAttempt = async (client, order) => {
+  const { key, fingerprint } = order.idempotency;
+  const rows = await Order.findByIdempotencyKey(client, order.buyer.userId, key);
+  const previous = resolveExistingAttempt(rows, fingerprint);
+  if (previous === null) return null;
+  if (previous.action === 'release') {
+    await Order.clearIdempotencyKey(client, previous.ids);
+    return null;
+  }
+  if (previous.action === 'fail') return rollbackWith(previous.failure);
+  logger.info('order_idempotent_replay', { userId: order.buyer.userId, orders: previous.orderIds.length });
+  return { ok: true, replayed: true, ...previous, shippingCost: order.surcharge };
+};
+
 const reserveLines = async (client, lines, order) => {
+  // Primero el lock del usuario: lo que sigue (intento previo, tope de pendientes) lee estado que
+  // otra request del mismo usuario podría estar cambiando justo ahora.
+  await Order.lockUserCheckout(client, order.buyer.userId);
+  if (order.idempotency) {
+    const previous = await resolvePreviousAttempt(client, order);
+    if (previous) return previous;
+  }
   const blocked = await checkPendingLimit(client, order.buyer.userId, lines);
   if (blocked) return rollbackWith(blocked);
 
@@ -139,6 +170,19 @@ const reserveLines = async (client, lines, order) => {
 };
 
 /**
+ * Red de seguridad: con el lock por usuario el índice único `(user_id, idempotency_key)` no debería
+ * saltar, pero es la garantía final. La transacción ya hizo ROLLBACK (el stock que descontó el trigger
+ * volvió y no quedó ninguna venta), así que se lee el intento que ganó y se reenvía.
+ */
+const replayAfterConflict = async (userId, idempotency, surcharge) => {
+  const rows = await Order.findByIdempotencyKey(pool, userId, idempotency.key);
+  const previous = resolveExistingAttempt(rows, idempotency.fingerprint);
+  if (previous && previous.action === 'replay') return { ok: true, replayed: true, ...previous, shippingCost: surcharge };
+  if (previous && previous.action === 'fail') return previous.failure;
+  return { ok: false, status: HTTP_SERVER_ERROR, code: 'ORDER_RESERVE_FAILED', message: RESERVE_FAILED_MESSAGE };
+};
+
+/**
  * Reserva el stock e inserta las ventas pendientes en una única transacción corta.
  * Para Mercado Pago genera el id de compra (`mp_external_reference`) y lo guarda en
  * la MISMA transacción, antes del COMMIT.
@@ -148,9 +192,9 @@ const reserveLines = async (client, lines, order) => {
  *   productId?: string|null, size?: string}>}
  */
 const reserveOrders = async ({
-  buyerName, buyerEmail, userId, items, shippingMethod, shippingCost, paymentMethod, expectedTotal,
+  buyerName, buyerEmail, userId, items, shippingMethod, paymentMethod, expectedTotal, idempotency = null,
 }) => {
-  const shipping = resolveShippingCost(shippingMethod, shippingCost);
+  const shipping = resolveShippingCost(shippingMethod);
   if (!shipping.ok) {
     return { ok: false, status: HTTP_BAD_REQUEST, code: CHECKOUT_ERROR.invalidShipping, message: shipping.message };
   }
@@ -163,6 +207,7 @@ const reserveOrders = async ({
     paymentMethod,
     shippingMethod,
     expectedTotal,
+    idempotency,
     purchaseId: paymentMethod === 'mp' ? crypto.randomUUID() : null,
   };
   try {
@@ -171,9 +216,10 @@ const reserveOrders = async ({
       (client) => reserveLines(client, plan.lines, order),
       { lockTimeoutMs: RESERVE_LOCK_TIMEOUT_MS }
     );
-    if (result.ok) invalidateProducts();
+    if (result.ok && !result.replayed) flushAvailabilityChange();
     return result;
   } catch (error) {
+    if (error.code === PG_UNIQUE_VIOLATION && idempotency) return replayAfterConflict(userId, idempotency, shipping.cost);
     if (error.code === PG_LOCK_NOT_AVAILABLE) {
       logger.warn('order_reserve_lock_timeout', { paymentMethod });
       return { ok: false, status: HTTP_SERVICE_UNAVAILABLE, code: 'ORDER_BUSY', message: ORDER_BUSY_MESSAGE };
@@ -183,7 +229,7 @@ const reserveOrders = async ({
       ok: false,
       status: HTTP_SERVER_ERROR,
       code: 'ORDER_RESERVE_FAILED',
-      message: 'No se pudo registrar la orden. Intentá de nuevo.',
+      message: RESERVE_FAILED_MESSAGE,
     };
   }
 };
@@ -198,9 +244,15 @@ const releaseOrders = async (orderIds) => {
   try {
     const released = await withTransaction('release_orders', async (client) => {
       const rows = await Order.findByIdsForUpdate(client, orderIds);
+      // El intento nunca se completó (ej. MP caído): se libera su key para que el reintento
+      // con la misma Idempotency-Key pueda reservar de nuevo en vez de chocar con una venta cancelada.
+      const pendingIds = rows
+        .filter((row) => row.payment_status === 'pendiente' && row.idempotency_key)
+        .map((row) => String(row.id));
+      await Order.clearIdempotencyKey(client, pendingIds);
       return Order.cancelLockedPending(client, rows);
     });
-    if (released > 0) invalidateProducts();
+    if (released > 0) flushAvailabilityChange();
   } catch (error) {
     logger.error('order_release_failed', { orderIds, code: error.code, message: error.message });
   }

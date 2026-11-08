@@ -5,7 +5,9 @@
 // amplificando la carga justo cuando la dependencia está mal.
 //
 // Estados:
-//  - cerrado: todo pasa; los fallos consecutivos se cuentan.
+//  - cerrado: todo pasa; los fallos consecutivos se cuentan. Con `slowCallMs`, una llamada que TERMINA
+//    bien pero tarda al menos ese tiempo también cuenta como fallo: latencia alta sostenida (mismo
+//    umbral de fallos seguidos) abre el circuito antes de que empiece a vencer por timeout.
 //  - abierto: tras `failureThreshold` fallos seguidos, rechaza al instante
 //    (`CIRCUIT_OPEN`) durante `openMs`.
 //  - semiabierto: vencido `openMs`, deja pasar UNA request de prueba; si sale
@@ -17,7 +19,7 @@ const logger = require('./logger');
 
 const CIRCUIT_OPEN_CODE = 'CIRCUIT_OPEN';
 
-const createCircuitBreaker = ({ name, failureThreshold, openMs, isFailure, now = Date.now }) => {
+const createCircuitBreaker = ({ name, failureThreshold, openMs, isFailure, slowCallMs = null, now = Date.now }) => {
   let consecutiveFailures = 0;
   let openedAt = null;
   let probeInFlight = false;
@@ -48,19 +50,25 @@ const createCircuitBreaker = ({ name, failureThreshold, openMs, isFailure, now =
     return error;
   };
 
+  const recordFailure = (isProbe) => {
+    consecutiveFailures += 1;
+    if (isProbe || consecutiveFailures >= failureThreshold) open();
+  };
+
   const execute = async (operation) => {
     const isProbe = isOpen();
     if (isProbe && !isAvailable()) throw rejectFast();
     if (isProbe) probeInFlight = true;
+    const startedAt = now();
 
     try {
       const result = await operation();
-      close();
+      if (slowCallMs !== null && now() - startedAt >= slowCallMs) recordFailure(isProbe);
+      else close();
       return result;
     } catch (error) {
       if (isFailure(error)) {
-        consecutiveFailures += 1;
-        if (isProbe || consecutiveFailures >= failureThreshold) open();
+        recordFailure(isProbe);
       } else {
         // Un rechazo "normal" (4xx) prueba que la dependencia responde.
         close();

@@ -96,13 +96,14 @@ lia-store/
 ├── middleware/
 │   ├── authMiddleware.js       # verifica el token contra Supabase (con caché corta) + adminMiddleware
 │   ├── rateLimit.js            # límites por endpoint (ventana deslizante) con headers estándar
-│   ├── concurrencyLimit.js     # un bulkhead por carril (read/auth/checkout/admin/webhook) + cola con timeout → 503
+│   ├── concurrencyLimit.js     # un bulkhead por carril (read/auth/admin/checkout/local/webhook) + presupuesto de conexiones compartido (`general`) + cola con timeout → 503
 │   ├── requestObserver.js      # X-Request-Id, latencia por ruta (p50/p95/p99) y log de requests lentas/5xx
 │   ├── proxyDiagnostic.js      # loguea al arrancar los saltos de X-Forwarded-For (verifica `trust proxy`)
 │   ├── httpCache.js            # Cache-Control público / no-store
 │   ├── securityHeaders.js      # CSP/HSTS/nosniff/X-Frame-Options en toda respuesta
 │   ├── requestDeadline.js      # corta con 503 REQUEST_TIMEOUT una request que no responde en 25 s (no se monta en /api/orders)
 │   ├── validateBody.js         # validación de body con Zod
+│   ├── validateQuery.js        # query string con Zod → req.validatedQuery (400 VALIDATION_ERROR)
 │   └── validateParams.js       # :id de orden (uuid) y de producto (dígitos) → 400 si no cumple
 │
 ├── services/                  # Casos de uso (sin req/res) y tareas periódicas
@@ -126,8 +127,13 @@ lia-store/
 │   ├── lookupRotation.js      # rotación en memoria de consultas a MP por referencia
 │   ├── concurrency.js         # mapWithConcurrency
 │   ├── productUpdateQuery.js  # UPDATE parcial de productos (+ expectedUpdatedAt)
+│   ├── productPublishing.js   # regla de publicación: qué exige un producto activo
+│   ├── productSqlFragments.js # SQL común de productos (texto limpio, stock por talle, binder de parámetros)
+│   ├── adminProductQuery.js   # SQL del listado admin (filtros, stock efectivo, orden)
+│   ├── catalogProductQuery.js # SQL del catálogo público (activos, talle/color, precio efectivo, facets)
+│   ├── catalogFacets.js       # orden de los facets (talles XS<S<M…, colores)
 │   ├── cloudinaryDestroy.js   # borrado de un asset de Cloudinary
-│   ├── idempotency.js         # Idempotency-Key: replay del 201 (memoria + base, fail-open)
+│   ├── idempotency.js         # Idempotency-Key: replay del 201 (memoria + idempotency_keys, fail-open; la verdad está en ventas.idempotency_key)
 │   ├── logger.js              # logs estructurados JSON, nivelados por LOG_LEVEL
 │   └── mercadopago.js         # cliente de la API de Mercado Pago
 │
@@ -202,16 +208,28 @@ config/database.js → Pool de conexiones pg
 ### 5.2 Productos — `/api/products` (`productRoutes.js` → `productController.js`)
 | Método | Ruta | Auth | Descripción |
 |---|---|---|---|
-| GET | `/api/products` | pública | Lista paginada (`?limit&offset`, máx 100), `ORDER BY created_at DESC`. |
-| GET | `/api/products/:id` | pública | Producto por id. `:id` no numérico → **400 `INVALID_PRODUCT_ID`**. |
-| POST | `/api/products` | **Bearer + admin** | Crea producto. Requiere `name` y `price`. |
-| PUT | `/api/products/:id` | **Bearer + admin** | Update dinámico (solo campos presentes: sin `stock` en el body, la columna `stock` no se toca). `expectedUpdatedAt` (el `updated_at` que leyó el admin, ISO con microsegundos) es **obligatorio si el body trae `stock` o `variants`** (400 `VALIDATION_ERROR` si falta) y opcional en el resto: si no coincide con el actual → **409 `PRODUCT_CHANGED`** sin modificar nada (comparación atómica en el mismo UPDATE). |
+| GET | `/api/products` | pública | Lista paginada (`?limit&offset`, máx 100), `ORDER BY created_at DESC`. `Cache-Control: public, max-age=10, stale-while-revalidate=30`. |
+| GET | `/api/products/admin/list` | **Bearer + admin** | Listado del panel admin con filtros, orden y paginación en el servidor (incluye inactivos; sin caché; 120 req/min). Query estricto (400 `VALIDATION_ERROR`; vacío = sin filtro): `q` (≤ 100, substring del nombre sin distinguir mayúsculas; `%`/`_`/`` literales), `category` (igualdad exacta sobre la categoría normalizada: trim + espacios colapsados + 1ª mayúscula), `status` (`active`/`inactive`; NULL cuenta como `active`), `stock` (`in_stock` >0, `low_stock` 1–5, `out_of_stock` =0 sobre el stock efectivo: suma de `stockByOption` de la 1ª variante Talle si tiene valores numéricos, si no la columna `stock`), `sort` (`name`/`price`/`stock`/`category` × `_asc`/`_desc`; sin `sort` = `created_at DESC, id DESC`; texto en orden de code units, NULL al final; desempate `created_at DESC, id DESC`), `page` (default 1, máx 100000), `limit` (default 5, máx 50). Respuesta `{ success, items, total, page, limit, totalPages, facets: { categories } }`: `items` son filas de `productos` en snake_case con las columnas del listado admin (sin `public_id`/`created_at`; el front las mapea con `mapAdminProductRow`), `facets.categories` las categorías normalizadas distintas de TODO el catálogo (sin filtrar). Página fuera de rango → `items: []` con el `total` real. SQL en `utils/adminProductQuery.js`. |
+| GET | `/api/products/catalog` | pública (anónima: ignora el token, **nunca** devuelve inactivos) | Catálogo de la tienda con filtros, orden y paginación en el servidor. Solo `status = 'active'` (un `status` NULL no se publica, igual que el filtro que usaba el front; `GET /api/products` sí lo cuenta como activo). 600 req/min por IP **y además un límite propio de 120 req/min por IP** (`products-catalog`: cada combinación de filtros es una clave de caché y, en frío, dos consultas); `Cache-Control: public, max-age=10` **sin `stale-while-revalidate`** + ETag (304 sin cuerpo; la URL completa, query string incluido, es la clave del caché HTTP). Caché de servidor en tres partes (todas LRU con tope): páginas con resultados (`catalog`, 200 entradas, `TTL.products` = 20 s), facets por categoría (`catalogFacets`, 100 entradas, 60 s: dependen solo de la categoría) y consultas SIN resultados (`catalogMisses`, 100 entradas, 10 s: una categoría inventada no ocupa lugar en la caché de páginas). Página y facets se piden **en serie** (una conexión del pool a la vez). La caché se vacía por completo en cambios del admin (alta, edición, borrado de producto) y cuando un movimiento de stock agota o revive un producto o un talle; una reserva o liberación común NO la vacía, así que el stock numérico visible puede atrasarse hasta ~20 s en el servidor más 10 s en el navegador/CDN (peor caso ≈ 30 s). Query estricto (400 `VALIDATION_ERROR` con `details[].field`; vacío = sin filtro; desconocido, `sort`/`offset`/`limit` repetidos o con forma de objeto = 400): `category` (nombre; **repetir el parámetro** para varios: `?category=Ropa&category=Remeras`, máx 40 de ≤ 100 caracteres; igualdad sin distinguir mayúsculas sobre el texto con trim y espacios colapsados; no se parte por comas), `size` y `color` (repetibles, máx 12 de ≤ 20 / ≤ 40; OR entre los valores de un mismo parámetro, AND entre parámetros), `sort` (`newest` default = `created_at DESC, id DESC`; `price_asc`, `price_desc`, `name_asc`, `name_desc`; el orden por nombre ignora mayúsculas y tildes; desempate siempre `created_at DESC, id DESC`), `offset` (default 0, máx **2400** = 100 páginas de 24; no se exige múltiplo de `limit` porque el front pide con `offset` = filas ya recibidas) y `limit` (default 24, máx 48). **Precio de orden** = el que ve y paga el cliente (`resolveUnitPrice`): `price` si hay `original_price` mayor (el tachado es solo referencia); si no, `price` con `discount` % aplicado y redondeado a centavos. No usa `transfer_price`. **Talle**: variante cuyo nombre empieza con "talle" (la primera con opciones); un talle cuenta si tiene stock > 0 en `stockByOption`; si el producto no lleva stock por talle (ningún número en `stockByOption`) sus talles valen lo que la columna `stock`; con stock por talle, una opción sin número = sin stock. Sin variante de talle, el producto no matchea ningún `size`. Se compara en mayúsculas. **Color**: sin distinguir mayúsculas; los colores de un talle son `colorsByOption[talle]` (en la variante de talle) y, si ese talle no tiene, las opciones de la variante `Color`. Un color matchea solo si lo ofrece algún talle con stock; con `size` y `color` juntos exige la MISMA combinación ("M y Rojo" = M con stock en Rojo). Respuesta `{ success, items, hasMore, facets: { sizes, colors } }`: `items` son filas de `productos` en snake_case con exactamente `id, name, price, original_price, transfer_price, image_url, images, category, discount, stock, hover_image_enabled, card_options, variants` (los numéricos salen como número; `id` como string, igual que el resto de la API; `variants` completo), listas para `mapDbRowToProduct`. `hasMore` sale de pedir `limit + 1` filas (sin COUNT). `facets` = talles (mayúsculas; XS<S<M<L…, luego numéricos) y colores (alfabético) con stock del conjunto filtrado SOLO por categoría (no por `size`/`color`), para poblar los selectores. SQL en `utils/catalogProductQuery.js` (fragmentos comunes con el listado admin en `utils/productSqlFragments.js`). |
+| GET | `/api/products/:id` | pública | Producto por id. `:id` no numérico → **400 `INVALID_PRODUCT_ID`**. `Cache-Control: public, max-age=5` sin `stale-while-revalidate` (es donde se decide comprar; peor caso de atraso del stock ≈ 5 s + 20 s del servidor). |
+| POST | `/api/products` | **Bearer + admin** | Crea producto. Requiere `name` y `price`. Si queda `active` (o sin `status`), exige además categoría, foto, color y talle con stock: si falta algo → **400 `PRODUCT_INCOMPLETE`** (ver regla de publicación abajo). |
+| PUT | `/api/products/:id` | **Bearer + admin** | Update dinámico (solo campos presentes: sin `stock` en el body, la columna `stock` no se toca). `expectedUpdatedAt` (el `updated_at` que leyó el admin, ISO con microsegundos) es **obligatorio si el body trae `stock` o `variants`** (400 `VALIDATION_ERROR` si falta) y opcional en el resto: si no coincide con el actual → **409 `PRODUCT_CHANGED`** sin modificar nada (comparación atómica en el mismo UPDATE). Si el producto resultante queda `active` e incompleto → **400 `PRODUCT_INCOMPLETE`** y rollback. |
 | DELETE | `/api/products/:id` | **Bearer + admin** | Borra el producto y después su imagen en Cloudinary (best-effort). Con ventas `pendiente` del producto → **409 `PRODUCT_HAS_PENDING_ORDERS`** (no borra). |
 
 Body de create/update (camelCase → columnas snake_case): `name`, `price`, `stock`, `category`,
 `imageUrl`/`images[]` (se sincroniza `image_url` con la primera), `publicId`, `description`,
 `discount` (admite null), `condition` (`new`/`used`), `freeShipping`, `variants`,
 `specifications`, `features`, `faqs` (JSONB), `warranty`, `returnPolicy`, `status`.
+
+**Regla de publicación** (`utils/productPublishing.js`, misma regla que el front): `inactive` es un
+borrador y no exige nada más que el schema. Un producto `active` (o con `status` NULL) tiene que
+tener categoría, al menos una foto (`images[]` o `image_url`), al menos un color (variante `Color`
+con opciones o `colorsByOption` en algún talle) y una variante de talle con stock total > 0. Se
+valida la fila **ya escrita** (`RETURNING *`) dentro de la transacción de `Product.create` /
+`Product.update`, así que cubre los updates parciales; si falta algo se hace rollback y se responde
+**400 `PRODUCT_INCOMPLETE`** con `details[0].field` = `category` | `images` | `color` | `sizes` | `stock`.
+Las compras no pasan por acá: un producto activo puede quedar sin stock por ventas (se muestra
+"Sin stock"), y para volver a editarlo hay que reponer un talle o pasarlo a `inactive`.
 
 ### 5.2b Talles — `/api/sizes` (`sizeRoutes.js` → `sizeController.js`)
 | Método | Ruta | Auth | Descripción |
@@ -225,10 +243,10 @@ No hay DELETE: se desactiva con `active: false`. El catálogo se usa desde la gu
 ### 5.3 Órdenes y pagos — `/api/orders` (`orderRoutes.js` → `orderController.js`)
 | Método | Ruta | Auth | Descripción |
 |---|---|---|---|
-| POST | `/api/orders/mp-webhook` | pública (server a server) | Notificación de Mercado Pago; verifica el pago contra la API de MP y marca las ventas. Rate limit 240/min. |
+| POST | `/api/orders/mp-webhook` | pública (server a server) | Notificación de Mercado Pago; verifica el pago contra la API de MP y marca las ventas. Rate limit 240/min. **Firma**: con `MP_WEBHOOK_SECRET` se valida `x-signature` (HMAC) y su `ts` debe tener ≤ 5 min de antigüedad (también si viene del futuro más que eso) → si no, **401 `INVALID_SIGNATURE`**. **Sin `MP_WEBHOOK_SECRET` y `NODE_ENV=production` falla cerrado: 401 `WEBHOOK_NOT_CONFIGURED`** (alerta `mp_webhook_secret_missing` una vez por proceso; los pagos igual se confirman por `mp-confirm` y por el sweep). En desarrollo/test sin secreto sigue permisivo con el warning `mp_webhook_unsigned_allowed`. |
 | POST | `/api/orders/transfer` | **Bearer** | Crea la orden por transferencia bancaria (el trigger de la BD descuenta stock). Errores de stock: ver abajo. |
 | POST | `/api/orders/mp-preference` | **Bearer** | Valida stock con `SELECT … FOR UPDATE`, inserta ventas `pendiente` y crea la preferencia MP (`init_point`, `order_ids`). Errores de stock: ver abajo; **503** sin `MP_ACCESS_TOKEN`; **502 `MP_UNAVAILABLE`** si MP no responde (se libera la reserva). |
-| POST | `/api/orders/mp-confirm` | **Bearer** | Confirma el pago verificándolo contra la API de MP (no confía en la URL de retorno) y **compara el monto acreditado** con el total de las órdenes: si no coincide, **409 `AMOUNT_MISMATCH`** y las ventas quedan `review_reason='amount_mismatch'`. `orders_paid` = ventas realmente pasadas a `pagado` en esta llamada (0 si ya estaban pagadas). |
+| POST | `/api/orders/mp-confirm` | **Bearer** | Confirma el pago verificándolo contra la API de MP (no confía en la URL de retorno) y **compara el monto acreditado** con el total de las órdenes: si no coincide, **409 `AMOUNT_MISMATCH`** y las ventas quedan `review_reason='amount_mismatch'`. `orders_paid` = ventas realmente pasadas a `pagado` en esta llamada (0 si ya estaban pagadas). **Solo salda pagos de compras propias**: si alguna venta del `external_reference` del pago no es del usuario (mismo email que el comprador) ni de un admin → **403 `FORBIDDEN`** y no se salda nada (IDOR). |
 | POST | `/api/orders/mp-cancel` | **Bearer** | Body `{ orderIds: string[] }` (1..50 uuids; si no → **400 `INVALID_ORDER_IDS`**). Cancela las compras MP de esas ventas consultando a MP **una vez por compra** (`mp_external_reference`) antes de abrir la transacción. `200 { success: true, outcome }` con `outcome` ∈ `released` (canceló y devolvió stock, o ya estaba cancelada/expirada) · `held` (pago en curso o MP no respondió: no cancela) · `paid` (pago aprobado: se salda, no cancela); agregado con precedencia `paid > held > released`. Alguna venta ajena (y no admin) → **403 `FORBIDDEN`** sin tocar nada; ids inexistentes se ignoran. Rate limit de mutaciones. |
 | GET | `/api/orders/user?email=` | **Bearer** | Compras del usuario: `pagado` + transferencias con comprobante avisado (`origin='wa_confirmado'`, cualquier `payment_status`). Solo el dueño o un admin (ajeno → **403**). |
 | POST | `/api/orders/nudge` | **Bearer** | Registra el recordatorio de pago pendiente. `orderIds` deben ser uuids (si no → **400 `INVALID_ORDER_IDS`**). |
@@ -259,9 +277,10 @@ mismo `SELECT … FOR UPDATE` que bloquea el stock y recalcula `unit_price`/`tot
 sea menor (`resolvePaymentUnitPrice`, espejo de `getTransferUnitPrice` del front); Mercado Pago
 siempre cobra el precio de lista. El medio lo define la ruta, no un campo del body. El
 `totalPrice` del body no decide el cobro: solo se compara con el total calculado y, si difiere en
-un solo centavo, responde 409 `PRICE_CHANGED`. Los precios con descuento se redondean a centavos. El costo de envío se valida
-contra la tarifa de `shippingController` (`local` 0, `correo` `CORREO_COST`, `moto` variable
-acotado). Un ítem sin `productId` se rechaza con 400: sin producto no hay precio verificable.
+un solo centavo, responde 409 `PRICE_CHANGED`. Los precios con descuento se redondean a centavos. El costo de envío lo impone el
+servidor desde la tarifa de `shippingController` (`local` 0, `correo` `CORREO_COST`); el método de
+envío es una whitelist estricta (`Object.hasOwn`) y cualquier otro valor responde 400
+`INVALID_SHIPPING`. El body se valida con Zod strict (`schemas/checkoutSchema.js`) antes de tomar locks. Un ítem sin `productId` se rechaza con 400: sin producto no hay precio verificable.
 También salen de la base **el nombre y la imagen** de la venta y del ítem de MP (`productos.name` y
 la primera de `images`, o `image_url`); `productName`/`productImage` del body se ignoran. La
 selección de variantes (`unitsConfig`) se valida contra las variantes reales y se guarda saneada
@@ -269,9 +288,9 @@ selección de variantes (`unitsConfig`) se valida contra las variantes reales y 
 (`req.user.email`); el del body solo se usa si la sesión no trae email. Los productos se bloquean
 en orden de `productId`.
 
-Rate limits: checkout 12/min (`transfer`, `mp-preference`), mutaciones 40/min. Todo `no-store`.
+Rate limits: checkout 12/min (`transfer`, `mp-preference`), mutaciones 40/min. Todo `no-store`. Carriles de concurrencia: `transfer` y `nudge` (no llaman a Mercado Pago) van al carril `local`; `mp-preference`, `mp-confirm`, `mp-cancel` y `/:id/cancel` al carril `checkout`; `mp-webhook` al `webhook`; los `PATCH` de admin al `admin`; los `GET` al `read`. Al cancelar una compra de MP (`mp-cancel`, `/:id/cancel`), si ya no queda ninguna venta pendiente de esa preferencia se la **expira en Mercado Pago** (`PUT /checkout/preferences/{id}`, timeout 4 s, sin esperar la respuesta y sin afectar la cancelación si falla; log `mp_preference_expired` / `mp_preference_expire_failed`). ⚠️ Esa llamada no se pudo validar contra Mercado Pago real.
 
-`transfer` y `mp-preference` aceptan `Idempotency-Key` (replay del `201`; misma key con otro carrito → **422**, key inválida → **400**). Detalle en `docs/flows/flow-checkout.md`.
+`transfer` y `mp-preference` aceptan `Idempotency-Key`, respaldada por `ventas.idempotency_key` (índice único por usuario) y un advisory lock por usuario: replay del `201` mientras la orden siga pendiente; misma key con otro carrito → **422**; key inválida → **400**; orden ya pagada → **409** `CHECKOUT_ATTEMPT_CLOSED`; cancelada o vencida → intento nuevo. Ese mismo lock hace atómico el tope de reservas pendientes por usuario. Detalle en `docs/flows/flow-checkout.md`.
 Además, `server.js` corre `expireStaleOrders` (`services/orderMaintenance.js`) cada 60 s: expira
 pendientes vencidas (MP 15 min tras consultar a MP, con retención de hasta 24 h si hay un pago en
 curso; transferencia 5 h) y restaura stock; cada 15 min concilia compras MP cerradas de las últimas
@@ -331,9 +350,14 @@ Rate limit 60/min: cada request consume cuota de la API de Cloudinary.
   responde **503**; token ausente o inválido → **401**.
 - **Caché de verificación**: el resultado se cachea por `CACHE_TTL_AUTH_SECONDS` (30 s por
   defecto, `0` desactiva) bajo una clave **SHA-256 del token** (nunca el token en claro), con
-  single-flight para no disparar N verificaciones del mismo token en paralelo. Solo se cachean
-  verificaciones exitosas. **Trade-off explícito**: un token revocado puede seguir siendo
-  aceptado hasta que expire el TTL.
+  single-flight para no disparar N verificaciones del mismo token en paralelo. La caché de sesiones
+  admite 5000 entradas (LRU). **Caché negativa** (`caches.authRejected`, 5000 entradas, 45 s,
+  `CACHE_TTL_AUTH_REJECTED_SECONDS`): un token que Supabase rechazó con un 4xx no se vuelve a
+  consultar durante ese lapso (también en `optionalAuth` de las rutas públicas). Una falla de
+  infraestructura (timeout, red, 5xx o 429 de Supabase) NO se cachea ni se toma por token inválido:
+  responde 503 `AUTH_UNAVAILABLE` (o sigue anónimo en `optionalAuth`). Un token vacío, con espacios
+  o caracteres de control, de más de 4096 caracteres o con `exp` vencido se descarta sin consultar.
+  **Trade-off explícito**: un token revocado puede seguir siendo aceptado hasta que expire el TTL.
 - **`adminMiddleware`**: debe ir después de `authMiddleware`; exige `req.user.role === 'admin'`
   (403 si no).
 - **Cobertura**: la cadena protege las escrituras de productos, **todo** el router de usuarios
@@ -397,7 +421,7 @@ de Supabase Auth y para el login.
 | `MP_ACCESS_TOKEN` | ✅ (Mercado Pago) | **Secreto.** Sin ella, `/api/orders/mp-*` responde **503**; la transferencia bancaria sigue funcionando. |
 | `MP_WEBHOOK_URL` | — | URL pública del webhook (`https://…/api/orders/mp-webhook`). En local no aplica salvo que expongas el backend por túnel. |
 | `ORDER_SWEEP_MAX_MP_LOOKUPS` | — (default `10`) | Tope de consultas a MP por ciclo del sweep de pendientes vencidas (4 en paralelo). |
-| `MP_WEBHOOK_SECRET` | — (recomendada en prod) | **Secreto.** Firma del webhook (panel MP → Webhooks). Si está, se valida `x-signature` y se rechaza con **401** lo que no cuadre; si falta, el webhook igual revalida cada pago contra la API de MP. |
+| `MP_WEBHOOK_SECRET` | — (**obligatoria en producción**) | **Secreto.** Firma del webhook (panel MP → Webhooks). Si está, se valida `x-signature` (HMAC y `ts` de ≤ 5 min) y se rechaza con **401** lo que no cuadre. Si falta con `NODE_ENV=production`, el webhook rechaza TODO con 401 `WEBHOOK_NOT_CONFIGURED`; fuera de producción sigue permisivo (revalida cada pago contra la API de MP). |
 
 ### 8.1 Concurrencia, carga y caché (opcionales)
 
@@ -412,14 +436,19 @@ Detalle del mecanismo en [`docs/flows/flow-concurrencia-carga.md`](docs/flows/fl
 | `DB_CONNECTION_TIMEOUT_MS` | `5000` | Espera máxima por una conexión del pool. |
 | `DB_STATEMENT_TIMEOUT_MS` | `10000` | Corta queries colgadas del lado del servidor Postgres. |
 | `DB_QUERY_TIMEOUT_MS` | `10000` | Ídem del lado del cliente `pg`. |
-| `BULKHEAD_<CARRIL>_MAX` / `_QUEUE` | `read`: `DB_POOL_MAX` / 200 · `auth`: 6 / 50 · `checkout`: 6 / 50 · `admin`: 4 / 20 · `webhook`: 4 / 50 | Handlers simultáneos y cola de cada carril del bulkhead. Al llenarse la cola se responde **503 + `Retry-After`**. |
-| `MAX_CONCURRENT_REQUESTS` / `MAX_QUEUED_REQUESTS` | `DB_POOL_MAX` / `200` | Valores del carril `read` (compatibilidad con el bulkhead único anterior). |
+| `BULKHEAD_<CARRIL>_MAX` / `_QUEUE` | `read`: 6 / 200 · `auth`: 3 / 50 · `admin`: 3 / 20 · `checkout` (con Mercado Pago): 4 / 50 · `local` (transferencia y nudge, sin MP): 2 / 50 · `webhook`: 3 / 50 | Handlers simultáneos y cola de cada carril del bulkhead. Al llenarse la cola se responde **503 + `Retry-After`**. **Regla**: un slot de `read`/`admin` usa como máximo una conexión del pool a la vez, y `read`+`auth`+`admin` comparten un presupuesto de conexiones (`BULKHEAD_GENERAL_MAX`, por defecto `DB_POOL_MAX - BULKHEAD_CRITICAL_DB_RESERVE`) para que checkout, órdenes locales y webhook siempre encuentren conexión libre aunque el tráfico público sature. |
+| `BULKHEAD_CRITICAL_DB_RESERVE` | `5` | Conexiones del pool reservadas a `checkout`/`local`/`webhook`; el grupo `general` (`read`+`auth`+`admin`) puede usar `DB_POOL_MAX` menos esto (mínimo 2). |
+| `BULKHEAD_GENERAL_MAX` | `DB_POOL_MAX - BULKHEAD_CRITICAL_DB_RESERVE` | Tope conjunto del grupo `general`. Aparece en `/health` como carril `general`. |
+| `MAX_CONCURRENT_REQUESTS` / `MAX_QUEUED_REQUESTS` | `6` / `200` | Valores del carril `read` (compatibilidad con el bulkhead único anterior). |
 | `QUEUE_TIMEOUT_MS` | `8000` | Espera máxima en cola (todos los carriles) antes de devolver 503. |
 | `SLOW_REQUEST_MS` | `1000` | Umbral para loguear una request como lenta. |
 | `ACCESS_LOG_ALL` | `false` | `true` loguea todas las requests (solo para una prueba de carga puntual). |
-| `CACHE_TTL_PRODUCTS_SECONDS` | `20` | Caché del catálogo. `0` la desactiva. Se invalida sola ante cambios de producto/stock. |
+| `CACHE_TTL_PRODUCTS_SECONDS` | `20` | Caché del catálogo. `0` la desactiva. Se vacía en cambios del admin y cuando un movimiento de stock agota/revive un producto o talle; las reservas comunes no la vacían (el stock numérico puede atrasarse hasta este TTL). |
+| `CACHE_TTL_CATALOG_FACETS_SECONDS` | `60` | Caché de talles/colores por categoría del catálogo. |
+| `CACHE_TTL_CATALOG_MISSES_SECONDS` | `10` | Caché de consultas del catálogo sin resultados. |
 | `CACHE_TTL_INSIGHTS_SECONDS` | `60` | Caché de la analítica admin. |
 | `CACHE_TTL_AUTH_SECONDS` | `30` | Caché de verificación de token. ⚠️ Un token revocado sigue siendo válido como máximo este tiempo. |
+| `CACHE_TTL_AUTH_REJECTED_SECONDS` | `45` | Caché negativa: cuánto se recuerda que Supabase rechazó un token (por hash). `0` la desactiva. |
 | `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error`. |
 
 `GET /health` expone en vivo el estado del pool, de cada carril del bulkhead, del rate limit, de las cachés, del circuito de Mercado Pago y las latencias por ruta.
@@ -507,7 +536,9 @@ El frontend vive en `../../FRONT/damiana-bella` (repo git propio) y apunta acá 
 - **`login` valida credenciales** contra Supabase Auth (`grant_type=password`).
 - **`.env.example` con placeholders**, sin credenciales reales.
 - **Rate limiting por endpoint** con ventana deslizante y headers estándar (`middleware/rateLimit.js`),
-  más estricto en login (10/min) y checkout (12/min).
+  más estricto en login (10/min) y checkout (12/min). El store tiene tope duro de 20 000 claves
+  (descarta la más antigua al llenarse), agrupa las IPv6 por /64 y el log de bloqueo
+  (`rate_limit_blocked`) lleva un hash de la clave, no la IP ni el id de usuario.
 - **Logs estructurados** (`utils/logger.js`) sin tokens ni PII; la caché de auth indexa por
   SHA-256 del token.
 - **SQL parametrizado** en todas las queries; transacciones y `FOR UPDATE` en el stock.
@@ -517,8 +548,8 @@ El frontend vive en `../../FRONT/damiana-bella` (repo git propio) y apunta acá 
 
 - **Headers de seguridad** en toda respuesta (`middleware/securityHeaders.js`): CSP restrictiva,
   `nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy`, CORP y HSTS cuando se sirve por HTTPS.
-- **Firma del webhook de MP** verificada con HMAC-SHA256 y comparación en tiempo constante
-  cuando `MP_WEBHOOK_SECRET` está configurada.
+- **Firma del webhook de MP** verificada con HMAC-SHA256, comparación en tiempo constante y
+  antigüedad máxima de 5 min del `ts`; sin `MP_WEBHOOK_SECRET` en producción el webhook falla cerrado.
 - **`npm run audit`** (`--audit-level=high`) disponible como paso previo al deploy.
 - **Manejo de errores sin fuga de internals** en todos los controllers (`userController`,
   `cloudinaryController`, `productController`): el detalle real (mensaje de Postgres, respuesta

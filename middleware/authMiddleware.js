@@ -27,6 +27,22 @@ const tokenCacheKey = (token) => `token:${crypto.createHash('sha256').update(tok
  * @returns {Promise<{id: string}|null>} usuario verificado, o null si el token no es válido.
  */
 const SUPABASE_VERIFY_TIMEOUT_MS = 3000;
+const HTTP_OK = 200;
+const HTTP_TOO_MANY_REQUESTS = 429;
+const HTTP_SERVER_ERROR = 500;
+
+/**
+ * Un 5xx o 429 de Supabase Auth NO dice nada del token: se propaga como falla de infraestructura
+ * (503 reintentable, nunca cacheada). Solo un 4xx distinto de 429 es un rechazo definitivo del token.
+ */
+const settleNonOk = (statusCode, resolve, reject) => {
+  if (statusCode >= HTTP_SERVER_ERROR || statusCode === HTTP_TOO_MANY_REQUESTS) {
+    const error = new Error(`supabase auth respondió ${statusCode}`);
+    error.code = 'SUPABASE_AUTH_UNAVAILABLE';
+    return reject(error);
+  }
+  return resolve(null);
+};
 
 const verifySupabaseToken = (token) =>
   new Promise((resolve, reject) => {
@@ -42,7 +58,7 @@ const verifySupabaseToken = (token) =>
         let data = '';
         response.on('data', (chunk) => { data += chunk; });
         response.on('end', () => {
-          if (response.statusCode !== 200) return resolve(null);
+          if (response.statusCode !== HTTP_OK) return settleNonOk(response.statusCode, resolve, reject);
           try {
             const user = JSON.parse(data);
             resolve(user && user.id ? user : null);
@@ -60,6 +76,8 @@ const verifySupabaseToken = (token) =>
 
 // Un access token real mide ~1 kB; arriba de esto es basura o un intento de abuso.
 const MAX_TOKEN_LENGTH = 4096;
+// Un token nunca lleva espacios ni caracteres de control: ni vale la pena preguntarle a Supabase.
+const WHITESPACE_OR_CONTROL = /[\s\u0000-\u001f\u007f]/;
 // Tolerancia de reloj entre este servidor y Supabase antes de dar un token por vencido.
 const EXPIRY_CLOCK_SKEW_SECONDS = 30;
 
@@ -83,40 +101,43 @@ const tokenExpiry = (token) => {
  * No verifica firma: un token bien formado y vigente pero falso igual se consulta.
  */
 const isClearlyUnusableToken = (token) => {
-  if (token.length > MAX_TOKEN_LENGTH) return true;
+  if (token.length === 0 || token.length > MAX_TOKEN_LENGTH || WHITESPACE_OR_CONTROL.test(token)) return true;
   const expiry = tokenExpiry(token);
   return expiry !== null && expiry < Math.floor(Date.now() / 1000) - EXPIRY_CLOCK_SKEW_SECONDS;
 };
 
 /**
- * Resuelve el usuario de la request: verifica el token contra Supabase y lee su
- * rol de `profiles`.
- * @returns {Promise<object|null>} usuario de la request, o null si el token no vale.
+ * Resuelve el usuario de la request: verifica el token contra Supabase y lee su rol de `profiles`.
+ * `rejectedBySupabase` distingue "Supabase dijo que el token no vale" (se puede recordar) de "el token
+ * es válido pero todavía no hay perfil" (no se recuerda).
+ * @returns {Promise<{user: object|null, rejectedBySupabase: boolean}>}
  */
 const resolveRequestUser = async (token) => {
   const supabaseUser = await verifySupabaseToken(token);
-  if (!supabaseUser) return null;
+  if (!supabaseUser) return { user: null, rejectedBySupabase: true };
 
   const result = await pool.query(
     'SELECT id, role, name FROM public.profiles WHERE id = $1',
     [supabaseUser.id]
   );
-  if (result.rows.length === 0) return null;
+  if (result.rows.length === 0) return { user: null, rejectedBySupabase: false };
 
   const profile = result.rows[0];
   return {
-    id: profile.id,
-    name: profile.name,
-    email: supabaseUser.email || null,
-    role: profile.role || 'user',
-    // Versión de los Términos que tildó al crear la cuenta (metadato de Supabase); null en cuentas anteriores.
-    termsVersion: supabaseUser.user_metadata?.terms_version ?? null,
+    rejectedBySupabase: false,
+    user: {
+      id: profile.id,
+      name: profile.name,
+      email: supabaseUser.email || null,
+      role: profile.role || 'user',
+      // Versión de los Términos que tildó al crear la cuenta (metadato de Supabase); null en cuentas anteriores.
+      termsVersion: supabaseUser.user_metadata?.terms_version ?? null,
+    },
   };
 };
 
 /**
- * Igual que `resolveRequestUser`, pero con caché de corta duración y
- * single-flight.
+ * Igual que `resolveRequestUser`, pero con caché y single-flight.
  *
  * Sin esto, CADA request autenticada hace un round trip HTTPS a Supabase Auth
  * más una query a `profiles`: navegar el panel admin dispara decenas de
@@ -125,20 +146,25 @@ const resolveRequestUser = async (token) => {
  *
  * Trade-off explícito: un token revocado puede seguir siendo aceptado hasta
  * `CACHE_TTL_AUTH_SECONDS` (30 s por defecto, `0` desactiva la caché).
+ *
+ * Caché NEGATIVA (`caches.authRejected`, por hash del token, con tope de entradas): un token que
+ * Supabase rechazó con un 4xx no se vuelve a consultar durante `CACHE_TTL_AUTH_REJECTED_SECONDS`; un
+ * script que repite un token falso no genera un round trip HTTPS por request. Una falla de
+ * infraestructura (timeout, 5xx, 429) lanza antes de llegar acá y jamás se recuerda como "inválido".
  */
 const resolveRequestUserCached = async (token) => {
   // Sin llamar a Supabase: un token claramente inservible no puede ser válido.
   if (isClearlyUnusableToken(token)) return null;
-  if (!(TTL.auth > 0)) return resolveRequestUser(token);
+  if (!(TTL.auth > 0)) return (await resolveRequestUser(token)).user;
 
   const key = tokenCacheKey(token);
   const cached = caches.auth.get(key);
   if (cached) return cached;
+  if (TTL.authRejected > 0 && caches.authRejected.get(key)) return null;
 
-  // Sólo se cachean verificaciones exitosas: un token inválido debe volver a
-  // consultarse siempre (no se le regala al atacante una respuesta memorizada).
-  const user = await caches.auth.single(key, () => resolveRequestUser(token));
+  const { user, rejectedBySupabase } = await caches.auth.single(key, () => resolveRequestUser(token));
   if (user) caches.auth.set(key, user, TTL.auth);
+  else if (rejectedBySupabase) caches.authRejected.set(key, true, TTL.authRejected);
   return user;
 };
 

@@ -101,7 +101,8 @@ test('carriles: cada ruta cae en el bulkhead que corresponde', () => {
   const cases = [
     ['POST', '/orders/mp-webhook', 'webhook'],
     ['POST', '/orders/mp-preference', 'checkout'],
-    ['POST', '/orders/transfer', 'checkout'],
+    ['POST', '/orders/transfer', 'local'],
+    ['POST', '/orders/nudge', 'local'],
     ['POST', '/orders/mp-confirm', 'checkout'],
     ['POST', '/orders/abc/cancel', 'checkout'],
     ['GET', '/orders/user', 'read'],
@@ -119,7 +120,7 @@ test('carriles: cada ruta cae en el bulkhead que corresponde', () => {
 
 test('carriles: el webhook tiene cupo propio y cada carril reporta sus estadísticas', () => {
   const stats = concurrencyStats();
-  assert.deepEqual(Object.keys(stats).sort(), ['admin', 'auth', 'checkout', 'read', 'webhook']);
+  assert.deepEqual(Object.keys(stats).sort(), ['admin', 'auth', 'checkout', 'general', 'local', 'read', 'webhook']);
   assert.ok(stats.webhook.maxConcurrent >= 1);
   assert.notEqual(lanes.webhook, lanes.read);
 });

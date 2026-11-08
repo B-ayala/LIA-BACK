@@ -4,6 +4,7 @@ const Order = require('./Order');
 const { withTransaction, rollbackWith } = require('../utils/transaction');
 const { REVIEW_REASON } = require('../utils/reviewReasons');
 const { DEDUCT, REASON, validateSizeStock, applySizeDelta } = require('../utils/variantStock');
+const { noteStockChange } = require('../utils/catalogInvalidation');
 
 const RELEASED_STATUSES = ['expirado', 'cancelado'];
 const AMOUNT_MISMATCH = -1;
@@ -70,6 +71,10 @@ class OrderPayment {
     );
     const nextVariants = applySizeDelta(product.variants, row.units_config, DEDUCT);
     if (nextVariants) await Order.setVariants(client, row.product_id, nextVariants);
+    noteStockChange(
+      { stock: product.stock, variants: product.variants },
+      { stock: Number(product.stock) - row.quantity, variants: nextVariants || product.variants }
+    );
     return true;
   }
 
@@ -186,6 +191,23 @@ class OrderPayment {
       'UPDATE public.ventas SET mp_preference_id = $2::text WHERE id = ANY($1::uuid[])',
       [orderIds, preferenceId || null]
     );
+  }
+
+  /**
+   * De estas preferencias, las que ya no tienen NINGUNA venta pendiente (todo su carrito se canceló o
+   * se pagó): solo esas se pueden expirar en MP sin cortarle el pago a una línea hermana.
+   * @returns {Promise<string[]>}
+   */
+  static async findPreferencesWithoutPendingOrders(preferenceIds) {
+    if (preferenceIds.length === 0) return [];
+    const result = await pool.query(
+      `SELECT p.id FROM unnest($1::text[]) AS p(id)
+        WHERE NOT EXISTS (
+          SELECT 1 FROM public.ventas v WHERE v.mp_preference_id = p.id AND v.payment_status = 'pendiente'
+        )`,
+      [preferenceIds]
+    );
+    return result.rows.map((row) => String(row.id));
   }
 
   /**

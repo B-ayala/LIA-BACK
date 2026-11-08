@@ -20,19 +20,17 @@ Dejar constancia de qué versión de los Términos aceptó cada cuenta, y pedir 
 
 ## Pasos principales (happy path)
 1. **Registro:** el cliente tilda "Acepto los Términos y la Política de privacidad". El front crea la cuenta con `terms_version` y `terms_accepted_at` en los datos del usuario y envía `POST /api/terms/registration` (constancia con IP).
-2. **Pago, cuenta que ya aceptó la versión vigente:** el paso Pago muestra el aviso "Al pagar aceptás los Términos y condiciones (versión X)". Sin casilla.
-3. **Pago, cuenta que no la aceptó** (cuentas anteriores al tilde del registro, o versión nueva): aparece la casilla. Al pagar, el front llama `POST /api/terms/accept` y recién después crea el pedido.
-4. **Checkout:** el backend verifica la aceptación de la versión vigente y guarda una fila `checkout` con el N° de pedido y la versión que fija el servidor.
+2. **Pago:** el checkout ya NO pide ni muestra los términos; se aceptan solo al crear la cuenta.
+3. **Checkout:** el backend NO bloquea la compra por los términos. Si la cuenta ya había aceptado la versión vigente (tilde del registro o `POST /api/terms/accept`), guarda una fila `checkout` con el N° de pedido y la versión que fija el servidor; si no la había aceptado, la compra sigue y no se registra constancia.
 
 ## Caminos alternativos
-- Si el admin publica una versión nueva mientras el cliente está en el paso Pago: `accept` responde 409 `TERMS_VERSION_OUTDATED`; el front avisa, muestra la versión nueva y vuelve a pedir el tilde. No se crea el pedido.
-- Si el cliente veía el aviso fijo y la versión cambió: el checkout responde 409 `TERMS_NOT_ACCEPTED`; recargar la página muestra la casilla.
+- Si el admin publica una versión nueva: `POST /api/terms/accept` con la versión vieja responde 409 `TERMS_VERSION_OUTDATED`. Las compras siguen sin bloquearse; solo dejan de registrar constancia hasta que la cuenta acepte la nueva.
 - Si falla `POST /api/terms/registration`: el registro sigue (es solo evidencia).
 
 ## Errores esperados
-- `GET /api/terms/status` falla → el pago queda bloqueado con "No pudimos verificar los términos y condiciones. Recargá la página e intentá de nuevo."
-- `POST /api/terms/accept` con base caída → 500 con mensaje humano; no se crea el pedido.
-- Checkout sin aceptación vigente → 409 `TERMS_NOT_ACCEPTED` con `currentVersion`, sin reservar stock.
+- `POST /api/terms/accept` con base caída → 500 con mensaje humano.
+- Si falla el guardado de la constancia de compra, la compra igual se crea (queda `terms_acceptance_not_saved` en el log).
+- Checkout sin aceptación vigente → NO hay error: la compra se crea sin constancia (ya no existe `TERMS_NOT_ACCEPTED` en el checkout).
 
 ## Diagrama
 ```mermaid
@@ -47,16 +45,11 @@ sequenceDiagram
   F->>B: POST /api/terms/registration (email, versión)
   B->>S: INSERT terms_acceptances (context=registration, IP)
   Note over C,S: Pago
-  F->>B: GET /api/terms/status
-  B->>S: versión vigente + ¿aceptó?
-  alt no aceptó la versión vigente
-    C->>F: tilda la casilla y paga
-    F->>B: POST /api/terms/accept
-    B->>S: INSERT (context=reacceptance, IP)
-  end
   F->>B: POST /api/orders/transfer | mp-preference
-  B->>S: ¿aceptó? sí → reserva y crea venta
-  B->>S: INSERT (context=checkout, N° de pedido)
+  B->>S: reserva y crea venta (sin exigir términos)
+  opt la cuenta ya aceptó la versión vigente
+    B->>S: INSERT (context=checkout, N° de pedido)
+  end
 ```
 
 ## Datos involucrados

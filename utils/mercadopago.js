@@ -15,6 +15,15 @@ const MP_API_BASE = 'https://api.mercadopago.com';
 // perceptible sobre los 10s de statement_timeout de la DB.
 const MP_REQUEST_TIMEOUT_MS = 8000;
 
+// Crear la preferencia es lo único que el comprador espera mirando la pantalla (y con stock ya
+// reservado): 5 s. Si MP no contesta se compensa y se ofrece transferencia, en vez de retener 8 s un slot
+// del carril de checkout. Expirar una preferencia al cancelar es secundario: plazo aún más corto.
+const MP_PREFERENCE_TIMEOUT_MS = 5000;
+const MP_EXPIRE_TIMEOUT_MS = 4000;
+// Una respuesta EXITOSA que tarda esto cuenta como falla del circuito: cinco seguidas (latencia alta
+// sostenida) lo abren sin esperar a que empiecen los timeouts.
+const MP_SLOW_CALL_MS = 3000;
+
 // Tolera valores pegados con comillas en el .env (mismo criterio que cloudinaryController)
 const getAccessToken = () =>
   (process.env.MP_ACCESS_TOKEN || '').trim().replace(/^['"]|['"]$/g, '');
@@ -46,6 +55,7 @@ const breaker = createCircuitBreaker({
   name: 'mercadopago',
   failureThreshold: 5,
   openMs: 30 * 1000,
+  slowCallMs: MP_SLOW_CALL_MS,
   isFailure: isMpOutage,
 });
 
@@ -54,7 +64,7 @@ const isAvailable = () => breaker.isAvailable();
 const retryAfterSeconds = () => breaker.retryAfterSeconds();
 const circuitState = () => breaker.state();
 
-const sendMpRequest = async (path, options = {}) => {
+const sendMpRequest = async (path, { timeoutMs = MP_REQUEST_TIMEOUT_MS, ...options } = {}) => {
   let response;
   try {
     response = await fetch(`${MP_API_BASE}${path}`, {
@@ -64,14 +74,14 @@ const sendMpRequest = async (path, options = {}) => {
         Authorization: `Bearer ${getAccessToken()}`,
         ...(options.headers || {}),
       },
-      signal: AbortSignal.timeout(MP_REQUEST_TIMEOUT_MS),
+      signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (error) {
     // `AbortSignal.timeout` dispara un `TimeoutError`; se re-envuelve con un
     // código propio para que el caller lo distinga de un rechazo de MP (4xx/5xx)
     // o de un corte de red, y lo loguee como lo que es: la API no respondió a tiempo.
     if (error.name === 'TimeoutError' || error.name === 'AbortError') {
-      const timeoutError = new Error(`Mercado Pago no respondió en ${MP_REQUEST_TIMEOUT_MS}ms`);
+      const timeoutError = new Error(`Mercado Pago no respondió en ${timeoutMs}ms`);
       timeoutError.code = 'MP_TIMEOUT';
       throw timeoutError;
     }
@@ -124,6 +134,19 @@ const createPreference = (preference) =>
   mpRequest('/checkout/preferences', {
     method: 'POST',
     body: JSON.stringify(preference),
+    timeoutMs: MP_PREFERENCE_TIMEOUT_MS,
+  });
+
+/**
+ * Expira una preferencia: `PUT /checkout/preferences/{id}` con `expires` y `expiration_date_to` ya
+ * vencida (endpoint de actualización de preferencias de Checkout Pro). Idempotente. NO se pudo validar
+ * contra Mercado Pago real (sin credenciales de prueba en este entorno): ver `expirePreferenceSafely`.
+ */
+const expirePreference = (preferenceId, payload) =>
+  mpRequest(`/checkout/preferences/${encodeURIComponent(preferenceId)}`, {
+    method: 'PUT',
+    body: JSON.stringify(payload),
+    timeoutMs: MP_EXPIRE_TIMEOUT_MS,
   });
 
 /** Obtiene un pago por id (para verificar estado y external_reference). */
@@ -150,6 +173,19 @@ const searchPaymentsByReference = async (externalReference) => {
   return Array.isArray(data && data.results) ? data.results : [];
 };
 
+// Antigüedad máxima (y adelanto máximo por desfase de reloj) del `ts` firmado en una notificación.
+const WEBHOOK_SIGNATURE_MAX_AGE_MS = 5 * 60 * 1000;
+// `ts` llega en segundos o en milisegundos según la versión del webhook: por encima de este valor son ms.
+const EPOCH_MS_THRESHOLD = 1e11;
+const MS_PER_SECOND = 1000;
+
+const isFreshTimestamp = (ts, now) => {
+  const value = Number(ts);
+  if (!Number.isFinite(value)) return false;
+  const tsMs = value > EPOCH_MS_THRESHOLD ? value : value * MS_PER_SECOND;
+  return Math.abs(now - tsMs) <= WEBHOOK_SIGNATURE_MAX_AGE_MS;
+};
+
 /**
  * Verifica la firma `x-signature` de una notificación de webhook.
  *
@@ -158,13 +194,15 @@ const searchPaymentsByReference = async (externalReference) => {
  * usando la clave secreta del webhook (panel de MP → Webhooks).
  *
  * Si `MP_WEBHOOK_SECRET` no está configurada devuelve `null` ("no verificable"),
- * y el caller decide: el webhook igual revalida el pago contra la API de MP,
- * así que sin secreto sigue siendo seguro, solo menos estricto. Con secreto,
- * una firma ausente o inválida devuelve `false` y el caller debe rechazar.
+ * y el caller decide (en producción el webhook falla cerrado, ver `orderController`; en
+ * desarrollo sigue, porque igual revalida el pago contra la API de MP). Con secreto,
+ * una firma ausente, inválida o con `ts` fuera de `WEBHOOK_SIGNATURE_MAX_AGE_MS` devuelve
+ * `false` y el caller debe rechazar (una notificación vieja capturada no se puede reenviar).
  *
+ * @param {number} [now] reloj inyectable (ms epoch) para probar la antigüedad.
  * @returns {boolean|null} true/false si se pudo verificar, null si no hay secreto.
  */
-const verifyWebhookSignature = ({ signatureHeader, requestId, dataId }) => {
+const verifyWebhookSignature = ({ signatureHeader, requestId, dataId, now = Date.now() }) => {
   const secret = getWebhookSecret();
   if (!secret) return null;
   if (!signatureHeader || !dataId) return false;
@@ -187,7 +225,8 @@ const verifyWebhookSignature = ({ signatureHeader, requestId, dataId }) => {
   const expectedBuffer = Buffer.from(expected, 'utf8');
   const receivedBuffer = Buffer.from(v1, 'utf8');
   if (expectedBuffer.length !== receivedBuffer.length) return false;
-  return crypto.timingSafeEqual(expectedBuffer, receivedBuffer);
+  if (!crypto.timingSafeEqual(expectedBuffer, receivedBuffer)) return false;
+  return isFreshTimestamp(ts, now);
 };
 
 module.exports = {
@@ -200,4 +239,8 @@ module.exports = {
   getPayment,
   searchPaymentsByReference,
   verifyWebhookSignature,
+  expirePreference,
+  WEBHOOK_SIGNATURE_MAX_AGE_MS,
+  MP_PREFERENCE_TIMEOUT_MS,
+  MP_SLOW_CALL_MS,
 };

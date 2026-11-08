@@ -1,4 +1,5 @@
 const Product = require('../models/Product');
+const { loadCatalog } = require('../services/catalog');
 const Size = require('../models/Size');
 const { collectGlobalSizeIds } = require('../schemas/variantSchema');
 const { caches, TTL, invalidateProducts } = require('../utils/cache');
@@ -6,6 +7,7 @@ const logger = require('../utils/logger');
 const { sendError } = require('../utils/httpResponses');
 const { destroyCloudinaryImage } = require('../utils/cloudinaryDestroy');
 const { resolveOriginalPrice } = require('../utils/productUpdateQuery');
+const { ACTIVE_REQUIREMENT_MESSAGES } = require('../utils/productPublishing');
 
 const MAX_PAGE_SIZE = 100;
 const DEFAULT_PAGE_SIZE = 50;
@@ -94,14 +96,21 @@ const rejectUnknownSizes = async (res, variants) => {
   return true;
 };
 
-// Un producto "Activo" sin stock es un estado válido: se muestra en la tienda
-// marcado "Sin stock" y no se puede comprar (el front pide confirmación antes).
+/** 400 PRODUCT_INCOMPLETE: un producto Activo tiene que tener categoría, foto, color y talle con stock. */
+const sendIncomplete = (res, missing) =>
+  sendError(res, 400, 'PRODUCT_INCOMPLETE', ACTIVE_REQUIREMENT_MESSAGES[missing], {
+    details: [{ field: missing, message: ACTIVE_REQUIREMENT_MESSAGES[missing] }],
+  });
+
+// Guardarlo "Activo" exige que esté completo; "Inactivo" es un borrador. Un activo puede
+// quedar sin stock después, por las compras: ahí se muestra "Sin stock" y no se puede comprar.
 const createProduct = async (req, res) => {
   try {
     if (await rejectUnknownSizes(res, req.body.variants)) return undefined;
-    const product = await Product.create(toInsertValues(req.body), req.user.id);
+    const result = await Product.create(toInsertValues(req.body), req.user.id);
+    if (result.status === 'incomplete') return sendIncomplete(res, result.missing);
     invalidateProducts();
-    return res.status(201).json({ success: true, data: product });
+    return res.status(201).json({ success: true, data: result.product });
   } catch (error) {
     return serverError(res, 'create', error);
   }
@@ -126,6 +135,43 @@ const getProducts = async (req, res) => {
     });
   } catch (error) {
     return serverError(res, 'list', error);
+  }
+};
+
+/**
+ * Listado del panel admin con filtros/orden/paginación en el servidor. Sin caché: el admin
+ * tiene que ver su propio cambio (stock, estado) en la lectura siguiente.
+ */
+const getAdminProducts = async (req, res) => {
+  try {
+    const { page, limit, ...filters } = req.validatedQuery;
+    const { rows, total, categories } = await Product.findAdminPage(filters, { page, limit });
+    return res.json({
+      success: true,
+      items: rows,
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit),
+      facets: { categories },
+    });
+  } catch (error) {
+    return serverError(res, 'admin_list', error);
+  }
+};
+
+/**
+ * Catálogo público con filtros/orden/paginación en el servidor. La clave de caché sale de los
+ * filtros YA validados y canónicos (no de la URL cruda): URLs equivalentes comparten entrada y
+ * una entrada nunca mezcla filtros distintos. Nunca incluye inactivos, tampoco para un admin.
+ */
+const getCatalog = async (req, res) => {
+  try {
+    const { offset, limit, ...filters } = req.validatedQuery;
+    const result = await loadCatalog(filters, { offset, limit });
+    return res.json({ success: true, ...result });
+  } catch (error) {
+    return serverError(res, 'catalog', error);
   }
 };
 
@@ -172,6 +218,7 @@ const updateProduct = async (req, res) => {
     const { expectedUpdatedAt, ...fields } = req.body;
     if (await rejectUnknownSizes(res, fields.variants)) return undefined;
     const result = await Product.update(req.params.id, fields, expectedUpdatedAt, req.user.id);
+    if (result.status === 'incomplete') return sendIncomplete(res, result.missing);
     if (result.status !== 'updated') {
       const [status, code, message] = UPDATE_FAILURES[result.status];
       return sendError(res, status, code, message);
@@ -220,6 +267,8 @@ const deleteProduct = async (req, res) => {
 module.exports = {
   createProduct,
   getProducts,
+  getAdminProducts,
+  getCatalog,
   getProductById,
   updateProduct,
   deleteProduct,

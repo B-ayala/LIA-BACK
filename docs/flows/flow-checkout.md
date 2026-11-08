@@ -16,7 +16,8 @@ stock y el estado de pago consistentes entre frontend, backend y Supabase.
 - Producto existente con stock suficiente (el backend no valida `status` del producto
   al reservar: solo existencia, stock y precio > 0).
 - Script SQL `db/migrations/2026-10-06_idempotency_key.sql` aplicado en Supabase si el
-  front manda `Idempotency-Key` (sin la columna `ventas.idempotency_key` el INSERT con key falla).
+  front manda `Idempotency-Key` (sin la columna `ventas.idempotency_key` el INSERT con key falla;
+  sin header, el INSERT no la usa).
 - Para MP: `MP_ACCESS_TOKEN` configurado en el backend (si falta → 503 con mensaje claro).
 - Modo de compra restringida (ver sección abajo) desactivado, o el usuario debe
   estar en la allowlist.
@@ -38,46 +39,42 @@ activo mientras exista **al menos un** perfil marcado
 - Pensado para "modo mantenimiento" controlado en producción (ej. probar el
   checkout con una sola cuenta antes de habilitar la compra pública).
 
-## Idempotencia del checkout (`Idempotency-Key`, desde 2026-10-06)
+## Idempotencia del checkout (`Idempotency-Key`)
 Header **opcional** en `POST /api/orders/transfer` y `POST /api/orders/mp-preference`
-(`orderController.readIdempotencyKey`). El front genera un UUID por intento de compra
-(`Checkout.tsx` → `getIdempotencyKey`) y lo reutiliza en los reintentos del mismo carrito.
-- **Formato:** `^[A-Za-z0-9_-]{8,128}$` (sin `:`, que es el separador interno). Inválido ->
-  `400 { code: 'INVALID_IDEMPOTENCY_KEY' }`, antes de tocar stock.
+(`utils/idempotency.js`). El front genera un UUID por intento de compra y lo reutiliza en los
+reintentos del mismo carrito. **La fuente de verdad es la base** (`ventas.idempotency_key`); la
+respuesta recordada en memoria y en `public.idempotency_keys` es solo un atajo.
+- **Formato:** `^[A-Za-z0-9_-]{8,128}$` (sin `:`, el separador interno). Inválido ->
+  `400 IDEMPOTENCY_KEY_INVALID`, antes de tocar stock.
 - **Persistencia:** cada línea del carrito (una fila de `ventas`) guarda
-  `idempotency_key = <key>:<huella>:<índice de línea>` (`Order.buildStoredKey`). La huella
-  son 12 hex de un sha256 (`utils/orderFingerprint.js`) sobre productos, cantidades,
-  variantes (`unitsConfig`), `shippingMethod` y medio de pago; las líneas se ordenan antes
-  de hashear, así que el orden del carrito no cambia la huella. **No incluye precios**
-  (los fija el servidor) ni nombre/email del comprador. Las filas con formato anterior
-  `<key>:<índice>` (sin huella) se reconocen y se reenvían sin comparar contenido.
+  `idempotency_key = <key>:<huella>:<índice de línea>`. La huella son 12 hex de un sha256 del
+  carrito, el envío, el total y el medio de pago (`transfer`/`mp`): una key no cruza medios de pago.
 - **Índice:** `ventas_user_idempotency_key_uidx` UNIQUE parcial sobre
-  `(user_id, idempotency_key) WHERE idempotency_key IS NOT NULL`. Sin header el INSERT es
-  el de siempre y no depende de la migración.
-- **Serialización:** dentro de la transacción, `pg_advisory_xact_lock(hashtextextended('<userId>:<key>', 0))`
-  (`Order.lockIdempotencyKey`) y después los locks de producto; recién entonces se busca
-  una reserva previa. Dos requests simultáneas con la misma key quedan en fila: la
-  segunda ve lo que commiteó la primera.
-- **Replay** (`replayReservation`): si ya existe una reserva de ese `(user_id, key)` se
-  devuelve con la misma forma que una reserva nueva (ids de órdenes, líneas valorizadas,
-  envío reconstruido) **sin descontar stock de nuevo**. En MP se vuelve a crear la
-  preferencia sobre esas órdenes.
-- **Casos de rechazo del replay:**
-  - Misma key con distinto medio de pago, o con huella distinta (otro carrito/envío) ->
-    `422 { code: 'IDEMPOTENCY_KEY_REUSED' }`.
-  - Replay de `mp-preference` cuando alguna de las órdenes ya no está `pendiente`
-    (pagada, cancelada, expirada) -> `409` "Esta compra ya fue procesada, cancelada o venció. Iniciá una nueva compra." (sin `code`).
-  - Replay de `transfer` no chequea estado: devuelve los ids originales.
-- **Carrera residual:** si dos requests igualmente llegan al INSERT y una pisa el índice
-  UNIQUE (`23505` con constraint `ventas_user_idempotency_key_uidx`), `handleReservationError`
-  hace ROLLBACK y reintenta `replayReservation`; si encuentra la ganadora, la devuelve.
-- **Compensación MP:** si Mercado Pago falla después de reservar, `releaseOrders` cancela
-  las órdenes, restaura stock y **limpia `idempotency_key`** (`Order.clearIdempotencyKey`)
-  para que el cliente pueda reintentar con la misma key en vez de recibir 409.
-- **Dedup previo (single-flight):** además, `caches.orders.single` colapsa requests
-  simultáneas del mismo usuario + mismo payload (`orderDedupeKey`: items, envío, total)
-  en una sola ejecución dentro del proceso. La key de idempotencia cubre lo que eso no
-  cubre: reintentos secuenciales y entre procesos.
+  `(user_id, idempotency_key) WHERE idempotency_key IS NOT NULL`. Sin header el INSERT es el de
+  siempre y no toca la columna.
+- **Serialización:** la transacción de la reserva empieza con
+  `pg_advisory_xact_lock(7301, hashtext(<userId>))` (`Order.lockUserCheckout`): las requests de un
+  mismo usuario hacen fila, así la segunda ve lo que commiteó la primera. El mismo lock hace
+  atómico el tope de reservas pendientes por usuario. Se libera solo al COMMIT/ROLLBACK.
+- **Intento previo** (`resolveExistingAttempt`, después del lock y antes del tope de pendientes):
+  - Todas las líneas `pendiente` y misma huella -> **replay**: `transfer` devuelve el mismo `201`
+    (`order_ids`, `order_number`) sin descontar stock de nuevo. `mp-preference` solo puede
+    reenviar el `init_point` si la respuesta sigue recordada; si no (la primera request todavía
+    arma la preferencia, o pasaron más de 10 min) responde `409 CHECKOUT_IN_PROGRESS`.
+  - Misma key con otra huella (otro carrito, envío, total o medio de pago) -> `422 IDEMPOTENCY_KEY_REUSED`.
+  - Alguna línea `pagado` (o en otro estado no vivo) -> `409 CHECKOUT_ATTEMPT_CLOSED`: no se crea otra compra.
+  - Todas `cancelado`/`expirado` -> el intento murió: se libera su key (`idempotency_key = NULL`)
+    y la misma request crea un **intento nuevo** (stock, precio y tope se validan de cero).
+- **Respuesta recordada vencida:** antes de reenviar un `201` recordado se verifica que sus
+  ventas sigan `pendiente` (`Order.areAllPending`); si no, se descarta y decide la base. Un
+  reintento tras cancelar o vencer nunca devuelve el `init_point` viejo.
+- **Respaldo ante carrera:** si igualmente el INSERT choca con el índice (`23505`), la transacción
+  hace ROLLBACK (el trigger de stock se revierte con ella, no queda ninguna venta huérfana) y se
+  relee el intento ganador para reenviarlo.
+- **Compensación MP:** si Mercado Pago falla después de reservar, `releaseOrders` cancela las
+  órdenes, restaura stock y **libera la key**, para que el reintento con la misma key reserve de nuevo.
+- **Single-flight:** además, `caches.orders.single` colapsa requests simultáneas del mismo
+  usuario + mismo carrito dentro del proceso (cubre también el doble submit sin header).
 - **CORS:** `Idempotency-Key` figura en `allowedHeaders` (`config/cors.js`).
 
 ## Datos de la orden: de dónde sale cada campo
@@ -88,8 +85,9 @@ Header **opcional** en `POST /api/orders/transfer` y `POST /api/orders/mp-prefer
 - **Email del comprador:** el de la cuenta autenticada (`req.user.email`, de Supabase Auth);
   el `buyerEmail` del body solo se usa de respaldo si la cuenta no tiene email (y se sigue
   validando por formato). `buyerName` sí viene del body.
-- **Costo de envío:** `local` 0, `correo` constante `CORREO_COST`, `moto` variable acotada
-  a 0-100000; método desconocido -> 400.
+- **Costo de envío:** `local` 0, `correo` constante `CORREO_COST` (el `shippingCost` del body se
+  ignora). Solo existen esos dos métodos (whitelist con `Object.hasOwn`); cualquier otro valor,
+  incluido el retirado `moto`, -> 400 `INVALID_SHIPPING` antes de abrir la transacción.
 - **Id de producto:** `productId` entero (`parseInt`); si no es entero -> 400 y no se
   reserva nada. Si el producto no existe -> 409 "No hay stock suficiente de ...".
 - **Dueño de la orden** (`isOrderOwner`): por `ventas.user_id` cuando existe; las filas
@@ -119,8 +117,8 @@ El descuento de stock lo hace el **trigger `trg_decrement_stock`** (AFTER INSERT
 2. Front llama `POST /api/orders/mp-preference` con items, comprador y envío, más el header
    `Idempotency-Key`. No hay espera artificial previa: el botón "Continuar al pago" /
    "Ir a Mercado Pago" queda deshabilitado mientras la request está en vuelo.
-3. Backend: valida payload (nombre ≤ 120 caracteres) → valida el formato de `Idempotency-Key` →
-   gate de compra restringida → `MP_ACCESS_TOKEN` → **transacción corta**: cuenta las líneas
+3. Backend: valida el body con Zod strict (`schemas/checkoutSchema.js`: tipos, tope de 50 ítems, nombre ≤ 120 caracteres) → valida el formato de `Idempotency-Key` →
+   gate de compra restringida → `MP_ACCESS_TOKEN` → **transacción corta**: toma el lock por usuario, resuelve un intento previo con la misma key, cuenta las líneas
    pendientes del usuario (tope `MAX_PENDING_LINES_PER_USER`, default 30 → 429
    `TOO_MANY_PENDING_ORDERS`), bloquea los productos en orden de `productId`
    (`SELECT … FOR UPDATE`), rechaza los productos inactivos (409 `PRODUCT_UNAVAILABLE`), valida
@@ -135,26 +133,21 @@ El descuento de stock lo hace el **trigger `trg_decrement_stock`** (AFTER INSERT
 4. Front guarda `mp_order_ids` en sessionStorage y redirige a `init_point`.
 5. Usuario paga en Mercado Pago y vuelve a `/checkout/result?collection_status=approved&payment_id=...`.
 6. Front llama `POST /api/orders/mp-confirm { paymentId }`; el backend verifica el
-   pago contra la API de MP y marca las ventas como `'pagado'`. Limpia el carrito.
+   pago contra la API de MP y marca las ventas como `'pagado'`. Solo si las ventas del pago
+   son del usuario (mismo email que el comprador) o es admin: si no, 403 `FORBIDDEN` sin
+   saldar nada. Limpia el carrito.
 7. La compra aparece en "Mis compras" (`GET /api/orders/user?email=` — solo dueño o admin). Ese
    endpoint devuelve las `pagado` **y** las transferencias con `origin='wa_confirmado'` (en cualquier estado de pago).
 
 ## Idempotencia de la creación de órdenes
-`mp-preference` y `transfer` aceptan el header `Idempotency-Key` (8-128 caracteres
-`[A-Za-z0-9_-]`; el front manda un UUID por intento de compra y lo descarta tras el éxito).
-- Misma key + mismo carrito tras un `201` → se devuelve la **misma respuesta** (mismas
-  `order_ids` / `init_point`) sin reservar stock de nuevo. Se recuerda 10 min, por usuario y
-  tipo de pago. Se guarda en memoria y en `public.idempotency_keys`, así sobrevive a un
-  reinicio de Render.
-- Misma key + carrito distinto (items, envío, costo, total, nombre o email del comprador) → `422 IDEMPOTENCY_KEY_REUSED`.
-- Key con formato inválido → `400 IDEMPOTENCY_KEY_INVALID`.
-- Solo se recuerdan los `201`: tras un `409` (stock) o `502` (MP) el reintento con la misma
-  key se ejecuta de nuevo.
-- Sin header: se mantiene el single-flight por carrito (colapsa solo requests simultáneas).
-- Si la tabla `idempotency_keys` no existe o la base falla, el checkout NO se corta: la
-  idempotencia cae a memoria (se pierde solo ante un reinicio) y se loguea un warn.
-- Cambiar nombre o email genera otra key en el front (otra compra): la orden pendiente
-  anterior, si existía, expira sola por el sweep.
+Ver "Idempotencia del checkout" arriba. Resumen operativo:
+- Misma key + mismo carrito mientras la orden siga pendiente -> misma respuesta, sin reservar de nuevo
+  (también tras un reinicio de Render: lo decide la base).
+- Misma key + carrito distinto -> `422 IDEMPOTENCY_KEY_REUSED`. Key inválida -> `400 IDEMPOTENCY_KEY_INVALID`.
+- Solo se recuerdan los `201`: tras un `409` (stock) o `502` (MP) el reintento se ejecuta de nuevo.
+- Si la tabla `idempotency_keys` no existe o falla, el checkout NO se corta (decide la base de `ventas`).
+- Cambiar nombre o email genera otra key en el front (otra compra): la orden pendiente anterior,
+  si existía, expira sola por el sweep.
 
 ## Caminos alternativos
 - **Transferencia:** el front llama `POST /api/orders/transfer` al backend Express
@@ -189,16 +182,21 @@ El descuento de stock lo hace el **trigger `trg_decrement_stock`** (AFTER INSERT
   - `paid` → hay un pago aprobado: se salda (`'pagado'`) y no se cancela.
   Precedencia del agregado: `paid > held > released`. Alguna venta ajena → 403 sin tocar nada.
   `POST /api/orders/:id/cancel` sigue disponible para una orden puntual (mismo criterio).
+  Tras cancelar, si ya no queda ninguna venta `pendiente` con esa `mp_preference_id`, se **expira
+  la preferencia en MP** (`PUT /checkout/preferences/{id}`, sin esperar y sin que un fallo afecte la
+  cancelación) para que el link de pago no siga vivo con el stock ya liberado.
 - **Webhook:** si `MP_WEBHOOK_URL` está configurada (o se configura en el panel de MP),
   MP notifica `POST /api/orders/mp-webhook` y el backend marca `'pagado'` sin
   depender del navegador del usuario. **Firma:** con `MP_WEBHOOK_SECRET` definida la firma
   `x-signature` (HMAC-SHA256 sobre `id:<data.id>;request-id:<x-request-id>;ts:<ts>;`,
-  comparación en tiempo constante) es **obligatoria**: firma ausente o inválida ->
+  comparación en tiempo constante, con `ts` de a lo sumo 5 min de antigüedad) es **obligatoria**: firma ausente, inválida o vieja ->
   `401 { success: false }` y no se consulta a MP ni se toca nada; se exige antes de
   decidir si la notificación interesa, así que también aplica a topics que no son
-  `payment`. Sin `MP_WEBHOOK_SECRET` el webhook se acepta sin verificar firma (el pago se
-  revalida igual contra la API de MP) y se loguea `mp_webhook_unsigned` en el arranque y
-  por request. Solo invalida el catálogo cacheado si marcó órdenes (`updated > 0`).
+  `payment`. Sin `MP_WEBHOOK_SECRET`: en **producción** (`NODE_ENV=production`) el webhook falla
+  cerrado con 401 `WEBHOOK_NOT_CONFIGURED` y alerta `mp_webhook_secret_missing` (una vez por
+  proceso); en desarrollo/test se acepta sin verificar firma (el pago se revalida igual contra la
+  API de MP) con el warning `mp_webhook_unsigned_allowed`. Solo vacía el catálogo cacheado si el
+  saldo cambió la disponibilidad de un producto o talle (pago tardío que re-descuenta stock).
 - **Reintento ante falla de auth (front):** si `authMiddleware` responde
   `503 AUTH_UNAVAILABLE` (ver Errores esperados), `apiFetch` espera `Retry-After` (máx. 2 s)
   y reintenta **una vez** sin cerrar sesión; como el reintento lleva la misma
@@ -221,7 +219,9 @@ El descuento de stock lo hace el **trigger `trg_decrement_stock`** (AFTER INSERT
 - Más de 8 compras por minuto desde la misma cuenta (`POST /transfer` y `/mp-preference` comparten el cupo) -> 429 `RATE_LIMITED`. Hay además un tope por IP (12/min) que se evalúa antes de autenticar; el de 8/min cuenta por usuario. Las cancelaciones y confirmaciones que pueden consultar a MP (`mp-confirm`, `mp-cancel`, `/:id/cancel`) tienen un tope por usuario de 20/min.
 - `unitsConfig` que no sea una lista de objetos planos de texto (máximo una entrada por unidad, claves <= 60 y valores <= 100 caracteres), o `buyerName` > 120 caracteres -> 400.
 - `mp-confirm` y el webhook ignoran pagos con `paymentId` no numérico o con moneda distinta de ARS (no saldan ninguna orden).
-- Método de envío inválido o costo de moto fuera de rango -> 400.
+- Método de envío desconocido (cualquier valor fuera de `local`/`correo`) -> 400 `INVALID_SHIPPING`.
+- Body del checkout con tipos o claves inválidas (strict) -> 400 `VALIDATION_ERROR` `{ success, code, message, details[] }`, antes de tomar ningún lock.
+- Reintento con la misma `Idempotency-Key` sobre una compra ya pagada -> 409 `CHECKOUT_ATTEMPT_CLOSED`; con la preferencia de MP aún en armado -> 409 `CHECKOUT_IN_PROGRESS`.
 - Error inesperado durante la reserva -> 500 "No se pudo registrar la orden. Intentá de nuevo." con rollback.
 - Webhook con `MP_WEBHOOK_SECRET` y firma ausente/inválida -> 401.
 - Modo de compra restringida activo y usuario no habilitado → 403 `PURCHASES_DISABLED`.

@@ -93,10 +93,12 @@ test('precio no positivo → PRODUCT_UNAVAILABLE 409', () => {
   assert.deepEqual([result.status, result.code], [409, CHECKOUT_ERROR.productUnavailable]);
 });
 
-test('envío: método desconocido o moto fuera de rango se rechazan', () => {
-  assert.equal(resolveShippingCost('drone', 0).ok, false);
-  assert.equal(resolveShippingCost('moto', -1).ok, false);
-  assert.deepEqual(resolveShippingCost('local', 999), { ok: true, cost: 0 });
+test('envío: solo local y correo existen; cualquier otro valor (incluido el retirado "moto") se rechaza', () => {
+  for (const method of ['drone', 'moto', 'constructor', '__proto__', 'toString', '', undefined, null, 5, ['local']]) {
+    assert.equal(resolveShippingCost(method).ok, false, String(method));
+  }
+  assert.deepEqual(resolveShippingCost('local'), { ok: true, cost: 0 });
+  assert.equal(resolveShippingCost('correo').ok, true);
 });
 
 test('unitsConfig: producto sin variantes guarda [] aunque el body traiga basura', () => {

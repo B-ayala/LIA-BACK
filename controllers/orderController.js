@@ -4,13 +4,16 @@ const User = require('../models/User');
 const TermsAcceptance = require('../models/TermsAcceptance');
 const mercadopago = require('../utils/mercadopago');
 const logger = require('../utils/logger');
-const { caches, invalidateProducts } = require('../utils/cache');
+const { caches } = require('../utils/cache');
+const { flushAvailabilityChange } = require('../utils/catalogInvalidation');
 const { sendError } = require('../utils/httpResponses');
 const { readIdempotencyKey, withIdempotency } = require('../utils/idempotency');
-const { validateOrderPayload } = require('../utils/checkoutRules');
+const { parseCheckoutBody } = require('../schemas/checkoutSchema');
+const { attemptFingerprint } = require('../utils/checkoutAttempt');
 const {
-  settleApprovedPayment, flagReversedPayment, isReversedPayment, AMOUNT_MISMATCH,
+  settleApprovedPayment, flagReversedPayment, isReversedPayment, resolveOrderIds, AMOUNT_MISMATCH,
 } = require('../utils/paymentSettlement');
+const { isOrderOwnerOrAdmin } = require('../utils/orderAccess');
 const { buildMpCheckout, buildTransferCheckout } = require('../services/checkout');
 
 const MP_NOT_CONFIGURED_MESSAGE =
@@ -23,7 +26,6 @@ const PURCHASES_DISABLED_MESSAGE =
   'Por el momento no es posible comprar. Sitio en mantenimiento, gracias por tu paciencia.';
 
 const HTTP_CREATED = 201;
-const HTTP_CONFLICT = 409;
 const DEFAULT_ORDER_PAGE_SIZE = 200;
 const MAX_ORDER_PAGE_SIZE = 500;
 // Los ids de pago de Mercado Pago son enteros: cualquier otra forma no llega a su API.
@@ -37,37 +39,42 @@ const boundedInt = (raw, fallback, min, max) => {
 };
 
 /**
- * Datos de la compra tal como se van a persistir. El email del comprador es el de
- * la sesión cuando existe (no el del body): la venta queda asociada a quien pagó
- * y "Mis compras" / la autorización por dueño no se pueden desviar a otro email.
+ * Datos de la compra tal como se van a persistir, a partir del body ya validado. El email del
+ * comprador es el de la sesión cuando existe (no el del body): la venta queda asociada a quien
+ * pagó y "Mis compras" / la autorización por dueño no se pueden desviar a otro email.
  */
-const checkoutInput = (req) => ({
-  buyerName: req.body.buyerName,
-  buyerEmail: (req.user && req.user.email) || req.body.buyerEmail,
+const checkoutInput = (req, body) => ({
+  buyerName: body.buyerName,
+  buyerEmail: (req.user && req.user.email) || body.buyerEmail,
   userId: req.user.id,
-  items: req.body.items,
-  shippingMethod: req.body.shippingMethod,
-  shippingCost: req.body.shippingCost,
+  items: body.items,
+  shippingMethod: body.shippingMethod,
+  shippingCost: body.shippingCost,
   // El total que el comprador vio y aceptó: no decide el cobro (lo calcula el servidor),
   // solo frena la compra si el precio cambió en el medio.
-  expectedTotal: req.body.totalPrice,
+  expectedTotal: body.totalPrice,
 });
+
+const sha256 = (text) => crypto.createHash('sha256').update(text).digest('hex');
+
+/** Una respuesta recordada solo se reenvía mientras sus ventas sigan pendientes (no canceladas/vencidas/pagadas). */
+const isAttemptAlive = (saved) => Order.areAllPending(saved.body && saved.body.order_ids);
 
 /**
  * Huella de una compra: mismo comprador + mismo carrito. Colapsa el doble submit
  * (doble click, reintento con la primera request en vuelo) que si no generaría DOS
  * juegos de ventas pendientes y descontaría el stock dos veces vía trigger.
  */
-const cartFingerprint = (input, totalPrice) => {
+const cartFingerprint = (input) => {
   const payload = JSON.stringify({
     buyerName: String(input.buyerName).trim(),
     buyerEmail: String(input.buyerEmail).trim(),
     items: input.items,
     shippingMethod: input.shippingMethod,
     shippingCost: input.shippingCost,
-    totalPrice,
+    totalPrice: input.expectedTotal,
   });
-  return crypto.createHash('sha256').update(payload).digest('hex');
+  return sha256(payload);
 };
 
 /**
@@ -80,12 +87,20 @@ const runCheckout = async (prefix, req, res, input, build) => {
   if (idempotency.error) {
     return res.status(idempotency.error.status).json(idempotency.error.body);
   }
-  const fingerprint = cartFingerprint(input, req.body.totalPrice);
+  const fingerprint = cartFingerprint(input);
+  // La huella que se guarda en cada venta incluye el medio de pago: una key no cruza mp/transferencia.
+  const attempt = idempotency.key
+    ? { key: idempotency.key, fingerprint: attemptFingerprint(sha256(`${prefix}:${fingerprint}`)) }
+    : null;
   const { status, body } = await withIdempotency({
     scope: `${prefix}:${req.user.id}`,
     key: idempotency.key,
     fingerprint,
-    execute: () => caches.orders.single(`${prefix}:${req.user.id}:${fingerprint}`, () => build(input)),
+    isReplayable: (saved) => isAttemptAlive(saved),
+    execute: () => caches.orders.single(
+      `${prefix}:${req.user.id}:${fingerprint}`,
+      () => build({ ...input, idempotency: attempt })
+    ),
   });
   return res.status(status).json(body);
 };
@@ -97,8 +112,6 @@ const isPurchaseBlocked = async (req) => {
   return !allowed;
 };
 
-const TERMS_NOT_ACCEPTED_MESSAGE = 'Para comprar tenés que aceptar los términos y condiciones vigentes.';
-
 /**
  * Deja constancia de la versión de los Términos vigente en la compra recién creada. La versión la fija
  * el servidor (no el body): el cliente no puede dejar constancia de otra. Un fallo no corta el
@@ -106,7 +119,7 @@ const TERMS_NOT_ACCEPTED_MESSAGE = 'Para comprar tenés que aceptar los término
  */
 const withTermsAcceptance = (build, req, termsVersion) => async (input) => {
   const result = await build(input);
-  if (result.status !== HTTP_CREATED) return result;
+  if (result.status !== HTTP_CREATED || result.replayed) return result;
   try {
     await TermsAcceptance.record({
       userId: req.user.id,
@@ -123,20 +136,18 @@ const withTermsAcceptance = (build, req, termsVersion) => async (input) => {
 
 const startCheckout = async (req, res, prefix, build) => {
   try {
-    const input = checkoutInput(req);
-    const validationError = validateOrderPayload({ ...input, totalPrice: req.body.totalPrice });
-    if (validationError) return sendError(res, 400, 'VALIDATION_ERROR', validationError);
+    // Todo el body se valida acá, antes de tomar cualquier lock de producto.
+    const parsed = parseCheckoutBody(req.body);
+    if (!parsed.ok) return sendError(res, 400, 'VALIDATION_ERROR', parsed.message, { details: parsed.details });
+    const input = checkoutInput(req, parsed.data);
     if (await isPurchaseBlocked(req)) return sendError(res, 403, 'PURCHASES_DISABLED', PURCHASES_DISABLED_MESSAGE);
     if (prefix === 'mp' && !mercadopago.isConfigured()) {
       return sendError(res, 503, 'MP_NOT_CONFIGURED', MP_NOT_CONFIGURED_MESSAGE);
     }
+    // La aceptación se pide al registrarse, no al comprar: solo se deja constancia si ya la había dado.
     const terms = await TermsAcceptance.statusFor(req.user);
-    if (!terms.accepted) {
-      return sendError(res, HTTP_CONFLICT, 'TERMS_NOT_ACCEPTED', TERMS_NOT_ACCEPTED_MESSAGE, {
-        currentVersion: terms.currentVersion,
-      });
-    }
-    return await runCheckout(prefix, req, res, input, withTermsAcceptance(build, req, terms.currentVersion));
+    const buildWithEvidence = terms.accepted ? withTermsAcceptance(build, req, terms.currentVersion) : build;
+    return await runCheckout(prefix, req, res, input, buildWithEvidence);
   } catch (error) {
     logger.error('checkout_failed', { prefix, code: error.code, message: error.message });
     if (res.headersSent) return undefined;
@@ -193,6 +204,18 @@ const logMpFailure = (event, paymentId, error) => {
 };
 
 /**
+ * ¿Las ventas de este pago son del usuario (o es admin)? El `external_reference` lo pone la tienda al crear
+ * la preferencia, pero cualquier usuario autenticado puede mandar el `paymentId` de OTRO comprador: sin este
+ * control, `mp-confirm` saldaría compras ajenas (IDOR). Un pago sin ventas asociadas no tiene nada que proteger.
+ */
+const paymentBelongsToUser = async (user, payment) => {
+  const ids = await resolveOrderIds(payment.external_reference);
+  if (ids.length === 0) return true;
+  const orders = await Order.findByIds(ids);
+  return orders.every((order) => isOrderOwnerOrAdmin(user, order));
+};
+
+/**
  * @desc    Confirma contra MP un pago aprobado y marca las órdenes como pagadas.
  *          Lo llama el frontend al volver de MP con payment_id; el webhook es el respaldo.
  * @route   POST /api/orders/mp-confirm
@@ -209,12 +232,17 @@ const confirmMpPayment = async (req, res) => {
       return sendError(res, 409, 'PAYMENT_NOT_APPROVED', 'El pago no está aprobado');
     }
 
+    if (!(await paymentBelongsToUser(req.user, payment))) {
+      logger.warn('mp_confirm_forbidden', { userId: req.user.id, paymentId });
+      return sendError(res, 403, 'FORBIDDEN', 'No podés confirmar este pago');
+    }
+
     const updated = await settleApprovedPayment(payment);
     if (updated === AMOUNT_MISMATCH) {
       return sendError(res, 409, 'AMOUNT_MISMATCH', 'El monto abonado no coincide con el total de la compra.');
     }
     // Un pago acreditado tarde vuelve a descontar stock: el catálogo cacheado tiene que reflejarlo.
-    if (updated > 0) invalidateProducts();
+    if (updated > 0) flushAvailabilityChange();
     return res.status(200).json({ success: true, orders_paid: updated });
   } catch (error) {
     logMpFailure('mp_confirm', paymentId, error);
@@ -236,9 +264,49 @@ const applyWebhookPayment = async (payment) => {
   if (!payment || !payment.external_reference) return;
   if (payment.status === 'approved') {
     const updated = await settleApprovedPayment(payment);
-    if (updated > 0) invalidateProducts();
+    if (updated > 0) flushAvailabilityChange();
   }
   if (isReversedPayment(payment)) await flagReversedPayment(payment);
+};
+
+let missingSecretAlerted = false;
+
+const isProduction = () => process.env.NODE_ENV === 'production';
+
+/**
+ * Sin `MP_WEBHOOK_SECRET` el webhook no puede autenticar a quien llama. En producción FALLA CERRADO (401): un
+ * atacante no puede disparar consultas a MP ni saldos con notificaciones falsas, y los pagos igual se confirman
+ * por `mp-confirm` y por el sweep de conciliación. Se alerta una sola vez por proceso para no inundar el log.
+ */
+const failClosedWithoutSecret = (res) => {
+  if (!missingSecretAlerted) {
+    missingSecretAlerted = true;
+    logger.error('mp_webhook_secret_missing', { action: 'rejecting_all_webhooks', env: 'MP_WEBHOOK_SECRET' });
+  }
+  return res.status(401).json({
+    success: false, code: 'WEBHOOK_NOT_CONFIGURED', message: 'Webhook no autenticable',
+  });
+};
+
+/**
+ * Firma HMAC de MP. `null` = no hay secreto configurado: en producción se rechaza; en desarrollo/test se sigue
+ * (con advertencia) porque el pago se revalida igual contra la API de MP.
+ * @returns {object|null} la respuesta ya enviada si se rechazó; null si se puede seguir.
+ */
+const rejectUnverifiedWebhook = (req, res, paymentId) => {
+  const signatureValid = mercadopago.verifyWebhookSignature({
+    signatureHeader: req.headers['x-signature'],
+    requestId: req.headers['x-request-id'],
+    dataId: paymentId,
+  });
+  if (signatureValid === false) {
+    logger.warn('mp_webhook_invalid_signature', { paymentId: String(paymentId) });
+    return res.status(401).json({ success: false, code: 'INVALID_SIGNATURE', message: 'Firma inválida' });
+  }
+  if (signatureValid !== null) return null;
+  if (isProduction()) return failClosedWithoutSecret(res);
+  logger.warn('mp_webhook_unsigned_allowed', { env: 'MP_WEBHOOK_SECRET', nodeEnv: process.env.NODE_ENV || 'unset' });
+  return null;
 };
 
 /**
@@ -251,17 +319,8 @@ const mpWebhook = async (req, res) => {
     return res.status(200).json({ success: true });
   }
 
-  // Firma HMAC de MP. `null` = no hay MP_WEBHOOK_SECRET configurado: se sigue
-  // adelante porque el pago se revalida igual contra la API de MP más abajo.
-  const signatureValid = mercadopago.verifyWebhookSignature({
-    signatureHeader: req.headers['x-signature'],
-    requestId: req.headers['x-request-id'],
-    dataId: paymentId,
-  });
-  if (signatureValid === false) {
-    logger.warn('mp_webhook_invalid_signature', { paymentId: String(paymentId) });
-    return res.status(401).json({ success: false, code: 'INVALID_SIGNATURE', message: 'Firma inválida' });
-  }
+  const rejection = rejectUnverifiedWebhook(req, res, paymentId);
+  if (rejection) return rejection;
   if (!PAYMENT_ID_PATTERN.test(String(paymentId))) {
     // 200 y no 4xx: no hay nada que reintentar, y no se le consulta a MP un id que no es suyo.
     logger.warn('mp_webhook_invalid_payment_id', { paymentId: String(paymentId).slice(0, 64) });

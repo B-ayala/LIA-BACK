@@ -29,6 +29,15 @@ const toMpItem = (item) => ({
 });
 
 /**
+ * Cuerpo para expirar una preferencia ya creada (cancelación): `expiration_date_to` en el momento actual.
+ * @param {number} [now] ms epoch inyectable.
+ */
+const buildExpirationPayload = (now = Date.now()) => ({
+  expires: true,
+  expiration_date_to: new Date(now).toISOString(),
+});
+
+/**
  * @param {{buyerName: string, buyerEmail: string, items: object[], shippingCost: number,
  *   purchaseId: string}} order líneas ya valorizadas por el servidor.
  * @param {{origin?: string, webhookUrl?: string, now?: number}} [options]
@@ -62,4 +71,4 @@ const buildPreferencePayload = (order, options = {}) => {
   return preference;
 };
 
-module.exports = { MP_EXPIRY_MINUTES, buildPreferencePayload };
+module.exports = { MP_EXPIRY_MINUTES, buildPreferencePayload, buildExpirationPayload };

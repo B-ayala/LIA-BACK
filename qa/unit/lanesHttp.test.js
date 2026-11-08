@@ -12,7 +12,8 @@ const { concurrencyLimit, concurrencyStats } = require('../../middleware/concurr
 const held = [];
 const app = express();
 app.use('/api', concurrencyLimit);
-app.post('/api/orders/transfer', (req, res) => { held.push(res); });
+app.post('/api/orders/mp-preference', (req, res) => { held.push(res); });
+app.post('/api/orders/transfer', (req, res) => res.json({ ok: true }));
 app.post('/api/orders/mp-webhook', (req, res) => res.json({ ok: true }));
 app.get('/api/products', (req, res) => res.json({ ok: true }));
 
@@ -35,17 +36,18 @@ test('un carril de checkout saturado responde 503 SERVER_BUSY sin afectar al cat
   const server = await new Promise((resolve) => { const s = app.listen(0, '127.0.0.1', () => resolve(s)); });
   const { port } = server.address();
   try {
-    const pending = [send(port, 'POST', '/api/orders/transfer'), send(port, 'POST', '/api/orders/transfer')];
+    const pending = [send(port, 'POST', '/api/orders/mp-preference'), send(port, 'POST', '/api/orders/mp-preference')];
     await until(() => held.length === 2);
     assert.equal(concurrencyStats().checkout.active, 2);
 
-    const shed = await send(port, 'POST', '/api/orders/transfer');
+    const shed = await send(port, 'POST', '/api/orders/mp-preference');
     assert.equal(shed.status, 503);
     assert.equal(shed.body.code, 'SERVER_BUSY');
     assert.ok(shed.headers['retry-after']);
 
     assert.equal((await send(port, 'GET', '/api/products')).status, 200, 'el catálogo sigue respondiendo');
     assert.equal((await send(port, 'POST', '/api/orders/mp-webhook')).status, 200, 'el webhook tiene su propio carril');
+    assert.equal((await send(port, 'POST', '/api/orders/transfer')).status, 200, 'la transferencia (sin MP) tiene su carril');
 
     held.forEach((res) => res.json({ ok: true }));
     await Promise.all(pending);

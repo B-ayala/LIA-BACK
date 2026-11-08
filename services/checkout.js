@@ -10,6 +10,7 @@ const { buildPreferencePayload } = require('../utils/mpPreference');
 const { reserveOrders, releaseOrders } = require('./checkoutReservation');
 
 const HTTP_CREATED = 201;
+const HTTP_CONFLICT = 409;
 const HTTP_BAD_GATEWAY = 502;
 
 /** Cuerpo de error del checkout: `{ success: false, code, message, productId?, size?, expectedTotal? }`. */
@@ -44,6 +45,14 @@ const mpUnavailableResult = () => failureResult({
   message: 'No se pudo conectar con Mercado Pago. Intentá de nuevo o elegí transferencia.',
 });
 
+// Intento ya registrado cuya preferencia de MP no se puede reenviar (el init_point solo vive en la
+// respuesta recordada): o la primera request sigue armándola o ya pasó la ventana de reenvío.
+const mpAttemptInProgressResult = () => failureResult({
+  status: HTTP_CONFLICT,
+  code: 'CHECKOUT_IN_PROGRESS',
+  message: 'Tu compra ya fue iniciada. Esperá unos segundos y revisá "Mis compras" antes de reintentar.',
+});
+
 const logPreferenceFailure = (error, orderIds) => {
   if (error.code === 'MP_TIMEOUT') {
     logger.warn('mp_create_preference_timeout', { orderIds });
@@ -69,6 +78,7 @@ const buildMpCheckout = async (input) => {
 
   const reservation = await reserveOrders({ ...input, paymentMethod: 'mp' });
   if (!reservation.ok) return failureResult(reservation);
+  if (reservation.replayed) return mpAttemptInProgressResult();
 
   try {
     // Se le cobra al comprador lo que quedó persistido (precio de la base), no lo del body.
@@ -105,6 +115,7 @@ const buildTransferCheckout = async (input) => {
   return {
     status: HTTP_CREATED,
     body: { success: true, order_ids: reservation.orderIds, order_number: reservation.orderNumber },
+    ...(reservation.replayed ? { replayed: true } : {}),
   };
 };
 

@@ -5,7 +5,7 @@
 const IdempotencyKey = require('../models/IdempotencyKey');
 const OrderPayment = require('../models/OrderPayment');
 const logger = require('../utils/logger');
-const { invalidateProducts } = require('../utils/cache');
+const { flushAvailabilityChange } = require('../utils/catalogInvalidation');
 const { MP_EXPIRY_MINUTES } = require('../utils/mpPreference');
 const { sweepStaleOrders } = require('./staleOrderSweep');
 
@@ -27,8 +27,8 @@ const purgeIdempotencyKeys = async () => {
 };
 
 const reportSweep = ({ mp, transfer, paid, held, flagged, reconciled }) => {
-  // El sweep movió stock: el catálogo cacheado quedó viejo.
-  if (mp > 0 || transfer > 0 || paid > 0 || reconciled > 0) invalidateProducts();
+  // El sweep movió stock: solo se vacía el catálogo si algún producto se agotó o volvió.
+  if (mp > 0 || transfer > 0 || paid > 0 || reconciled > 0) flushAvailabilityChange();
   if (mp > 0 || transfer > 0 || paid > 0 || held > 0 || flagged > 0 || reconciled > 0) {
     logger.info('orders_sweep', {
       expiredMp: mp, expiredTransfer: transfer, settledMp: paid, heldMp: held, flaggedMp: flagged, reconciledClosed: reconciled,

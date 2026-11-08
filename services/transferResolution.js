@@ -12,7 +12,7 @@
 const Order = require('../models/Order');
 const OrderPayment = require('../models/OrderPayment');
 const logger = require('../utils/logger');
-const { invalidateProducts } = require('../utils/cache');
+const { flushAvailabilityChange } = require('../utils/catalogInvalidation');
 const { withTransaction, rollbackWith } = require('../utils/transaction');
 
 const HTTP_NOT_FOUND = 404;
@@ -57,7 +57,7 @@ const resolvePendingTransfer = async (orderId, targetStatus, actor) => {
     }
     return { ok: true };
   }, { actor });
-  if (result.ok && targetStatus === 'cancelado') invalidateProducts();
+  if (result.ok && targetStatus === 'cancelado') flushAvailabilityChange();
   return result;
 };
 
@@ -77,7 +77,7 @@ const confirmLateTransfer = async (orderId, actor) => {
   }, { actor });
   if (!result.ok) return result;
 
-  invalidateProducts();
+  flushAvailabilityChange();
   if (result.oversold) {
     logger.error('oversold_late_transfer', { orderId: String(orderId), productId: result.productId, quantity: result.quantity });
   }

@@ -33,7 +33,8 @@ const pool = installFakeDatabase((sql, params) => {
     if (sql.startsWith('UPDATE') && params[params.length - 1] === UNKNOWN_ID) return { rows: [] };
     return { rows: [{ ...ROW, name: params[0] === 'XL' ? 'XL' : ROW.name }] };
   }
-  if (sql.startsWith('INSERT INTO public.productos')) return { rows: [{ id: 1 }] };
+  // `status` es el parámetro 19 del INSERT: la regla de publicación lee la fila devuelta.
+  if (sql.startsWith('INSERT INTO public.productos')) return { rows: [{ id: 1, status: params[18] }] };
   return undefined;
 });
 installFakeSupabaseAuth({ 'admin-token': ADMIN, 'user-token': USER });
@@ -181,9 +182,11 @@ describe('PUT /api/sizes/:id', () => {
 });
 
 describe('POST /api/products con optionMeta global', () => {
+  // Borrador: acá se prueba optionMeta, no la regla de publicación de un producto Activo.
   const productWith = (sizeId) => ({
     name: 'Remera',
     price: 100,
+    status: 'inactive',
     variants: [{ name: 'Talle', options: ['M'], optionMeta: { M: { source: 'global', sizeId } } }],
   });
 
@@ -203,5 +206,16 @@ describe('POST /api/products con optionMeta global', () => {
     const insert = pool.queries.find((query) => query.sql.startsWith('INSERT INTO public.productos'));
     const saved = JSON.parse(insert.params[11]);
     assert.deepEqual(saved[0].optionMeta, { M: { source: 'global', sizeId: SIZE_ID } });
+  });
+
+  test('Activo incompleto: 400 PRODUCT_INCOMPLETE con el dato que falta y la transacción se deshace', async () => {
+    const response = await call('/api/products', {
+      method: 'POST', token: 'admin-token', body: { ...productWith(SIZE_ID), status: 'active' },
+    });
+    assert.equal(response.status, 400);
+    const body = await response.json();
+    assert.equal(body.code, 'PRODUCT_INCOMPLETE');
+    assert.match(body.message, /categoría/);
+    assert.equal(pool.queries.at(-1).sql, 'ROLLBACK');
   });
 });

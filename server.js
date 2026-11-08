@@ -62,21 +62,21 @@ app.use(cors(corsOptions));
 // Solo se usa para leer la cookie httpOnly del refresh token (authRoutes):
 // no se firma nada acá, Supabase ya emite el refresh token firmado.
 app.use(cookieParser());
+// Rate limit general de la API: techo antiflood por IP/usuario, deliberadamente
+// holgado. Va ANTES de los parsers de body: un flood no debe costar CPU de parseo antes de
+// ser rechazado. Los límites finos por endpoint sensible (login, checkout, insights)
+// viven en cada archivo de rutas y son los que hacen el trabajo real.
+app.use(
+  '/api',
+  createRateLimit({ name: 'api', windowMs: 60 * 1000, max: 1200 })
+);
+
 // Límite explícito de body: un payload gigante consume memoria y CPU de parseo
 // antes de llegar a cualquier validación. Auth recibe solo email, contraseña y
 // token de captcha (≤4096): se parsea primero con un tope chico; el parser
 // global de abajo saltea los bodies ya parseados.
 app.use('/api/auth', express.json({ limit: '8kb' }));
 app.use(express.json({ limit: '256kb' }));
-app.use(express.urlencoded({ extended: true, limit: '256kb' }));
-
-// Rate limit general de la API: techo antiflood por IP/usuario, deliberadamente
-// holgado. Los límites finos por endpoint sensible (login, checkout, insights)
-// viven en cada archivo de rutas y son los que hacen el trabajo real.
-app.use(
-  '/api',
-  createRateLimit({ name: 'api', windowMs: 60 * 1000, max: 1200 })
-);
 
 // Control de concurrencia: sólo N handlers tocan la base a la vez; el resto
 // espera en cola acotada y, si se llena, recibe 503 rápido (load shedding).

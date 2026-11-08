@@ -1,5 +1,5 @@
 /**
- * Reglas de negocio puras del checkout: validación del pedido, precio, envío,
+ * Reglas de negocio puras del checkout: precio, envío,
  * orden de bloqueo y disponibilidad de cada línea contra la fila del producto.
  * Sin I/O: la transacción que las usa vive en services/checkoutReservation.js.
  */
@@ -8,15 +8,9 @@ const { CORREO_COST } = require('../controllers/shippingController');
 const { REASON, validateSizeStock } = require('./variantStock');
 const { UNITS_PROBLEM, validateUnitsConfig } = require('./unitsConfig');
 
-const MAX_ORDER_ITEMS = 50;
 // Tope de unidades de un mismo producto por línea: sin él, una sola línea podía reservar
 // todo el stock de un producto (5 h en transferencia) sin pagar nada.
 const DEFAULT_MAX_QUANTITY_PER_LINE = 20;
-const MAX_MOTO_SHIPPING_COST = 100000;
-// Se persisten tal cual en `ventas`: se acotan para no guardar texto arbitrario.
-const MAX_BUYER_NAME_LENGTH = 120;
-const MAX_BUYER_EMAIL_LENGTH = 254;
-const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 // 18 dígitos entran siempre en un bigint de Postgres (el máximo tiene 19).
 const PRODUCT_ID_PATTERN = /^\d{1,18}$/;
 
@@ -28,9 +22,8 @@ const CENTS_FACTOR = 100;
 /** Mismo redondeo que `roundToCents` del frontend: los dos lados cobran el mismo centavo. */
 const roundToCents = (value) => Math.round((value + Number.EPSILON) * CENTS_FACTOR) / CENTS_FACTOR;
 
-// Costo de envío por método. `moto` es variable (se acuerda por WhatsApp según
-// distancia), así que solo se acota; el resto es una constante del negocio y se
-// impone desde acá: el cliente no puede elegir cuánto paga de envío.
+// Costo de envío por método: constante del negocio impuesta desde acá (el cliente no
+// puede elegir cuánto paga de envío). Es la whitelist de métodos aceptados.
 const SHIPPING_COSTS = { local: 0, correo: CORREO_COST };
 
 const CHECKOUT_ERROR = Object.freeze({
@@ -77,69 +70,21 @@ const resolvePaymentUnitPrice = (product, paymentMethod) => {
   return Math.min(listPrice, transferPrice);
 };
 
-/** @returns {{ok: true, cost: number} | {ok: false, message: string}} */
-const resolveShippingCost = (shippingMethod, rawCost) => {
-  const requested = Number.isFinite(Number(rawCost)) ? Number(rawCost) : 0;
-  if (shippingMethod === 'moto') {
-    if (requested < 0 || requested > MAX_MOTO_SHIPPING_COST) {
-      return { ok: false, message: 'El costo de envío informado no es válido.' };
-    }
-    return { ok: true, cost: requested };
-  }
-  const official = SHIPPING_COSTS[shippingMethod];
-  if (official === undefined) {
+/**
+ * `Object.hasOwn`: un método como `constructor` o `__proto__` no puede colarse por la cadena de prototipos.
+ * @returns {{ok: true, cost: number} | {ok: false, message: string}}
+ */
+const resolveShippingCost = (shippingMethod) => {
+  if (typeof shippingMethod !== 'string' || !Object.hasOwn(SHIPPING_COSTS, shippingMethod)) {
     return { ok: false, message: 'El método de envío seleccionado no es válido.' };
   }
-  return { ok: true, cost: official };
+  return { ok: true, cost: SHIPPING_COSTS[shippingMethod] };
 };
 
 /** Unidades máximas por línea (`MAX_QUANTITY_PER_LINE`, por defecto 20). */
 const maxQuantityPerLine = () => {
   const configured = Number.parseInt(process.env.MAX_QUANTITY_PER_LINE, 10);
   return Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_MAX_QUANTITY_PER_LINE;
-};
-
-const validateItem = (item) => {
-  if (!item || !item.productName || !String(item.productName).trim()) {
-    return 'Los datos del producto son inválidos (productName).';
-  }
-  if (!Number.isInteger(item.quantity) || item.quantity <= 0) {
-    return `La cantidad seleccionada de "${item.productName}" es inválida (quantity).`;
-  }
-  if (item.quantity > maxQuantityPerLine()) {
-    return `Podés comprar hasta ${maxQuantityPerLine()} unidades de "${item.productName}" por compra.`;
-  }
-  if (!Number.isFinite(item.unitPrice) || item.unitPrice <= 0) {
-    return `El producto "${item.productName}" no tiene un precio válido (unitPrice).`;
-  }
-  if (!Number.isFinite(item.totalPrice) || item.totalPrice <= 0) {
-    return `El total calculado de "${item.productName}" es inválido (totalPrice).`;
-  }
-  return null;
-};
-
-/** Valida el payload de creación de orden. Devuelve un mensaje de error o null. */
-const validateOrderPayload = ({ buyerName, buyerEmail, items, totalPrice }) => {
-  if (!buyerName || !String(buyerName).trim()) return 'El nombre del comprador es requerido.';
-  if (String(buyerName).trim().length > MAX_BUYER_NAME_LENGTH) {
-    return `El nombre del comprador no puede superar ${MAX_BUYER_NAME_LENGTH} caracteres.`;
-  }
-  if (!buyerEmail || String(buyerEmail).length > MAX_BUYER_EMAIL_LENGTH || !EMAIL_PATTERN.test(String(buyerEmail))) {
-    return 'El email del comprador no es válido.';
-  }
-  if (!Array.isArray(items) || items.length === 0) {
-    return 'No hay productos en el carrito para procesar la compra.';
-  }
-  // Cota dura: cada ítem es un bloqueo de fila dentro de la transacción.
-  if (items.length > MAX_ORDER_ITEMS) {
-    return `El carrito supera el máximo de ${MAX_ORDER_ITEMS} productos por compra.`;
-  }
-  for (const item of items) {
-    const itemError = validateItem(item);
-    if (itemError) return itemError;
-  }
-  if (!Number.isFinite(totalPrice) || totalPrice <= 0) return 'El total final es inválido (totalPrice).';
-  return null;
 };
 
 const parseProductId = (raw) => {
@@ -283,7 +228,6 @@ module.exports = {
   resolvePaymentUnitPrice,
   checkExpectedTotal,
   resolveShippingCost,
-  validateOrderPayload,
   maxQuantityPerLine,
   parseProductId,
   planReservationLines,
